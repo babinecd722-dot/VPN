@@ -1,0 +1,14 @@
+[Unit]
+Description=AmneziaWG port forwarding for OPEN NAT
+Documentation=file:/usr/local/share/doc/awg-port-forward/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/awg-port-forward apply
+ExecStop=/usr/local/sbin/awg-port-forward clean
+
+[Install]
+WantedBy=multi-user.target
