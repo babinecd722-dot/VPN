@@ -1,7 +1,7 @@
 # Windscribe VPN — Windows installer (official)
 
-This folder documents how to fetch the **official** Windows x64 installer from Windscribe.
-The installer is **not** committed to this repository (large binary); use the script below or the links.
+The Windows x64 installer is vendored here as `Windscribe_2.21.7_amd64.exe` (from the official
+`windscribe.com` redirect). You can re-fetch with the script if the version changes.
 
 ## Official entry points (HTTPS on windscribe.com)
 
