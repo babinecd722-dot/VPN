@@ -1,0 +1,2 @@
+# Third-party installers (fetch with scripts/download-windscribe-windows.sh)
+third_party/windscribe/*.exe
