@@ -4,5 +4,6 @@ __pycache__/
 .venv/
 venv/
 data/
+logs/
 *.db
 bot.log
