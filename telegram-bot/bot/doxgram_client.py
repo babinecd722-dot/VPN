@@ -1,30 +1,62 @@
 from __future__ import annotations
 
-import time
+import json
 from typing import Any
 
 import httpx
 
 from bot.config import Settings
+from bot.errors import humanize_doxgram_error
 
 
 class DoxgramError(Exception):
-    def __init__(self, message: str, status: int | None = None) -> None:
+    def __init__(self, message: str, status: int | None = None, raw: str = "") -> None:
         super().__init__(message)
         self.status = status
+        self.raw = raw
 
 
 class DoxgramClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self._headers = {
-            "UserAuthToken": settings.doxgram_token,
+        self._token = settings.doxgram_token
+        self._refresh = settings.doxgram_refresh_token
+        self._vpn_headers_base = {"User-Agent": "Doxgram-Android-VPN"}
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {
+            "UserAuthToken": self._token,
             "User-Agent": "Doxgram-Android",
         }
-        self._vpn_headers = {
-            "UserAuthToken": settings.doxgram_token,
-            "User-Agent": "Doxgram-Android-VPN",
-        }
+
+    def _vpn_headers(self) -> dict[str, str]:
+        headers = dict(self._vpn_headers_base)
+        headers["UserAuthToken"] = self._token
+        return headers
+
+    async def _refresh_token(self) -> bool:
+        if not self._refresh:
+            return False
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(
+                "https://api.doxgram.com/identity-service/auth/refresh",
+                params={"refreshToken": self._refresh},
+                headers={"User-Agent": "Doxgram-Android"},
+            )
+        if response.status_code >= 400:
+            return False
+        try:
+            data = response.json()
+        except json.JSONDecodeError:
+            return False
+        token = data.get("token")
+        refresh = data.get("refreshToken")
+        if not token:
+            return False
+        self._token = token
+        if refresh:
+            self._refresh = refresh
+        return True
 
     async def _request(
         self,
@@ -33,20 +65,33 @@ class DoxgramClient:
         *,
         headers: dict[str, str] | None = None,
         params: dict[str, Any] | None = None,
-        json: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
         timeout: float = 60.0,
+        retry_on_401: bool = True,
     ) -> Any:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.request(
                 method,
                 url,
-                headers=headers or self._headers,
+                headers=headers or self._auth_headers(),
                 params=params,
-                json=json,
+                json=json_body,
             )
+
+        if response.status_code == 401 and retry_on_401 and await self._refresh_token():
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.request(
+                    method,
+                    url,
+                    headers=headers or self._auth_headers(),
+                    params=params,
+                    json=json_body,
+                )
+
         if response.status_code >= 400:
-            detail = response.text[:500]
-            raise DoxgramError(detail, response.status_code)
+            raw = response.text[:500]
+            raise DoxgramError(humanize_doxgram_error(response.status_code, raw), response.status_code, raw)
+
         if not response.content:
             return None
         return response.json()
@@ -66,7 +111,7 @@ class DoxgramClient:
         return await self._request(
             "POST",
             "https://api.doxgram.com/gpt-service/conversations",
-            json=payload,
+            json_body=payload,
             timeout=30.0,
         )
 
@@ -74,7 +119,7 @@ class DoxgramClient:
         return await self._request(
             "POST",
             f"https://api.doxgram.com/gpt-service/conversations/{conversation_id}/messages",
-            json={"content": content},
+            json_body={"content": content},
             timeout=120.0,
         )
 
@@ -85,7 +130,7 @@ class DoxgramClient:
         return await self._request(
             "GET",
             "https://api.doxgram.com/vpn-service/key/get",
-            headers=self._vpn_headers,
+            headers=self._vpn_headers(),
             params=params,
             timeout=30.0,
         )
@@ -103,6 +148,7 @@ class DoxgramClient:
             "https://api.doxgram.com/vpn-service/key/free",
             headers=headers,
             timeout=30.0,
+            retry_on_401=False,
         )
 
 

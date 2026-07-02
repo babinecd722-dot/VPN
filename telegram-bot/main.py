@@ -9,6 +9,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from bot.config import load_settings
 from bot.database import Database
 from bot.doxgram_client import DoxgramClient
+from bot.gate_middleware import SubscriptionGateMiddleware
 from bot.handlers import router
 from bot.middleware import InjectMiddleware
 from bot.rate_limit import RateLimiter
@@ -36,6 +37,7 @@ async def main() -> None:
             limiter=limiter,
         )
     )
+    dp.update.middleware(SubscriptionGateMiddleware())
 
     dp.include_router(router)
 

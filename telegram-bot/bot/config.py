@@ -19,6 +19,7 @@ def _parse_ids(raw: str) -> set[int]:
 class Settings:
     bot_token: str
     doxgram_token: str
+    doxgram_refresh_token: str
     channel_1_id: int
     channel_1_link: str
     channel_2_id: int
@@ -31,6 +32,7 @@ class Settings:
 def load_settings() -> Settings:
     bot_token = os.getenv("BOT_TOKEN", "").strip()
     doxgram_token = os.getenv("DOXGRAM_TOKEN", "").strip()
+    doxgram_refresh_token = os.getenv("DOXGRAM_REFRESH_TOKEN", "").strip()
     if not bot_token:
         raise RuntimeError("BOT_TOKEN is not set")
     if not doxgram_token:
@@ -39,6 +41,7 @@ def load_settings() -> Settings:
     return Settings(
         bot_token=bot_token,
         doxgram_token=doxgram_token,
+        doxgram_refresh_token=doxgram_refresh_token,
         channel_1_id=int(os.getenv("CHANNEL_1_ID", "-1003485510052")),
         channel_1_link=os.getenv("CHANNEL_1_LINK", "https://t.me/ted_resolution").strip(),
         channel_2_id=int(os.getenv("CHANNEL_2_ID", "-1003956524111")),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message
@@ -18,15 +19,9 @@ from bot.keyboards import (
 from bot.rate_limit import RateLimiter
 from bot.states import ChatStates, OsintStates
 from bot.subscription import has_access
+from bot.subscription_gate import LOCKED_TEXT, send_locked_screen
 
 router = Router()
-
-
-WELCOME_LOCKED = (
-    "<b>Доступ к сервису</b>\n\n"
-    "Бот бесплатный, но нужна подписка на оба канала.\n"
-    "После подписки нажмите «Проверить подписку»."
-)
 
 WELCOME_OPEN = (
     "<b>Главное меню</b>\n\n"
@@ -37,78 +32,49 @@ WELCOME_OPEN = (
 )
 
 
-async def ensure_access(message_or_call: Message | CallbackQuery, bot: Bot, settings, limiter: RateLimiter) -> bool:
-    user = message_or_call.from_user
-    if not user:
-        return False
-    if limiter.is_admin(user.id):
-        return True
-    ok, missing = await has_access(bot, settings, user.id)
-    if ok:
-        return True
-
-    text = (
-        "<b>Нужна подписка</b>\n\n"
-        f"Не подписаны: <b>{', '.join(missing)}</b>\n"
-        "Подпишитесь и нажмите «Проверить подписку»."
-    )
-    kb = subscription_keyboard(settings.channel_1_link, settings.channel_2_link)
-    if isinstance(message_or_call, CallbackQuery):
-        await message_or_call.message.edit_text(text, reply_markup=kb)
-        await message_or_call.answer()
-    else:
-        await message_or_call.answer(text, reply_markup=kb)
-    return False
+async def safe_edit(call: CallbackQuery, text: str, reply_markup) -> None:
+    try:
+        await call.message.edit_text(text, reply_markup=reply_markup)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, bot: Bot, settings, limiter: RateLimiter, state: FSMContext) -> None:
+async def cmd_start(message: Message, bot: Bot, settings, state: FSMContext) -> None:
     await state.clear()
     user = message.from_user
     if not user:
-        return
-
-    if limiter.is_admin(user.id):
-        await message.answer(WELCOME_OPEN, reply_markup=main_menu_keyboard())
         return
 
     ok, _ = await has_access(bot, settings, user.id)
     if ok:
         await message.answer(WELCOME_OPEN, reply_markup=main_menu_keyboard())
     else:
-        await message.answer(WELCOME_LOCKED, reply_markup=subscription_keyboard(settings.channel_1_link, settings.channel_2_link))
+        await message.answer(LOCKED_TEXT, reply_markup=subscription_keyboard(settings.channel_1_link, settings.channel_2_link))
 
 
 @router.callback_query(F.data == "check_sub")
-async def cb_check_sub(call: CallbackQuery, bot: Bot, settings, limiter: RateLimiter, state: FSMContext) -> None:
+async def cb_check_sub(call: CallbackQuery, bot: Bot, settings, state: FSMContext) -> None:
     await state.clear()
     user = call.from_user
-    if limiter.is_admin(user.id):
-        await call.message.edit_text(WELCOME_OPEN, reply_markup=main_menu_keyboard())
-        await call.answer("Доступ открыт")
-        return
-
     ok, missing = await has_access(bot, settings, user.id)
     if ok:
-        await call.message.edit_text(WELCOME_OPEN, reply_markup=main_menu_keyboard())
+        await safe_edit(call, WELCOME_OPEN, main_menu_keyboard())
         await call.answer("Доступ открыт")
     else:
-        await call.answer(f"Нужна подписка: {', '.join(missing)}", show_alert=True)
+        await call.answer(f"Подпишитесь: {', '.join(missing)}", show_alert=True)
 
 
 @router.callback_query(F.data == "menu_home")
-async def cb_menu_home(call: CallbackQuery, bot: Bot, settings, limiter: RateLimiter, state: FSMContext) -> None:
+async def cb_menu_home(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    if not await ensure_access(call, bot, settings, limiter):
-        return
-    await call.message.edit_text(WELCOME_OPEN, reply_markup=main_menu_keyboard())
+    await safe_edit(call, WELCOME_OPEN, main_menu_keyboard())
     await call.answer()
 
 
 @router.callback_query(F.data == "menu_limits")
-async def cb_limits(call: CallbackQuery, bot: Bot, settings, limiter: RateLimiter) -> None:
-    if not await ensure_access(call, bot, settings, limiter):
-        return
+async def cb_limits(call: CallbackQuery, limiter: RateLimiter) -> None:
     user = call.from_user
     text = (
         "<b>Ваши лимиты</b>\n\n"
@@ -118,20 +84,19 @@ async def cb_limits(call: CallbackQuery, bot: Bot, settings, limiter: RateLimite
             limiter.is_admin(user.id),
         )
     )
-    await call.message.edit_text(text, reply_markup=back_to_menu_keyboard())
+    await safe_edit(call, text, back_to_menu_keyboard())
     await call.answer()
 
 
 @router.callback_query(F.data == "menu_osint")
-async def cb_osint(call: CallbackQuery, bot: Bot, settings, limiter: RateLimiter, state: FSMContext) -> None:
-    if not await ensure_access(call, bot, settings, limiter):
-        return
+async def cb_osint(call: CallbackQuery, limiter: RateLimiter, state: FSMContext) -> None:
     await state.set_state(OsintStates.waiting_query)
     left = limiter.remaining(call.from_user.id, "osint")
     extra = "♾ без лимита" if left is None else f"осталось {left} запросов в час"
-    await call.message.edit_text(
+    await safe_edit(
+        call,
         f"<b>Поиск</b>\n\nОтправьте запрос одним сообщением.\n<i>{extra}</i>",
-        reply_markup=back_to_menu_keyboard(),
+        back_to_menu_keyboard(),
     )
     await call.answer()
 
@@ -139,27 +104,18 @@ async def cb_osint(call: CallbackQuery, bot: Bot, settings, limiter: RateLimiter
 @router.message(OsintStates.waiting_query)
 async def osint_query(
     message: Message,
-    bot: Bot,
-    settings,
     limiter: RateLimiter,
     doxgram: DoxgramClient,
     state: FSMContext,
 ) -> None:
-    if not await ensure_access(message, bot, settings, limiter):
-        await state.clear()
-        return
-
     query = (message.text or "").strip()
     if len(query) < 2:
         await message.answer("Запрос слишком короткий.", reply_markup=back_to_menu_keyboard())
         return
 
-    allowed, remaining = limiter.check(message.from_user.id, "osint")
+    allowed, _ = limiter.check(message.from_user.id, "osint")
     if not allowed:
-        await message.answer(
-            f"Лимит поиска исчерпан. Подождите час.\nОсталось: <b>0</b>",
-            reply_markup=main_menu_keyboard(),
-        )
+        await message.answer("Ваш лимит поиска исчерпан. Подождите час.", reply_markup=main_menu_keyboard())
         await state.clear()
         return
 
@@ -168,28 +124,27 @@ async def osint_query(
         data = await doxgram.osint_search(query)
         limiter.consume(message.from_user.id, "osint")
         parts = format_osint_result(data)
+        await wait.delete()
         for i, part in enumerate(parts):
             markup = main_menu_keyboard() if i == len(parts) - 1 else None
             await message.answer(part, reply_markup=markup)
-        await wait.delete()
     except DoxgramError as exc:
-        await wait.edit_text(f"Ошибка поиска ({exc.status or '—'}).\nПопробуйте позже.", reply_markup=main_menu_keyboard())
+        await wait.edit_text(f"<b>Поиск недоступен</b>\n\n{esc(str(exc))}", reply_markup=main_menu_keyboard())
     except Exception:
-        await wait.edit_text("Сервис временно недоступен.", reply_markup=main_menu_keyboard())
+        await wait.edit_text("Сервис поиска временно недоступен.", reply_markup=main_menu_keyboard())
     finally:
         await state.clear()
 
 
 @router.callback_query(F.data == "menu_chat")
-async def cb_chat(call: CallbackQuery, bot: Bot, settings, limiter: RateLimiter, state: FSMContext) -> None:
-    if not await ensure_access(call, bot, settings, limiter):
-        return
+async def cb_chat(call: CallbackQuery, limiter: RateLimiter, state: FSMContext) -> None:
     await state.set_state(ChatStates.waiting_message)
     left = limiter.remaining(call.from_user.id, "chat")
     extra = "♾ без лимита" if left is None else f"осталось {left} сообщений в час"
-    await call.message.edit_text(
+    await safe_edit(
+        call,
         f"<b>Чат</b>\n\nНапишите сообщение — получите ответ.\n<i>{extra}</i>",
-        reply_markup=chat_keyboard(),
+        chat_keyboard(),
     )
     await call.answer()
 
@@ -198,27 +153,18 @@ async def cb_chat(call: CallbackQuery, bot: Bot, settings, limiter: RateLimiter,
 async def cb_chat_reset(call: CallbackQuery, db, state: FSMContext) -> None:
     db.clear_conversation(call.from_user.id)
     await state.set_state(ChatStates.waiting_message)
-    await call.message.edit_text(
-        "<b>Новый диалог</b>\n\nНапишите первое сообщение.",
-        reply_markup=chat_keyboard(),
-    )
+    await safe_edit(call, "<b>Новый диалог</b>\n\nНапишите первое сообщение.", chat_keyboard())
     await call.answer("Диалог сброшен")
 
 
 @router.message(ChatStates.waiting_message)
 async def chat_message(
     message: Message,
-    bot: Bot,
-    settings,
     limiter: RateLimiter,
     doxgram: DoxgramClient,
     db,
     state: FSMContext,
 ) -> None:
-    if not await ensure_access(message, bot, settings, limiter):
-        await state.clear()
-        return
-
     text = (message.text or "").strip()
     if not text:
         await message.answer("Отправьте текстовое сообщение.", reply_markup=chat_keyboard())
@@ -245,63 +191,43 @@ async def chat_message(
         limiter.consume(message.from_user.id, "chat")
 
         reply = (result or {}).get("reply") or {}
-        answer = (reply.get("content") or "").strip()
-        if not answer:
-            answer = "Пустой ответ. Попробуйте переформулировать."
-
+        answer = (reply.get("content") or "").strip() or "Пустой ответ. Попробуйте переформулировать."
         title = result.get("conversationTitle") or "Чат"
         await wait.delete()
-        await message.answer(
-            f"<b>{esc(title)}</b>\n\n{esc(answer)}",
-            reply_markup=chat_keyboard(),
-        )
+        await message.answer(f"<b>{esc(title)}</b>\n\n{esc(answer)}", reply_markup=chat_keyboard())
     except DoxgramError as exc:
-        if exc.status == 502:
-            msg = "Сервис чата временно недоступен на стороне провайдера."
-        elif exc.status in (401, 403, 417):
-            msg = "Ошибка авторизации backend. Сообщите администратору."
-        else:
-            msg = f"Ошибка чата ({exc.status or '—'})."
-        await wait.edit_text(msg, reply_markup=chat_keyboard())
+        await wait.edit_text(f"<b>Чат недоступен</b>\n\n{esc(str(exc))}", reply_markup=chat_keyboard())
     except Exception:
-        await wait.edit_text("Сервис временно недоступен.", reply_markup=chat_keyboard())
+        await wait.edit_text("Сервис чата временно недоступен.", reply_markup=chat_keyboard())
 
 
 @router.callback_query(F.data == "menu_vpn")
-async def cb_vpn(call: CallbackQuery, bot: Bot, settings, limiter: RateLimiter, state: FSMContext) -> None:
+async def cb_vpn(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    if not await ensure_access(call, bot, settings, limiter):
-        return
-    await call.message.edit_text(
-        "<b>VPN</b>\n\nВыберите локацию сервера:",
-        reply_markup=vpn_servers_keyboard(),
-    )
+    await safe_edit(call, "<b>VPN</b>\n\nВыберите локацию сервера:", vpn_servers_keyboard())
     await call.answer()
 
 
 @router.callback_query(F.data.startswith("vpn:"))
-async def cb_vpn_server(call: CallbackQuery, bot: Bot, settings, limiter: RateLimiter) -> None:
-    if not await ensure_access(call, bot, settings, limiter):
-        return
+async def cb_vpn_server(call: CallbackQuery) -> None:
     key = call.data.split(":", 1)[1]
     server = server_by_key(key)
     if not server:
         await call.answer("Сервер не найден", show_alert=True)
         return
     tier = "Премиум · без лимита скорости" if server["tier"] == "premium" else "Стандарт · ограничение скорости"
-    await call.message.edit_text(
+    await safe_edit(
+        call,
         f"<b>{server['flag']} {esc(server['title'])}</b>\n\n"
         f"Хост: <code>{esc(server['host'])}</code>\n"
         f"Тариф: {tier}",
-        reply_markup=vpn_connect_keyboard(key),
+        vpn_connect_keyboard(key),
     )
     await call.answer()
 
 
 @router.callback_query(F.data.startswith("vpn_connect:"))
-async def cb_vpn_connect(call: CallbackQuery, bot: Bot, settings, limiter: RateLimiter, doxgram: DoxgramClient) -> None:
-    if not await ensure_access(call, bot, settings, limiter):
-        return
+async def cb_vpn_connect(call: CallbackQuery, doxgram: DoxgramClient) -> None:
     key = call.data.split(":", 1)[1]
     server = server_by_key(key)
     if not server:
@@ -316,25 +242,32 @@ async def cb_vpn_connect(call: CallbackQuery, bot: Bot, settings, limiter: RateL
             payload = await doxgram.get_free_vpn_key()
         vless = payload.get("vlessUri") or ""
         if not vless:
-            raise DoxgramError("empty vless")
+            raise DoxgramError("Пустой ключ VPN")
         speed = int(payload.get("speedLimitBytesPerSecond") or 0)
         text = format_vpn_card(server, vless, speed)
-        await call.message.edit_text(text, reply_markup=vpn_servers_keyboard())
-    except DoxgramError:
-        await call.message.edit_text(
-            "Не удалось получить ключ. Попробуйте другой сервер.",
-            reply_markup=vpn_servers_keyboard(),
-        )
+        await safe_edit(call, text, vpn_servers_keyboard())
+    except DoxgramError as exc:
+        await safe_edit(call, f"Не удалось получить ключ.\n\n{esc(str(exc))}", vpn_servers_keyboard())
     except Exception:
-        await call.message.edit_text(
-            "Сервис VPN временно недоступен.",
-            reply_markup=vpn_servers_keyboard(),
-        )
+        await safe_edit(call, "Сервис VPN временно недоступен.", vpn_servers_keyboard())
 
 
 @router.message(Command("menu"))
-async def cmd_menu(message: Message, bot: Bot, settings, limiter: RateLimiter, state: FSMContext) -> None:
+async def cmd_menu(message: Message, bot: Bot, settings, state: FSMContext) -> None:
     await state.clear()
-    if not await ensure_access(message, bot, settings, limiter):
+    ok, missing = await has_access(bot, settings, message.from_user.id)
+    if ok:
+        await message.answer(WELCOME_OPEN, reply_markup=main_menu_keyboard())
+    else:
+        await send_locked_screen(message, settings, missing)
+
+
+@router.message()
+async def fallback_message(message: Message, bot: Bot, settings, state: FSMContext) -> None:
+    if await state.get_state() is not None:
         return
-    await message.answer(WELCOME_OPEN, reply_markup=main_menu_keyboard())
+    ok, missing = await has_access(bot, settings, message.from_user.id)
+    if ok:
+        await message.answer("Выберите раздел в меню:", reply_markup=main_menu_keyboard())
+    else:
+        await send_locked_screen(message, settings, missing)
