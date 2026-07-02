@@ -23,6 +23,7 @@ def setup_logging() -> None:
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     root = logging.getLogger()
+    root.handlers.clear()
     root.setLevel(logging.INFO)
 
     stream = logging.StreamHandler()
