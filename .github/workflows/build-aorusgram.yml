@@ -35,10 +35,31 @@ jobs:
       - name: Clone Telegram iOS
         if: steps.tg-cache.outputs.cache-hit != 'true'
         run: |
-          git clone --depth=1 --branch release-12.8 \
-            https://github.com/TelegramMessenger/Telegram-iOS.git telegram-ios
+          # Big repo over GitHub — macOS runners intermittently hit `curl 56 / early EOF`.
+          # Tune git for large fetches and retry the clone a few times before giving up.
+          git config --global http.postBuffer 524288000
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 300
+          git config --global core.compression 0
+          n=0
+          until [ "$n" -ge 4 ]; do
+            rm -rf telegram-ios
+            if git clone --depth=1 --no-tags --branch release-12.8 \
+                 https://github.com/TelegramMessenger/Telegram-iOS.git telegram-ios; then
+              break
+            fi
+            n=$((n+1))
+            echo "Clone attempt $n failed — retrying in 15s..."
+            sleep 15
+          done
+          if [ ! -d telegram-ios/.git ]; then
+            echo "ERROR: telegram-ios clone failed after $n attempts"; exit 1
+          fi
           cd telegram-ios
-          git submodule update --init --depth=1 --jobs=4 || true
+          for i in 1 2 3; do
+            git submodule update --init --depth=1 --jobs=4 && break
+            echo "submodule update attempt $i failed — retrying..."; sleep 10
+          done
 
       - name: Ensure rlottie submodule
         run: |
