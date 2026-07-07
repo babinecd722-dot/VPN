@@ -15971,8 +15971,8 @@ def patch_message_translate_button(tg: Path) -> None:
     toggle_new = (
         "    private func aorusPresentInlineActionToast(_ text: String) {\n"
         "        guard let item = self.item else { return }\n"
-        "        guard let navigationController = item.controllerInteraction.navigationController() else { return }\n"
-        "        navigationController.present(UndoOverlayController(presentationData: item.presentationData, content: .info(title: nil, text: text, timeout: nil, customUndoText: nil), elevatedLayout: false, animateInAsReplacement: true, action: { _ in return false }), in: .current)\n"
+        "        let aorusPresentationData = item.context.sharedContext.currentPresentationData.with { $0 }\n"
+        "        item.controllerInteraction.presentControllerInCurrent(UndoOverlayController(presentationData: aorusPresentationData, content: .info(title: nil, text: text, timeout: nil, customUndoText: nil), elevatedLayout: false, animateInAsReplacement: true, action: { _ in return false }), nil)\n"
         "    }\n"
         "\n"
         "    private func aorusToggleTranslate() {\n"
