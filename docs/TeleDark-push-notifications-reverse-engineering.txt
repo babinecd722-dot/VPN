@@ -1,0 +1,566 @@
+================================================================================
+  РЕВЕРС-ИНЖИНИРИНГ: КАК РАБОТАЮТ УВЕДОМЛЕНИЯ В TeleDark v12.7.ipa
+================================================================================
+
+Источник: TeleDark [v12.7].ipa (86.7 MB)
+SHA по размеру: 86 700 000 байт (скачан с Google Drive, пост ZiSipa #1669)
+Дата анализа: 2026-07-07
+Метод: распаковка IPA, разбор Info.plist, embedded.mobileprovision,
+       анализ Mach-O бинарников и injected dylib, strings, code signature.
+
+ВАЖНО: Все данные ниже — только то, что реально найдено в файле.
+       Ничего не додумано.
+
+
+================================================================================
+1. ЧТО ЭТО ЗА ПРИЛОЖЕНИЕ
+================================================================================
+
+Тип:        модифицированный клиент Telegram iOS (не App Store)
+Имя:        Teledark
+Версия:     12.7 (CFBundleShortVersionString)
+Build:      1 (CFBundleVersion)
+Bundle ID:  app.teledark
+Executable: Telegram (CFBundleExecutable)
+Min iOS:    10.0
+
+Базовый бинарник — форк Telegram iOS 12.7 с вшитыми фреймворками:
+  - TelegramCoreFramework.framework
+  - TelegramUIFramework.framework
+  - PostboxFramework.framework
+  - MtProtoKitFramework.framework
+  - SwiftSignalKitFramework.framework
+
+Мод-классы в TelegramCore (найдены через strings):
+  - TDGhostMode
+  - TDDeletedMessages
+  - TDPremiumBypass
+  - TDStoryDownload
+  - TDViewOnceUnlimited
+  - TDStrings / TDStringsV
+  - TeledarkSettings (меню: Settings/Menu/Teledark)
+  - TeledarkAIVoiceProcessor
+
+Мод-атрибуты UserDefaults (найдены как строки):
+  - teledark_hideOnlineStatus
+  - teledark_showDeletedMessages
+  - teledark_bypassScreenshotProtection
+  - teledark_bypassContentRestrictions
+  - teledark_ghostModeMessages
+  - teledark_ghostModeStories
+  - teledark_ghostModeOverriddenChats
+  - teledark_premiumBypass_v2_defaults
+  - teledark_storyDownload
+  - teledark_viewOnceUnlimited
+  - teledark_viewOnceDownload
+  - teledark_unlockTranslation
+  - teledark_translateBeforeSendLang
+
+
+================================================================================
+2. ПОДПИСЬ IPA — ЧТО РЕАЛЬНО ВНУТРИ
+================================================================================
+
+2.1. Маркер переподписи
+-----------------------
+В бандле есть файл:
+  Payload/Telegram.app/SignedByEsign
+
+Содержимое:
+  Signed By Esign
+  使用轻松签签名
+  https://esign.yyyue.xyz
+
+Вывод: IPA был переподписан инструментом ESign (轻松签) перед распространением.
+
+
+2.2. embedded.mobileprovision (во всех 7 таргетах)
+---------------------------------------------------
+Один и тот же профиль во всех:
+  - Telegram.app
+  - BroadcastUploadExtension.appex
+  - IntentsExtension.appex
+  - NotificationContentExtension.appex
+  - NotificationServiceExtensionv1.appex
+  - ShareExtension.appex
+  - WidgetExtension.appex
+
+Данные профиля:
+  Name:                00008150-000A25410C9A401CNU07T4
+  UUID:                c80c8d43-2420-49e4-a8ef-65301f1d9a9a
+  TeamName:            Rhoslyn Carney
+  TeamIdentifier:      LKRRVC93D7
+  CreationDate:        2026-03-03 19:14:33 UTC
+  ExpirationDate:      2027-03-01 11:51:50 UTC
+  ProvisionsAllDevices: отсутствует (НЕ enterprise)
+  ProvisionedDevices:    1 устройство — UDID 00008150-000A25410C9A401C
+
+Тип подписи: Ad-Hoc / iPhone Distribution (платный Apple Developer, 1 UDID)
+НЕ enterprise-сертификат «на всех».
+
+
+2.3. Сертификат в code signature бинарника
+------------------------------------------
+В Mach-O Telegram найдено (strings / CMS blob):
+  iPhone Distribution: Rhoslyn Carney (LKRRVC93D7)
+
+Это Distribution-сертификат Apple Developer Program, не бесплатный
+7-дневный Apple ID signing.
+
+
+2.4. Несовпадение Bundle ID и App ID в профиле
+----------------------------------------------
+  Info.plist приложения:     app.teledark
+  application-identifier     LKRRVC93D7.app.polarbear5166.durian2960
+  в embedded.mobileprovision:
+
+Это расхождение подтверждено:
+  - Info.plist → CFBundleIdentifier = app.teledark
+  - embedded.mobileprovision → application-identifier = LKRRVC93D7.app.polarbear5166.durian2960
+  - Code signature entitlements blob → тот же polarbear App ID
+
+Схема: приложение собрано с bundle app.teledark, но подписано профилем
+       от другого App ID (app.polarbear5166.durian2960). Так делают при
+       сайдлоаде, чтобы получить расширенные entitlements чужого App ID.
+       Для работы на другом устройстве IPA всё равно нужно переподписать
+       СВОИМ сертификатом.
+
+
+================================================================================
+3. ENTITLEMENTS — ЧТО НУЖНО ДЛЯ PUSH
+================================================================================
+
+Из embedded.mobileprovision (ключевые для уведомлений):
+
+  aps-environment = production
+
+  com.apple.developer.usernotifications.communication = true
+  com.apple.developer.usernotifications.time-sensitive = true
+
+  com.apple.security.application-groups:
+    - group.1f56048729375e2d.1
+    - group.1f56048729375e2d.2
+    - group.1f56048729375e2d.3
+    - group.1f56048729375e2d.4
+    - group.1f56048729375e2d.5
+
+  com.apple.developer.team-identifier = LKRRVC93D7
+  get-task-allow = false
+
+В signed entitlements бинарника Telegram также найдены:
+  aps-environment
+  com.apple.developer.usernotifications.communication
+  com.apple.developer.usernotifications.time-sensitive
+
+БЕЗ aps-environment в mobileprovision push-уведомления на iOS не работают.
+Бесплатная 7-дневная подпись (AltStore/Sideloadly с личным Apple ID) обычно
+НЕ включает push — нужен платный Apple Developer ($99/год) с включённой
+capability Push Notifications для вашего App ID.
+
+
+================================================================================
+4. UIBackgroundModes И РАСШИРЕНИЯ УВЕДОМЛЕНИЙ
+================================================================================
+
+4.1. UIBackgroundModes (Info.plist главного приложения)
+-------------------------------------------------------
+  - audio
+  - fetch
+  - location
+  - remote-notification    ← обязателен для APNs
+  - voip
+  - processing
+
+4.2. BGTaskSchedulerPermittedIdentifiers
+------------------------------------------
+  - app.teledark.refresh
+  - app.teledark.cleanup
+  - app.teledark.upload.*
+
+4.3. App Extensions (все с префиксом app.teledark.*)
+----------------------------------------------------
+  Bundle ID                              | NSExtensionPointIdentifier
+  ---------------------------------------|------------------------------------------
+  app.teledark.NotificationService       | com.apple.usernotifications.service
+  app.teledark.NotificationContent     | com.apple.usernotifications.content-extension
+  app.teledark.Widget                  | com.apple.widgetkit-extension
+  app.teledark.Share                   | com.apple.share-services
+  app.teledark.SiriIntents             | com.apple.intents-service
+  app.teledark.BroadcastUpload         | com.apple.broadcast-services-upload
+
+Критичные для push:
+  NotificationServiceExtensionv1.appex
+    - Bundle: app.teledark.NotificationService
+    - Principal class: NotificationService
+    - Обрабатывает входящие push до показа пользователю
+
+  NotificationContentExtension.appex
+    - Bundle: app.teledark.NotificationContent
+    - Principal class: NotificationViewController
+    - Категории: withReplyMedia, withMuteMedia
+
+Все extensions имеют свой embedded.mobileprovision и _CodeSignature.
+
+
+================================================================================
+5. INJECTED DYLIB — МЕХАНИЗМ ФИКСА ДЛЯ САЙДЛОАДА
+================================================================================
+
+В главный бинарник Telegram вшиты LC_LOAD_DYLIB (порядок загрузки):
+
+  1.  @executable_path/FilePickerFix.dylib
+  2.  @executable_path/TelegramChatFixer.dylib
+  3.  @executable_path/TelegramNotificationFix.dylib    ← фикс уведомлений
+  4.  @executable_path/sideloadFixerLol.dylib            ← фикс App Groups
+  5.  @executable_path/libsubstrate.dylib                ← Substrate runtime
+  6.  @executable_path/liberdade.dylib                   ← основной мод (5.7 MB)
+  7.  @executable_path/libps.dylib
+  8.  @executable_path/flutersult.dylib
+  9.  @executable_path/lidersunframe.dylib
+  10. @executable_path/ZiSpop-up.dylib                   ← попап канала ZiSipa
+  11. @executable_path/iOSGods.dylib
+  12. @executable_path/SatellaJailed.dylib
+  13. @executable_path/putcher_concurent.dylib
+  14. @executable_path/liframesatrate.dylib
+  15. @executable_path/libobjcpatch.dylib
+
+Размеры (байты на диске):
+  liberade.dylib              ~5.7 MB
+  libobjcpatch.dylib          ~445 KB
+  libsubstrate.dylib          ~301 KB
+  TelegramNotificationFix.dylib ~233 KB
+  sideloadFixerLol.dylib      ~86 KB
+
+
+5.1. TelegramNotificationFix.dylib
+----------------------------------
+Автор (строки внутри dylib):
+  Tweaked By DzMohaipa
+  @DzMohaipa
+  dzmohaipa.com/ipa
+
+Фреймворк: Logos/Substrate (символы _logos_method$, _logos_orig$, _logos_register_hook$)
+
+Перехваченные методы (декодировано из символов Mach-O):
+
+  HOOK 1:
+    Класс:   AppDelegate
+    Метод:   application:didFinishLaunchingWithOptions:
+    Назначение: код при старте приложения (в т.ч. FCAlertView — попап автора)
+
+  HOOK 2:
+    Класс:   NSFileManager
+    Метод:   containerURLForSecurityApplicationGroupIdentifier:
+    Назначение: ПОДМЕНА пути к App Group контейнеру при сайдлоаде.
+                Когда переподписываешь другим сертификатом, App Group ID
+                в профиле меняется — без этого хука extensions (в т.ч.
+                NotificationService) не находят общие данные с основным app.
+
+  HOOK 3:
+    Класс:   INPreferences
+    Метод:   _siriAuthorizationStatus (private)
+    Назначение: обход/фикс статуса Siri (не напрямую про push, но есть в dylib)
+
+  HOOK 4:
+    Класс:   AppDelegate
+    Метод:   FCAlertView:clickedButtonIndex:buttonTitle:
+    Назначение: обработка кнопок попапа DzMohaipa
+
+Зависимость: @rpath/nicegram-BlackScreenFIX.dylib (указана в dylib,
+             но файла nicegram-BlackScreenFIX.dylib в бандле НЕТ)
+
+
+5.2. sideloadFixerLol.dylib
+---------------------------
+Путь в dylib: /Library/MobileSubstrate/DynamicLibraries/sideloadFixerLol.dylib
+(стандартный путь Substrate, но файл лежит в @executable_path)
+
+Используемые API (строки):
+  - containerURLForSecurityApplicationGroupIdentifier:
+  - CKContainer / initWithContainerIdentifier: / _setupWithContainerID:options:
+  - method_getImplementation / method_setImplementation (runtime method swizzling)
+  - AppGroup
+  - Team ID: LKRRVC93D7 (зашит в dylib)
+
+Назначение: дополнительный фикс App Group / CloudKit контейнеров при переподписи.
+
+
+5.3. libobjcpatch.dylib
+-----------------------
+Содержит:
+  - RSPillRedirectSucceededNotification (NSNotification)
+  - postNotificationName:object:
+  - CaptainHook / Swift hook патчи (символы add_image_hook_swiftV1)
+
+Назначение: runtime-патчи Objective-C/Swift, в т.ч. для совместимости сайдлоада.
+
+
+5.4. ZiSpop-up.dylib
+--------------------
+Содержит CaptainHook, ссылки на Theos (/opt/theos/vendor/include/CaptainHook/).
+Попап/реклама канала ZiSipa. К уведомлениям напрямую не относится.
+
+
+================================================================================
+6. КАК РАБОТАЕТ ЦЕПОЧКА PUSH (ФАКТИЧЕСКАЯ СХЕМА)
+================================================================================
+
+  [iPhone: TeleDark app.teledark]
+        |
+        | 1. registerForRemoteNotifications()
+        v
+  [Apple APNs]  — требует aps-environment в подписи
+        |
+        | 2. device token
+        v
+  [TeleDark] → отправляет token на серверы Telegram
+        |         (привязка к bundle id app.teledark)
+        v
+  [Telegram servers]
+        |
+        | 3. push при новом сообщении
+        v
+  [APNs] → [NotificationServiceExtension] → [NotificationContentExtension]
+        |         app.teledark.NotificationService
+        |
+        | 4. App Group: group.1f56048729375e2d.{1-5}
+        |    Общие данные между app и extensions
+        v
+  [Показ уведомления на экране]
+
+При переподписи другим сертификатом:
+  - App Group identifiers в новом профиле будут ДРУГИМИ
+  - TelegramNotificationFix + sideloadFixerLol перехватывают
+    containerURLForSecurityApplicationGroupIdentifier: и подставляют
+    рабочие пути
+  - Без этих dylib или без аналога — extensions теряют доступ к данным,
+    rich notifications и фоновая доставка ломаются
+
+
+================================================================================
+7. ЧТО ПИШЕТ КАНАЛ ZiSipa (ВНЕШНИЙ ИСТОЧНИК, СВЕРЕНО С РЕВЕРСОМ)
+================================================================================
+
+Пост #1669 (TeleDark v12.7):
+  - «Уведомления работают!»
+  - «Не меняйте Bundle ID, чтобы уведомления работали»
+  - Ссылка на пост #1189: «Уведомления только с личным сертификатом»
+
+Пост #1189 (уведомления):
+  - Push работает только с личным (платным) сертификатом разработчика
+
+Это совпадает с находками в IPA:
+  - Bundle ID app.teledark должен сохраняться
+  - Нужен aps-environment: production в mobileprovision
+  - Ad-Hoc профиль на чужой UDID сам по себе на твоём телефоне не работает
+
+
+================================================================================
+8. ЧТО НУЖНО СДЕЛАТЬ В СВОЁМ КЛИЕНТЕ (ПОШАГОВЫЙ ПЛАН)
+================================================================================
+
+Ниже — практический план воспроизведения схемы TeleDark для своего клиента.
+Каждый пункт привязан к тому, что найдено в IPA.
+
+
+ШАГ 1. Bundle ID
+----------------
+  - Выбери постоянный explicit Bundle ID (у TeleDark: app.teledark)
+  - НЕ меняй его при переподписи
+  - Все extensions: <твой.bundle.id>.NotificationService и т.д.
+  - Зарегистрируй App ID в Apple Developer Portal
+
+
+ШАГ 2. Apple Developer сертификат
+----------------------------------
+  - Платный Apple Developer Program ($99/год)
+  - Создай App ID с capabilities:
+      [x] Push Notifications
+      [x] App Groups
+      [x] Time Sensitive Notifications (если нужны)
+      [x] Communication Notifications (если нужны)
+  - Создай provisioning profile (Development или Distribution/Ad-Hoc)
+  - Убедись что в профиле есть:
+      aps-environment = production (или development для теста)
+      com.apple.security.application-groups = твои группы
+
+
+ШАГ 3. Entitlements в Xcode/Bazel
+---------------------------------
+  В .entitlements главного приложения:
+    <key>aps-environment</key>
+    <string>production</string>
+
+    <key>com.apple.security.application-groups</key>
+    <array>
+      <string>group.ТВОЙ_ID.1</string>
+      ...
+    </array>
+
+  То же для КАЖДОГО extension (NotificationService, NotificationContent, Widget...)
+
+
+ШАГ 4. UIBackgroundModes
+------------------------
+  В Info.plist:
+    <key>UIBackgroundModes</key>
+    <array>
+      <string>remote-notification</string>
+      <string>voip</string>
+      <string>fetch</string>
+      <string>audio</string>
+      <string>location</string>
+      <string>processing</string>
+    </array>
+
+  (минимум для push: remote-notification; остальное — как в Telegram)
+
+
+ШАГ 5. Notification Extensions
+-------------------------------
+  Обязательно включи и подпиши:
+    - NotificationService extension (com.apple.usernotifications.service)
+    - NotificationContent extension (опционально, для кастом UI)
+
+  Bundle ID extensions должен быть под тем же Team ID.
+  Все extensions подписываются ОДНИМ профилем/сертификатом с app.
+
+
+ШАГ 6. App Groups
+-----------------
+  - Создай App Group в Developer Portal
+  - Пропиши одинаковые group.* во всех таргетах (app + все extensions)
+  - Telegram использует 5 групп: group.1f56048729375e2d.{1,2,3,4,5}
+  - У тебя будут свои group.ТВОЙ_TEAM_ID.* — это нормально
+
+
+ШАГ 7. Фикс для сайдлоада (аналог TeleDark dylib)
+--------------------------------------------------
+  TeleDark решает проблему переподписи через runtime hook:
+
+    NSFileManager
+      - containerURLForSecurityApplicationGroupIdentifier:
+
+  Тебе нужен аналог если распространяешь IPA для переподписи чужими
+  сертификатами. Варианты:
+
+  A) Написать dylib на Theos/Logos:
+     %hook NSFileManager
+     - (NSURL *)containerURLForSecurityApplicationGroupIdentifier:(NSString *)id {
+       // подставить корректный путь для текущего сертификата
+       return %orig или кастомный URL;
+     }
+     %end
+
+  B) Использовать готовые: sideloadFixerLol.dylib / TelegramNotificationFix.dylib
+     (но они заточены под Team LKRRVC93D7 и polarbear App ID — нужна адаптация)
+
+  C) Если пользователь подписывает СВОИМ сертификатом с правильными
+     App Groups в профиле — хуки могут быть не нужны, всё заработает
+     нативно при корректной подписи всех таргетов.
+
+
+ШАГ 8. Подпись IPA
+------------------
+  Инструменты (поддерживаются каналом): ESign, Scarlet, GBox, Feather, KSign
+
+  При подписи:
+    1. Импорт .p12 + .mobileprovision
+    2. Выбрать IPA
+    3. НЕ менять Bundle ID
+    4. Подписать app + ВСЕ extensions + frameworks
+    5. Установить на устройство (UDID должен быть в профиле для Ad-Hoc)
+
+  Файл SignedByEsign в TeleDark подтверждает что использовался ESign.
+
+
+ШАГ 9. Проверка на устройстве
+-----------------------------
+  1. Настройки iOS → Teledark/твой клиент → Уведомления → Разрешить
+  2. Внутри приложения: Настройки → Уведомления (Telegram settings)
+  3. Убедиться что app не в Focus/Не беспокоить
+  4. Background App Refresh включён
+  5. При проблемах в РФ: MTProto proxy или стабильный VPN (вне scope реверса,
+     но канал ZiSipa упоминает работу без VPN для мода)
+
+
+================================================================================
+9. ЧАСТЫЕ ПРИЧИНЫ, ПОЧЕМУ PUSH НЕ РАБОТАЕТ
+================================================================================
+
+  [ ] Нет aps-environment в mobileprovision (бесплатная 7-дневная подпись)
+  [ ] Bundle ID изменён при подписи в ESign/Scarlet
+  [ ] Подписан только main app, extensions не подписаны
+  [ ] App Groups в профиле не совпадают с entitlements в бинарнике
+  [ ] UDID устройства не в Ad-Hoc профиле
+  [ ] Сертификат отозван Apple (revoked)
+  [ ] Нет интернета / блокировка соединения с APNs или Telegram DC
+  [ ] Пользователь запретил уведомления в iOS Settings
+  [ ] Нет dylib-фикса App Group при переподписи чужим сертификатом
+
+
+================================================================================
+10. ОТЛИЧИЕ ОТ ОФИЦИАЛЬНОГО TELEGRAM
+================================================================================
+
+  Официальный Telegram iOS:
+    Bundle ID:  ph.telegra.Telegraph (в открытых сборках Telegram-iOS)
+    Team:       Telegram FZ-LLC (C67CF9S4VU) — в fake-codesigning профилях
+    Push:       через сертификаты Telegram в App Store
+
+  TeleDark:
+    Bundle ID:  app.teledark
+    Подпись:    сторонний Developer (Rhoslyn Carney / LKRRVC93D7)
+    Push:       через APNs с aps-environment в СТОРОННЕМ профиле
+    + dylib фиксы для сайдлоада
+    + 15 injected dylib с мод-функциями
+
+  Серверы Telegram принимают device token для app.teledark как отдельного
+  клиента (свой bundle id в запросе регистрации push).
+
+
+================================================================================
+11. СВОДНАЯ ТАБЛИЦА
+================================================================================
+
+  Параметр                          | Значение в TeleDark v12.7
+  ----------------------------------|------------------------------------------
+  Bundle ID                         | app.teledark
+  App ID в профиле                  | LKRRVC93D7.app.polarbear5166.durian2960
+  Сертификат                        | iPhone Distribution: Rhoslyn Carney
+  Team ID                           | LKRRVC93D7
+  Тип профиля                       | Ad-Hoc, 1 UDID
+  aps-environment                   | production
+  App Groups                        | group.1f56048729375e2d.1..5
+  NotificationService bundle        | app.teledark.NotificationService
+  NotificationContent bundle        | app.teledark.NotificationContent
+  UIBackgroundModes                 | remote-notification + voip + fetch + ...
+  Dylib фикс App Group              | TelegramNotificationFix.dylib
+  Dylib фикс sideload               | sideloadFixerLol.dylib
+  Substrate runtime                 | libsubstrate.dylib
+  Основной мод                      | liberade.dylib (5.7 MB)
+  Инструмент переподписи (маркер)   | ESign (SignedByEsign)
+  Требование канала                 | личный сертификат + не менять Bundle ID
+
+
+================================================================================
+12. ФАЙЛЫ ДЛЯ ИЗУЧЕНИЯ В РАСПАКОВАННОМ IPA
+================================================================================
+
+  Payload/Telegram.app/Info.plist
+  Payload/Telegram.app/embedded.mobileprovision
+  Payload/Telegram.app/Telegram                          (main Mach-O)
+  Payload/Telegram.app/TelegramNotificationFix.dylib
+  Payload/Telegram.app/sideloadFixerLol.dylib
+  Payload/Telegram.app/liberdade.dylib
+  Payload/Telegram.app/SignedByEsign
+  Payload/Telegram.app/PlugIns/NotificationServiceExtensionv1.appex/
+  Payload/Telegram.app/PlugIns/NotificationContentExtension.appex/
+  Payload/Telegram.app/Frameworks/TelegramCoreFramework.framework/
+  Payload/Telegram.app/Frameworks/TelegramUIFramework.framework/
+  Payload/Telegram.app/_CodeSignature/CodeResources
+
+
+================================================================================
+КОНЕЦ ДОКУМЕНТА
+================================================================================
