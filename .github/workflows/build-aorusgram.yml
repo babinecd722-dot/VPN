@@ -1,0 +1,873 @@
+name: Build AorusGram IPA
+
+on:
+  push:
+    branches: [ main, "claude/**", "cursor/**" ]
+  workflow_dispatch:
+
+# Do not cancel in-progress Bazel runs: a new push or manual dispatch must not kill a 40–60m build.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    env:
+      # Quiets GitHub deprecation warnings for actions/cache, checkout, upload-artifact on Node 20.
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: aorusgram
+
+      - name: Cache Telegram iOS source
+        id: tg-cache
+        uses: actions/cache@v4
+        with:
+          path: telegram-ios
+          key: tg-ios-src-v201-release-12.8-png8
+
+      - name: Clone Telegram iOS
+        if: steps.tg-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 --branch release-12.8 \
+            https://github.com/TelegramMessenger/Telegram-iOS.git telegram-ios
+          cd telegram-ios
+          git submodule update --init --depth=1 --jobs=4 || true
+
+      - name: Ensure rlottie submodule
+        run: |
+          cd telegram-ios
+          CPP_COUNT=$(find submodules/rlottie/rlottie/src -name "*.cpp" 2>/dev/null | wc -l)
+          echo "rlottie .cpp files found: $CPP_COUNT"
+          if [ "$CPP_COUNT" -eq 0 ]; then
+            echo "rlottie empty — cloning directly..."
+            rm -rf submodules/rlottie/rlottie
+            git clone --depth=1 https://github.com/TelegramMessenger/rlottie.git submodules/rlottie/rlottie
+          fi
+          echo "rlottie .cpp count after: $(find submodules/rlottie/rlottie/src -name '*.cpp' | wc -l)"
+
+      # Cosmetic: a few upstream icons ship as sub-8-bit or 16-bit PNGs, which makes
+      # CopyPng emit "Input PNG does not have an 8 bit input depth" warnings. Re-encode
+      # just those known assets to 8-bit, mode-aware so pixels stay visually identical:
+      # 1-bit grayscale -> 8-bit L, palette/16-bit/etc. -> 8-bit RGBA. If Pillow is
+      # unavailable, fall back to macOS sips so the step still normalizes the known files.
+      - name: Normalize non-8-bit PNGs to 8-bit (silence libpng warnings)
+        run: |
+          cd telegram-ios
+          python3 -m pip install --quiet --disable-pip-version-check Pillow >/dev/null 2>&1 || pip3 install --quiet Pillow >/dev/null 2>&1 || true
+          python3 << 'PYEOF'
+          import os
+          import shutil
+          import subprocess
+          import tempfile
+          try:
+              from PIL import Image
+              has_pillow = True
+          except Exception as e:
+              print("Pillow unavailable — using sips fallback:", e)
+              has_pillow = False
+          names = {
+              "VideoRecordArrow",
+              "PhotoEditorCropCorners",
+              "ModernMediaEmptyAlbumIcon",
+              "MediaGroupBurst",
+              "MediaGroupAll",
+              "CameraFocusCrosshairs",
+              "CameraAutoFocusCrosshairs",
+          }
+
+          def normalize_with_pillow(path):
+              im = Image.open(path)
+              if im.mode == "1":
+                  im2 = im.convert("L")
+              elif im.mode == "P":
+                  im2 = im.convert("RGBA")
+              elif im.mode in ("L", "LA", "RGB", "RGBA"):
+                  im2 = im
+              else:
+                  im2 = im.convert("RGBA")
+              im2.save(path, format="PNG", optimize=True)
+
+          def normalize_with_sips(path):
+              sips = "/usr/bin/sips"
+              if not os.path.exists(sips):
+                  raise RuntimeError("sips not found")
+              fd, tmp = tempfile.mkstemp(prefix=".aorus-png-", suffix=".png", dir=os.path.dirname(path) or ".")
+              os.close(fd)
+              try:
+                  result = subprocess.run(
+                      [sips, "-s", "format", "png", path, "--out", tmp],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.STDOUT,
+                      text=True,
+                      check=False,
+                  )
+                  if result.returncode != 0:
+                      raise RuntimeError(result.stdout.strip() or f"sips exited {result.returncode}")
+                  shutil.move(tmp, path)
+              finally:
+                  if os.path.exists(tmp):
+                      os.unlink(tmp)
+
+          count = 0
+          for root, _, files in os.walk("."):
+              for fn in files:
+                  if not fn.endswith(".png"):
+                      continue
+                  base = fn.split("@", 1)[0].rsplit(".", 1)[0]
+                  if base not in names:
+                      continue
+                  p = os.path.join(root, fn)
+                  try:
+                      if has_pillow:
+                          normalize_with_pillow(p)
+                      else:
+                          normalize_with_sips(p)
+                      count += 1
+                      print("8-bit:", p)
+                  except Exception as e:
+                      print("skip", p, e)
+          print("PNG normalization done, converted", count)
+          PYEOF
+
+      # Must run on every SDK: on iOS 26+ the "Fix Icon Composer" step is skipped and
+      # these lines were never appended — Bazel then enables index-while-building (slow,
+      # extra GitHub downloads) and can hit 502/timeouts during repo fetch.
+      - name: Bazel CI tuning (.bazelrc, always)
+        run: |
+          BC=telegram-ios/.bazelrc
+          touch "$BC"
+          add() { grep -qxF "$1" "$BC" 2>/dev/null || echo "$1" >> "$BC"; }
+          add "build --incompatible_disallow_empty_glob=false"
+          # Quiets Bazel 8 MODULE.bazel vs resolved graph mismatch (bazel_features / skylib / platforms).
+          add "build --check_direct_dependencies=off"
+          add "build --features=-swift.index_while_building"
+          add "build --features=-swift.use_global_index_store"
+          # Device IPA without Apple identity: Telegram vendors rules_apple with disable_legacy_signing
+          # (skips legacy codesign path that requires a cert matching the .mobileprovision).
+          add "build --features=disable_legacy_signing"
+          echo "=== tail $BC ==="; tail -5 "$BC"
+
+      - name: Patch Telegram/BUILD bundle IDs to AorusGram
+        run: |
+          python3 << 'PYEOF'
+          import os
+
+          # Replacements — order matters: specific suffixes before the base ID
+          replacements = [
+              ('ph.telegra.Telegraph.Share',                   'com.aorusgram.Share'),
+              ('ph.telegra.Telegraph.SiriIntents',             'com.aorusgram.SiriIntents'),
+              ('ph.telegra.Telegraph.Widget',                  'com.aorusgram.Widget'),
+              ('ph.telegra.Telegraph.BroadcastUpload',         'com.aorusgram.BroadcastUpload'),
+              ('ph.telegra.Telegraph.NotificationServiceExtension', 'com.aorusgram.NotificationService'),
+              ('ph.telegra.Telegraph.NotificationService',     'com.aorusgram.NotificationService'),
+              ('ph.telegra.Telegraph.NotificationContent',     'com.aorusgram.NotificationContent'),
+              ('ph.telegra.Telegraph.WatchkitApp',             'com.aorusgram.watchkitapp'),
+              ('ph.telegra.Telegraph.WatchkitExtension',       'com.aorusgram.watchkitapp.watchkitextension'),
+              ('ph.telegra.Telegraph.SiriIntentsUI',           'com.aorusgram.SiriIntentsUI'),
+              ('ph.telegra.Telegraph',                         'com.aorusgram'),
+              ('C67CF9S4VU',                                   'R9Q5YYQM2M'),
+          ]
+
+          # 1. Patch Telegram/BUILD
+          build_path = 'telegram-ios/Telegram/BUILD'
+          if os.path.exists(build_path):
+              t = open(build_path).read()
+              for old, new in replacements:
+                  n = t.count(old)
+                  if n:
+                      t = t.replace(old, new)
+                      print(f'BUILD: replaced {n}x "{old}"')
+              # After replacing bundle IDs, store_bundle_ids now contains our ID,
+              # which triggers com.apple.developer.applesignin entitlement.
+              # Clear the list so none of the App-Store-only entitlements are added.
+              import re as _re
+              t = _re.sub(r'store_bundle_ids\s*=\s*\[.*?\]', 'store_bundle_ids = []', t, flags=_re.DOTALL)
+              # Also clear official_bundle_ids to skip VoIP/CarPlay/associated-domains
+              t = _re.sub(r'official_bundle_ids\s*=\s*\[.*?\]', 'official_bundle_ids = []', t, flags=_re.DOTALL)
+              # Device + --disableProvisioningProfiles: every select() used None for this branch.
+              # rules_apple fails if ANY built target still resolves to None. count=1 only fixed the
+              # first match (an extension), not //Telegram:Telegram — replace all branches.
+              t2, nprov = _re.subn(
+                  r'(":disableProvisioningProfilesSetting"\s*:\s*)None(\s*,)',
+                  r'\1"@build_configuration//provisioning:Telegram.mobileprovision"\2',
+                  t,
+              )
+              if nprov:
+                  t = t2
+                  print(f'BUILD: disableProvisioningProfiles → Telegram.mobileprovision ({nprov} branches)')
+              # Bazel merges plist_fragment() templates from this file — on-disk Info.plist is NOT enough.
+              build_brand = [
+                  (
+                      '<key>CFBundleDisplayName</key>\n    <string>Telegram</string>',
+                      '<key>CFBundleDisplayName</key>\n    <string>Aorusgram</string>',
+                  ),
+                  (
+                      '<key>CFBundleName</key>\n    <string>Telegram</string>',
+                      '<key>CFBundleName</key>\n    <string>Aorusgram</string>',
+                  ),
+                  (
+                      '<key>CFBundleURLSchemes</key>\n            <array>\n                <string>telegram</string>\n            </array>',
+                      '<key>CFBundleURLSchemes</key>\n            <array>\n                <string>aorusgram</string>\n            </array>',
+                  ),
+              ]
+              for old_b, new_b in build_brand:
+                  n = t.count(old_b)
+                  if n:
+                      t = t.replace(old_b, new_b)
+                      print(f'BUILD branding: replaced {n}x', old_b.split()[0:2])
+                  else:
+                      print('WARNING: BUILD branding pattern missing:', old_b[:70].replace('\n', ' '))
+              open(build_path, 'w').write(t)
+              print('BUILD file patched: store_bundle_ids and official_bundle_ids cleared')
+          else:
+              print('WARNING: Telegram/BUILD not found')
+
+          # 2. Patch all *.entitlements files in telegram-ios/Telegram/
+          ent_dir = 'telegram-ios/Telegram'
+          if os.path.isdir(ent_dir):
+              for fname in sorted(os.listdir(ent_dir)):
+                  if fname.endswith('.entitlements'):
+                      fpath = os.path.join(ent_dir, fname)
+                      t2 = open(fpath).read()
+                      changed = False
+                      for old, new in replacements:
+                          if old in t2:
+                              t2 = t2.replace(old, new)
+                              changed = True
+                      if changed:
+                          open(fpath, 'w').write(t2)
+                          print(f'Entitlements patched: {fname}')
+          PYEOF
+
+      - name: Setup Xcode (newest available, prefer iOS 26 SDK)
+        id: xcode_setup
+        run: |
+          echo "=== All installed Xcodes ==="
+          ls -d /Applications/Xcode*.app 2>/dev/null || echo "(no Xcode_*.app found, only default)"
+
+          # Pick the newest Xcode by version. Order: 26 > 17 > 16 > fallback.
+          XCODE=""
+          for cand in $(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V -r); do
+            XCODE="$cand"; break
+          done
+          if [ -z "$XCODE" ] && [ -d /Applications/Xcode.app ]; then
+            XCODE=/Applications/Xcode.app
+          fi
+          if [ -z "$XCODE" ]; then
+            echo "FATAL: no Xcode installation found"
+            exit 1
+          fi
+
+          echo "Selected Xcode: $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+
+          echo "=== iOS SDKs ==="
+          xcodebuild -showsdks 2>/dev/null | grep -iE "iphoneos|ios" || true
+
+          # Detect iOS SDK major version to gate compatibility patches.
+          IOS_SDK=$(xcodebuild -showsdks 2>/dev/null | grep -oE 'iphoneos[0-9]+' | sort -V | tail -1 | grep -oE '[0-9]+')
+          if [ -z "$IOS_SDK" ]; then IOS_SDK=0; fi
+          echo "Detected iOS SDK major: $IOS_SDK"
+          echo "ios_sdk_major=$IOS_SDK" >> "$GITHUB_OUTPUT"
+
+          # Detect Swift compiler version
+          SWIFT_VER=$(swift --version 2>/dev/null | grep -oE 'Swift version [0-9]+\.[0-9]+' | head -1 | awk '{print $3}')
+          echo "Swift compiler: $SWIFT_VER"
+          echo "swift_version=$SWIFT_VER" >> "$GITHUB_OUTPUT"
+
+      - name: Fix Icon Composer bundles (only if SDK < iOS 26)
+        if: ${{ steps.xcode_setup.outputs.ios_sdk_major < 26 }}
+        run: |
+          python3 -c "import base64; exec(base64.b64decode('aW1wb3J0IG9zLCBzaHV0aWwsIHN0cnVjdCwgemxpYiwganNvbgpkZWYgY3JlYXRlX3BuZygpOgogICAgdywgaCA9IDEwMjQsIDEwMjQKICAgIGRlZiBtayh0LCBkKToKICAgICAgICBjID0gdCArIGQKICAgICAgICByZXR1cm4gc3RydWN0LnBhY2soJz5JJywgbGVuKGQpKSArIGMgKyBzdHJ1Y3QucGFjaygnPkknLCB6bGliLmNyYzMyKGMpICYgMHhmZmZmZmZmZikKICAgIHJvdyA9IGJ5dGVzKFswXSkgKyBieXRlcyhbMzMsIDE1MCwgMjQzXSAqIHcpCiAgICBpZGF0ID0gemxpYi5jb21wcmVzcyhyb3cgKiBoLCA5KQogICAgaWhkciA9IHN0cnVjdC5wYWNrKCc+SUlCQkJCQicsIHcsIGgsIDgsIDIsIDAsIDAsIDApCiAgICByZXR1cm4gYidceDg5UE5HXHJcblx4MWFcbicgKyBtayhiJ0lIRFInLCBpaGRyKSArIG1rKGInSURBVCcsIGlkYXQpICsgbWsoYidJRU5EJywgYicnKQpwbmdfYnl0ZXMgPSBjcmVhdGVfcG5nKCkKaWNvbl9kaXJzID0gW10KZm9yIHJvb3QsIGRpcnMsIGZpbGVzIGluIG9zLndhbGsoJ3RlbGVncmFtLWlvcycpOgogICAgZm9yIGQgaW4gZGlyczoKICAgICAgICBpZiBkLmVuZHN3aXRoKCcuaWNvbicpOgogICAgICAgICAgICBpY29uX2RpcnMuYXBwZW5kKG9zLnBhdGguam9pbihyb290LCBkKSkKcHJpbnQoJ0ZvdW5kJywgbGVuKGljb25fZGlycyksICcuaWNvbiBidW5kbGUocyknKQpmb3IgaWNvbl9wYXRoIGluIGljb25fZGlyczoKICAgIG5hbWUgPSBvcy5wYXRoLmJhc2VuYW1lKGljb25fcGF0aClbOi01XQogICAgcGFyZW50ID0gb3MucGF0aC5kaXJuYW1lKGljb25fcGF0aCkKICAgIGFwcGljb25zZXQgPSBvcy5wYXRoLmpvaW4ocGFyZW50LCBuYW1lICsgJy5hcHBpY29uc2V0JykKICAgIG9zLm1ha2VkaXJzKGFwcGljb25zZXQsIGV4aXN0X29rPVRydWUpCiAgICBvcGVuKG9zLnBhdGguam9pbihhcHBpY29uc2V0LCAnQXBwSWNvbi5wbmcnKSwgJ3diJykud3JpdGUocG5nX2J5dGVzKQogICAgb3Blbihvcy5wYXRoLmpvaW4oYXBwaWNvbnNldCwgJ0NvbnRlbnRzLmpzb24nKSwgJ3cnKS53cml0ZShqc29uLmR1bXBzKHsnaW1hZ2VzJzogW3snZmlsZW5hbWUnOiAnQXBwSWNvbi5wbmcnLCAnaWRpb20nOiAndW5pdmVyc2FsJywgJ3BsYXRmb3JtJzogJ2lvcycsICdzaXplJzogJzEwMjR4MTAyNCd9XSwgJ2luZm8nOiB7J2F1dGhvcic6ICd4Y29kZScsICd2ZXJzaW9uJzogMX19KSkKICAgIHNodXRpbC5ybXRyZWUoaWNvbl9wYXRoKQogICAgcHJpbnQoJ1JlcGxhY2VkOicsIGljb25fcGF0aCkKcHJpbnQoJ0RvbmU6JywgbGVuKGljb25fZGlycyksICdidW5kbGUocykgcmVwbGFjZWQnKQo=').decode())"
+
+      - name: Patch SDK compatibility (only if SDK < iOS 26)
+        if: ${{ steps.xcode_setup.outputs.ios_sdk_major < 26 }}
+        run: |
+          python3 << 'SDKEOF'
+          import re, os, glob
+
+          def patch_file(path, fn):
+              if not os.path.exists(path):
+                  print(f'Not found: {path}'); return
+              try:
+                  c = open(path, encoding='utf-8', errors='ignore').read()
+                  n = fn(c)
+                  if n != c:
+                      open(path, 'w', encoding='utf-8').write(n)
+                      print(f'Patched: {path}')
+              except Exception as e:
+                  print(f'Error {path}: {e}')
+
+          # Detect Swift compiler version (Xcode 16 = Swift 6.0+)
+          # We use #if compiler(>=6.0) as the gate. iOS 26 (UIGlassEffect,
+          # WindowingControlStyle) is NOT in any released Xcode yet — keep stubs
+          # for compiler < 6.2; the runtime #available guards still work on iOS 26 devices.
+
+          # ── 1. NativeWindowHostView.swift — iOS 26 WindowingControlStyle ──────
+          # Xcode 16 (compiler 6.0) does NOT have iOS 26 SDK either. Wrap with
+          # #if compiler(>=6.2) so it compiles on Xcode 16, runtime-guards on iOS 26.
+          def fix_nativewindow(c):
+              if 'WindowingControlStyle' not in c: return c
+              lines = c.split('\n'); result = []; i = 0; n = 0
+              while i < len(lines):
+                  ln = lines[i]
+                  if ('@available(iOS 26' in ln and i+1 < len(lines) and
+                      'func ' in lines[i+1] and 'WindowingControlStyle' in lines[i+1]):
+                      sp = ' ' * (len(ln) - len(ln.lstrip()))
+                      result.append(sp + '#if compiler(>=6.2)')
+                      result.append(ln); result.append(lines[i+1])
+                      depth = lines[i+1].count('{') - lines[i+1].count('}'); i += 2
+                      while i < len(lines) and depth > 0:
+                          result.append(lines[i])
+                          depth += lines[i].count('{') - lines[i].count('}'); i += 1
+                      result.append(sp + '#endif'); n += 1
+                  else:
+                      result.append(ln); i += 1
+              if n: print(f'NativeWindowHostView: {n} iOS 26 block(s) wrapped')
+              return '\n'.join(result)
+
+          patch_file('telegram-ios/submodules/Display/Source/NativeWindowHostView.swift', fix_nativewindow)
+
+          # ── 2. GlassBackgroundComponent.swift — iOS 26 UIGlassEffect ──────────
+          # Stub the iOS 26 types when compiler doesn't have them.
+          def fix_glass(c):
+              stub = """#if !compiler(>=6.2)
+          @available(iOS 26.0, *)
+          class UIGlassEffect: UIVisualEffect {
+              enum Style { case regular, clear }
+              convenience init(style: Style) { self.init() }
+              var tintColor: UIColor?
+              var isInteractive: Bool = false
+          }
+          @available(iOS 26.0, *)
+          class UIGlassContainerEffect: UIVisualEffect {
+              var spacing: CGFloat = 0.0
+          }
+          #endif
+          """
+              if 'UIGlassEffect' in c and '#if !compiler(>=6.2)' not in c:
+                  # Remove any old #if !compiler(>=6.0) stubs
+                  c = re.sub(r'#if !compiler\(>=6\.0\)\n.*?#endif\n', '', c, flags=re.DOTALL)
+                  lines = c.split('\n'); ins = 0
+                  for j, ln in enumerate(lines):
+                      if ln.strip().startswith('import ') or ln.strip() == '': ins = j+1
+                      elif ins > 0: break
+                  lines.insert(ins, stub); c = '\n'.join(lines)
+                  print('GlassBackgroundComponent: UIGlassEffect stub inserted (compiler<6.2)')
+              return c
+
+          patch_file('telegram-ios/submodules/TelegramUI/Components/GlassBackgroundComponent/Sources/GlassBackgroundComponent.swift', fix_glass)
+
+          print('=== Done. Xcode 16 + iOS 18 SDK handles NSAdaptiveImageGlyph, .limited, supportsAdaptiveImageGlyph, trackConfiguration natively. ===')
+          SDKEOF
+
+      - name: Inject AorusGram sources
+        run: |
+          PATCHES=aorusgram/patches
+          TG=telegram-ios
+          PEER=$TG/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen
+
+          # 0. AorusGram core (ClientSpoofManager, AorusGramBootstrap, etc.) — must link into TelegramUI
+          mkdir -p $TG/submodules/AorusGram
+          rm -rf $TG/submodules/AorusGram/Sources
+          cp -a aorusgram/AorusGram/Sources $TG/submodules/AorusGram/
+          cp $PATCHES/submodules/AorusGram/BUILD $TG/submodules/AorusGram/
+          python3 << 'PY'
+          from pathlib import Path
+          p = Path("telegram-ios/submodules/TelegramUI/BUILD")
+          t = p.read_text()
+          needle = '        "//submodules/TelegramUIPreferences:TelegramUIPreferences",\n'
+          if needle not in t:
+              raise SystemExit("TelegramUI BUILD: needle for AorusGram insert not found")
+          deps = [
+              ('//submodules/AorusGram:AorusGram', '        "//submodules/AorusGram:AorusGram",\n'),
+              ('//submodules/AorusGramUI:AorusGramUI', '        "//submodules/AorusGramUI:AorusGramUI",\n'),
+          ]
+          insert = ""
+          for label, dep in deps:
+              if label in t:
+                  print(f"TelegramUI BUILD: {label} dep already present")
+              else:
+                  insert += dep
+                  print(f"TelegramUI BUILD: added {label}")
+          if insert:
+              t = t.replace(needle, needle + insert, 1)
+              p.write_text(t)
+          PY
+
+          # 1. Copy AorusGramUI module (all new code, no conflicts)
+          # Wipe the tree first: cached telegram-ios may still contain renamed/removed Swift
+          # files; plain cp -r merges and leaves stale basenames → Bazel "filename used twice".
+          rm -rf $TG/submodules/AorusGramUI
+          mkdir -p $TG/submodules/AorusGramUI
+          cp -r $PATCHES/submodules/AorusGramUI/. $TG/submodules/AorusGramUI/
+
+          # 1b. Copy AorusBadge module (local verification/DEV/meme badge system)
+          rm -rf $TG/submodules/AorusBadge
+          mkdir -p $TG/submodules/AorusBadge
+          cp -r $PATCHES/submodules/AorusBadge/. $TG/submodules/AorusBadge/
+
+          # 2. Add AorusGramUI dep to the REAL PeerInfoScreen BUILD in place.
+          #    (Do NOT overwrite with a stale full copy — upstream drifts, e.g. it
+          #    removed WebSearchUI, which broke analysis when our copy still listed it.)
+          python3 -c "import base64; exec(base64.b64decode('aW1wb3J0IHJlCnAgPSAndGVsZWdyYW0taW9zL3N1Ym1vZHVsZXMvVGVsZWdyYW1VSS9Db21wb25lbnRzL1BlZXJJbmZvL1BlZXJJbmZvU2NyZWVuL0JVSUxEJwp0ID0gb3BlbihwKS5yZWFkKCkKaWYgJy8vc3VibW9kdWxlcy9Bb3J1c0dyYW1VSScgaW4gdDoKICAgIHByaW50KCdQZWVySW5mb1NjcmVlbiBCVUlMRDogQW9ydXNHcmFtVUkgZGVwIGFscmVhZHkgcHJlc2VudCcpCmVsc2U6CiAgICBpID0gdC5maW5kKCdkZXBzID0gWycpCiAgICBpZiBpID09IC0xOgogICAgICAgIHJhaXNlIFN5c3RlbUV4aXQoJ1BlZXJJbmZvU2NyZWVuIEJVSUxEOiBkZXBzIGFuY2hvciBub3QgZm91bmQnKQogICAgbmwgPSB0LmZpbmQoJ1xuJywgaSkgKyAxCiAgICB0ID0gdFs6bmxdICsgJyAgICAgICAgIi8vc3VibW9kdWxlcy9Bb3J1c0dyYW1VSSIsXG4nICsgdFtubDpdCiAgICBvcGVuKHAsICd3Jykud3JpdGUodCkKICAgIHByaW50KCdQZWVySW5mb1NjcmVlbiBCVUlMRDogYWRkZWQgQW9ydXNHcmFtVUkgZGVwJykK').decode())"
+
+          # 3. Add the AorusGram Settings disclosure item to the REAL upstream
+          #    PeerInfoSettingsItems.swift in place. (Do NOT overwrite with a stale
+          #    full copy — upstream drifts: 12.8 changed RenderedPeer -> EngineRenderedPeer
+          #    in this file, which broke our snapshot copy. In-place patching tracks upstream.)
+          python3 << 'PY'
+          import sys
+          from pathlib import Path
+          p = Path("telegram-ios/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/PeerInfoSettingsItems.swift")
+          if not p.is_file():
+              sys.exit("PeerInfoSettingsItems.swift not found")
+          t = p.read_text(encoding="utf-8")
+
+          # 3a. Dedicated section for AorusGram, placed immediately after the myProfile
+          #     case so it renders as its OWN block directly under the "My Profile" block.
+          if "case aorusGram" not in t:
+              enum_anchor = "    case myProfile\n"
+              if enum_anchor not in t:
+                  sys.exit("PeerInfoSettingsItems: myProfile enum case not found")
+              t = t.replace(enum_anchor, enum_anchor + "    case aorusGram\n", 1)
+              print("PeerInfoSettingsItems: added aorusGram section after myProfile")
+
+          # 3b. A single "AorusGram" row in that section. Icon = white gear on a blue
+          #     rounded square, rendered by Telegram's own settings-icon helper (identical
+          #     look to native rows like Notifications/Privacy, matching the reference photo).
+          if "interaction.openSettings(.aorusGram)" not in t:
+              anchor = "items[.support]!.append(PeerInfoScreenDisclosureItem(id: 0, text: presentationData.strings.Settings_Support,"
+              idx = t.find(anchor)
+              if idx == -1:
+                  sys.exit("PeerInfoSettingsItems: Settings_Support anchor not found")
+              line_start = t.rfind("\n", 0, idx) + 1
+              indent = t[line_start:idx]
+              block = (
+                  indent + "let aorusRowIcon: UIImage? = {\n"
+                  + indent + "    // AorusGram brand icon (white A on black), embedded as base64 and drawn into a rounded\n"
+                  + indent + "    // 30x30 settings tile (always the black icon, independent of theme).\n"
+                  + indent + "    let aorusIconB64 = \"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\"\n"
+                  + indent + "    guard let aorusIconData = Data(base64Encoded: aorusIconB64), let base = UIImage(data: aorusIconData) else { return nil }\n"
+                  + indent + "    let sz = CGSize(width: 30.0, height: 30.0)\n"
+                  + indent + "    return UIGraphicsImageRenderer(size: sz).image { _ in\n"
+                  + indent + "        UIBezierPath(roundedRect: CGRect(origin: .zero, size: sz), cornerRadius: 8.0).addClip()\n"
+                  + indent + "        base.draw(in: CGRect(origin: .zero, size: sz))\n"
+                  + indent + "    }\n"
+                  + indent + "}()\n"
+                  + indent + "items[.aorusGram]!.append(PeerInfoScreenDisclosureItem(id: 0, text: \"AorusGram\", icon: aorusRowIcon, action: {\n"
+                  + indent + "    interaction.openSettings(.aorusGram)\n"
+                  + indent + "}))\n"
+              )
+              t = t[:line_start] + block + t[line_start:]
+              print("PeerInfoSettingsItems: inserted AorusGram row in its own section under My Profile")
+          else:
+              print("PeerInfoSettingsItems: AorusGram item already present")
+
+          p.write_text(t, encoding="utf-8")
+          PY
+
+          # 4. Patch PeerInfoScreen.swift in-place (add case aorusGram to enum)
+          # 5. Patch PeerInfoScreenSettingsActions.swift in-place (add import + case)
+          python3 -c "import base64; exec(base64.b64decode('aW1wb3J0IHJlLCBvcwoKcGVlcl9kaXIgPSAndGVsZWdyYW0taW9zL3N1Ym1vZHVsZXMvVGVsZWdyYW1VSS9Db21wb25lbnRzL1BlZXJJbmZvL1BlZXJJbmZvU2NyZWVuL1NvdXJjZXMnCgojIDEuIFBhdGNoIFBlZXJJbmZvU2NyZWVuLnN3aWZ0IOKAlCBhZGQgYW9ydXNHcmFtIHRvIGVudW0gb25seQpzY3JlZW5fcGF0aCA9IG9zLnBhdGguam9pbihwZWVyX2RpciwgJ1BlZXJJbmZvU2NyZWVuLnN3aWZ0JykKdCA9IG9wZW4oc2NyZWVuX3BhdGgpLnJlYWQoKQppZiAnY2FzZSBhb3J1c0dyYW0nIG5vdCBpbiB0OgogICAgbSA9IHJlLnNlYXJjaChyJyhlbnVtIFBlZXJJbmZvU2V0dGluZ3NTZWN0aW9uIFx7KSguKj8pKFxuXH0pJywgdCwgcmUuRE9UQUxMKQogICAgaWYgbToKICAgICAgICB0ID0gdFs6bS5zdGFydCgzKV0gKyAnXG4gICAgY2FzZSBhb3J1c0dyYW0nICsgdFttLnN0YXJ0KDMpOl0KICAgICAgICBvcGVuKHNjcmVlbl9wYXRoLCAndycpLndyaXRlKHQpCiAgICAgICAgcHJpbnQoJ1BhdGNoZWQgUGVlckluZm9TY3JlZW4uc3dpZnQ6IGFkZGVkIGNhc2UgYW9ydXNHcmFtJykKICAgIGVsc2U6CiAgICAgICAgcHJpbnQoJ1dBUk5JTkc6IFBlZXJJbmZvU2V0dGluZ3NTZWN0aW9uIG5vdCBmb3VuZCcpCmVsc2U6CiAgICBwcmludCgnUGVlckluZm9TY3JlZW4uc3dpZnQ6IGFvcnVzR3JhbSBhbHJlYWR5IHByZXNlbnQnKQoKIyAyLiBQYXRjaCBQZWVySW5mb1NjcmVlblNldHRpbmdzQWN0aW9ucy5zd2lmdCDigJQgYWRkIGltcG9ydCArIG9uZSBjYXNlCmFjdGlvbnNfcGF0aCA9IG9zLnBhdGguam9pbihwZWVyX2RpciwgJ1BlZXJJbmZvU2NyZWVuU2V0dGluZ3NBY3Rpb25zLnN3aWZ0JykKdCA9IG9wZW4oYWN0aW9uc19wYXRoKS5yZWFkKCkKY2hhbmdlZCA9IEZhbHNlCgppZiAnaW1wb3J0IEFvcnVzR3JhbVVJJyBub3QgaW4gdDoKICAgIHQgPSByZS5zdWIocideKGltcG9ydCBcdyspJywgcidcMVxuaW1wb3J0IEFvcnVzR3JhbVVJJywgdCwgY291bnQ9MSwgZmxhZ3M9cmUuTVVMVElMSU5FKQogICAgY2hhbmdlZCA9IFRydWUKICAgIHByaW50KCdBZGRlZCBpbXBvcnQgQW9ydXNHcmFtVUknKQoKaWYgJ2Nhc2UgLmFvcnVzR3JhbScgbm90IGluIHQ6CiAgICBhb3J1c19jYXNlID0gJyAgICAgICAgY2FzZSAuYW9ydXNHcmFtOlxuICAgICAgICAgICAgcHVzaChhb3J1c0dyYW1Db250cm9sbGVyKGNvbnRleHQ6IHNlbGYuY29udGV4dCkpXG4nCiAgICBmb3IgdGFyZ2V0IGluIFsnICAgICAgICBjYXNlIC5mYXE6JywgJyAgICAgICAgY2FzZSAudGlwczonLCAnICAgICAgICBjYXNlIC5zdXBwb3J0OiddOgogICAgICAgIGlmIHRhcmdldCBpbiB0OgogICAgICAgICAgICB0ID0gdC5yZXBsYWNlKHRhcmdldCwgYW9ydXNfY2FzZSArIHRhcmdldCwgMSkKICAgICAgICAgICAgY2hhbmdlZCA9IFRydWUKICAgICAgICAgICAgcHJpbnQoJ0FkZGVkIGFvcnVzR3JhbSBjYXNlIGJlZm9yZScsIHRhcmdldC5zdHJpcCgpKQogICAgICAgICAgICBicmVhawoKaWYgY2hhbmdlZDoKICAgIG9wZW4oYWN0aW9uc19wYXRoLCAndycpLndyaXRlKHQpCiAgICBwcmludCgnU2F2ZWQgYWN0aW9ucyBmaWxlJykKZWxzZToKICAgIHByaW50KCdBY3Rpb25zIGZpbGU6IG5vIGNoYW5nZXMgbmVlZGVkJykK').decode())"
+
+          # 6. Copy the AorusGram conversation-export helper into the PeerInfoScreen
+          #    module (compiled via the module's Sources/**/*.swift glob; the "Download
+          #    conversation" menu item is injected into PeerInfoScreenPerformButtonAction
+          #    by aorus_branding.py).
+          cp $PATCHES/submodules/TelegramUI/Components/PeerInfo/PeerInfoScreen/Sources/AorusConversationExport.swift $PEER/Sources/
+
+          # 7. Copy the AorusGram "user's messages in group" chat-contents helper into the
+          #    TelegramUI module (Sources/**/*.swift glob). The context-menu item and the
+          #    single "Go to message" action are injected by aorus_branding.py.
+          cp $PATCHES/submodules/TelegramUI/Sources/AorusUserMessages.swift $TG/submodules/TelegramUI/Sources/
+
+          # 8. Copy the AorusGram SOCKS5 call-proxy reader into TelegramCallsUI (the
+          #    call-start sites are patched to use it by aorus_branding.py).
+          cp $PATCHES/submodules/TelegramCallsUI/Sources/AorusCallProxy.swift $TG/submodules/TelegramCallsUI/Sources/
+
+          # 9. Copy the login-by-backup account picker into AuthorizationUI (compiled via
+          #    its Sources/**/*.swift glob). The themed key button on the phone-entry
+          #    screen that presents it is injected by aorus_branding.py.
+          cp $PATCHES/submodules/AuthorizationUI/Sources/AorusLoginBackupPicker.swift $TG/submodules/AuthorizationUI/Sources/
+
+          echo "Injection complete"
+          echo "--- AorusGramUI sources ---"
+          ls -la $TG/submodules/AorusGramUI/Sources/
+
+      - name: AorusGram branding (launch screen, name, URLs, icons, strings)
+        env:
+          # License HMAC key — injected (obfuscated) into LicenseKeyProvider.swift
+          # at build time. Set this as a repo secret. If unset, the license client
+          # is left unprovisioned (refuses to sign) and the build still succeeds.
+          LICENSE_HMAC_KEY_HEX: ${{ secrets.LICENSE_HMAC_KEY_HEX }}
+        run: |
+          python3 aorusgram/scripts/aorus_branding.py telegram-ios
+          # Cached telegram-ios trees can carry AppDelegate edits without a matching import line.
+          python3 << 'PY'
+          import sys
+          from pathlib import Path
+          p = Path("telegram-ios/submodules/TelegramUI/Sources/AppDelegate.swift")
+          if not p.is_file():
+              sys.exit("AppDelegate.swift missing")
+          t = p.read_text(encoding="utf-8")
+          if "import AorusGram" in t:
+              print("AppDelegate: import AorusGram already present")
+              sys.exit(0)
+          if "AorusGramBootstrap" not in t and "ClientSpoofManager" not in t:
+              print("AppDelegate: no AorusGram hooks — skip import")
+              sys.exit(0)
+          pos = t.find("import UIKit")
+          if pos < 0:
+              sys.exit("AppDelegate: import UIKit not found")
+          line_end = t.find("\n", pos)
+          if line_end < 0:
+              sys.exit("AppDelegate: newline after UIKit import not found")
+          t = t[: line_end + 1] + "import AorusGram\n" + t[line_end + 1 :]
+          p.write_text(t, encoding="utf-8")
+          print("AppDelegate: forced import AorusGram (post-branding)")
+          PY
+          # Alternate icons are handled by patch_alternate_icons() in aorus_branding.py.
+          # Belt-and-suspenders (xcconfig APP_NAME + explicit plist literals)
+          PLIST="telegram-ios/Telegram/Telegram-iOS/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Aorusgram" "$PLIST" 2>/dev/null || true
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName Aorusgram" "$PLIST" 2>/dev/null || true
+          python3 aorusgram/scripts/verify_aorus_branding.py telegram-ios
+
+      - name: Install Bazel
+        run: brew install bazel 2>/dev/null || true
+
+      - name: Prepare build config
+        working-directory: telegram-ios
+        run: |
+          echo "=== build-system contents ==="
+          ls build-system/ || echo "(no build-system dir)"
+          ls build-system/Make/ 2>/dev/null | head -20 || echo "(no Make dir)"
+          echo "=== Writing AorusGram appstore-configuration.json (always overwrite) ==="
+          python3 << 'CFEOF'
+          import json
+          api_id = "34110820"
+          api_hash = "a000c631534567d489462ac9c72b7c4d"
+          config = {
+              "bundle_id": "com.aorusgram",
+              "api_id": api_id,
+              "api_hash": api_hash,
+              "team_id": "R9Q5YYQM2M",
+              "app_center_id": "0",
+              "is_internal_build": "false",
+              "is_appstore_build": "false",
+              "appstore_id": "0",
+              "app_specific_url_scheme": "aorusgram",
+              "premium_iap_product_id": "",
+              "enable_siri": False,
+              "enable_icloud": False
+          }
+          open('build-system/appstore-configuration.json', 'w').write(json.dumps(config, indent=2))
+          print('Config written:')
+          print(json.dumps(config, indent=2))
+          CFEOF
+          python3 << 'MPEOF'
+          import os, shutil
+
+          p = 'build-system/Make/Make.py'
+          t = open(p).read()
+
+          # 1. Inject provisioning profiles copy before invoke_build()
+          inj = (
+              "\n"
+              "    import shutil as _sh, os as _os\n"
+              "    _ps = _os.environ.get('RUNNER_TEMP', '/tmp') + '/signing/profiles'\n"
+              "    _pd = _os.path.join(_os.getcwd(), 'build-input/configuration-repository/provisioning')\n"
+              "    _os.makedirs(_pd, exist_ok=True)\n"
+              "    _os.path.isdir(_ps) and [_sh.copy(_os.path.join(_ps,_f),_pd) for _f in _os.listdir(_ps) if _f.endswith('.mobileprovision')]\n"
+              "    _fl = sorted(f for f in _os.listdir(_pd) if f.endswith('.mobileprovision'))\n"
+              "    open(_os.path.join(_pd,'BUILD'),'w').write('exports_files([' + ','.join('\"'+f+'\"' for f in _fl) + '])')\n"
+              "    print('Provisioning:', _fl)\n"
+          )
+
+          OLD = '    bazel_command_line.invoke_build()'
+          if OLD in t:
+              t = t.replace(OLD, inj + OLD, 1)
+              print('Patched: invoke_build injection OK')
+          else:
+              print('WARNING: invoke_build not found')
+
+          # 2. Unsigned device IPA — inject Bazel flags into BazelCommandLine.__init__ so every
+          #    `bazel build` sees them. (A second replace on invoke_build() was fragile: upstream
+          #    line numbers / duplicate matches could skip appending — CI then omitted
+          #    disable_legacy_signing while still adding disableExtensions.)
+          # Upstream Make.py gained extra comments after common_args = [ — match only the opener.
+          ca_opener = "        self.common_args = [\n"
+          # NOTE: --//Telegram:disableExtensions is intentionally NOT added — we WANT the
+          # Share / NotificationService / NotificationContent extensions bundled into the IPA
+          # (needed for push + share, TeleDark-style). Extensions resolve provisioning via the
+          # disableProvisioningProfiles branch, which the BUILD patch points at the wildcard
+          # Telegram.mobileprovision (covers every com.aorusgram.* bundle id).
+          ca_flags = (
+              "            # CI: unsigned iphoneos artifact (rules_apple disable_legacy_signing).\n"
+              "            '--features=disable_legacy_signing',\n"
+              "            '--//Telegram:disableProvisioningProfiles',\n"
+          )
+          if "disable_legacy_signing" in t and "'--//Telegram:disableProvisioningProfiles'" in t:
+              print('Make.py: CI signing flags already present')
+          elif ca_opener in t:
+              t = t.replace(ca_opener, ca_opener + ca_flags, 1)
+              print('Patched: common_args CI signing flags OK')
+          else:
+              print('WARNING: common_args opener not found — disable_legacy_signing not injected')
+
+          # 3. Skip aps_environment None check (our fake profiles have it)
+          t = t.replace('if codesigning_data.aps_environment is None:', 'if False and codesigning_data.aps_environment is None:', 1)
+          t = t.replace("aps_environment=codesigning_data.aps_environment,", "aps_environment=codesigning_data.aps_environment or 'development',", 1)
+
+          # 4. Drop dSYM generation from the release build. dsymutil on the full opt
+          #    binary is the single biggest memory consumer at the final link step and
+          #    was OOM-crashing bazel on the ~7 GB runner. dSYMs are debug-symbol files
+          #    used only to symbolicate crash logs — they have ZERO effect on the app
+          #    itself or its functionality, and are not needed for a sideload IPA.
+          for _dsym_flag in ("'--apple_generate_dsym',", "'--output_groups=+dsyms',"):
+              if _dsym_flag in t:
+                  t = t.replace(_dsym_flag, "")
+                  print('Make.py: removed dSYM flag', _dsym_flag)
+              else:
+                  print('Make.py: dSYM flag already absent', _dsym_flag)
+
+          open(p, 'w').write(t)
+          print('All Make.py patches applied')
+          MPEOF
+
+      - name: Fail fast — verify Make.py patches (saves ~1h if patch breaks)
+        working-directory: telegram-ios
+        run: |
+          python3 << 'VERIFY'
+          t = open("build-system/Make/Make.py", encoding="utf-8", errors="replace").read()
+          assert "'--features=disable_legacy_signing'," in t, \
+              "Make.py: disable_legacy_signing not in common_args"
+          assert "'--//Telegram:disableExtensions'," not in t, \
+              "Make.py: disableExtensions must NOT be set (extensions are required for push/share)"
+          assert "'--//Telegram:disableProvisioningProfiles'," in t, \
+              "Make.py: disableProvisioningProfiles not in common_args"
+          assert "_ps = _os.environ.get('RUNNER_TEMP'" in t, \
+              "Make.py: missing provisioning copy injection"
+          assert "if self.disable_provisioning_profiles:" in t, \
+              "Make.py: invoke_build missing disable_provisioning_profiles branch"
+          print("Make.py patch sanity checks: OK")
+          VERIFY
+
+      - name: Prepare codesigning
+        run: |
+          mkdir -p $RUNNER_TEMP/signing/profiles
+          python3 << 'CSEOF'
+          import subprocess, plistlib, uuid, os
+          from datetime import datetime, timezone
+
+          subprocess.run(
+              ['openssl', 'req', '-x509', '-newkey', 'rsa:2048',
+               '-keyout', '/tmp/fake-key.pem', '-out', '/tmp/fake-cert.pem',
+               '-days', '3650', '-nodes', '-subj', '/CN=FakeProvision'],
+              capture_output=True
+          )
+          cert_der = subprocess.check_output(
+              ['openssl', 'x509', '-in', '/tmp/fake-cert.pem', '-outform', 'DER']
+          )
+
+          team = 'R9Q5YYQM2M'
+          base = 'com.aorusgram'
+          out_dir = os.environ.get('RUNNER_TEMP', '/tmp') + '/signing/profiles'
+          os.makedirs(out_dir, exist_ok=True)
+
+          # Bundle suffixes match the Telegram/BUILD template patterns exactly.
+          # IntentsExtension uses .SiriIntents (BUILD: {telegram_bundle_id}.SiriIntents).
+          # Watch uses .watchkitapp / .watchkitapp.watchkitextension.
+          profiles = [
+              ('Telegram',             base),
+              ('Share',                base + '.Share'),
+              ('NotificationService',  base + '.NotificationService'),
+              ('NotificationContent',  base + '.NotificationContent'),
+              ('Intents',              base + '.SiriIntents'),
+              ('IntentsExtension',     base + '.SiriIntents'),
+              # BUILD maps ph.telegra.Telegraph.SiriIntentsUI → com.aorusgram.SiriIntentsUI (not .IntentsUI).
+              ('IntentsUIExtension',   base + '.SiriIntentsUI'),
+              ('Widget',               base + '.Widget'),
+              ('BroadcastUpload',      base + '.BroadcastUpload'),
+              ('Watch',                base + '.watchkitapp'),
+              ('WatchExtension',       base + '.watchkitapp.watchkitextension'),
+          ]
+
+          for name, bundle_suffix in profiles:
+              plist = {
+                  'AppIDName': 'AorusGram',
+                  'ApplicationIdentifierPrefix': [team],
+                  'CreationDate': datetime(2025, 1, 1, tzinfo=timezone.utc),
+                  'DeveloperCertificates': [cert_der],
+                  'ExpirationDate': datetime(2030, 1, 1, tzinfo=timezone.utc),
+                  'IsXcodeManaged': False,
+                  'Name': 'AorusGram ' + name,
+                  'ProvisionsAllDevices': True,
+                  'TeamIdentifier': [team],
+                  'TeamName': 'AorusGram Team',
+                  'TimeToLive': 1826,
+                  'UUID': str(uuid.uuid4()),
+                  'Version': 1,
+                  'Platform': ['iOS'],
+                  'Entitlements': {
+                      # Wildcard App ID for the Telegram profile so it validates EVERY
+                      # com.aorusgram.* extension bundle id (the BUILD patch points all
+                      # targets' disableProvisioningProfiles branch at Telegram.mobileprovision).
+                      'application-identifier': (team + '.*') if name == 'Telegram' else (team + '.' + bundle_suffix),
+                      'aps-environment': 'development',
+                      'keychain-access-groups': [team + '.' + bundle_suffix, team + '.' + base],
+                      'com.apple.developer.team-identifier': team,
+                      # plisttool checks ALL entitlement keys in the generated
+                      # entitlements file against the provisioning profile.
+                      # The Telegram BUILD template includes app-groups for all targets.
+                      'com.apple.security.application-groups': ['group.' + base],
+                  }
+              }
+              plist_bytes = plistlib.dumps(plist, fmt=plistlib.FMT_XML)
+              tmp_plist = '/tmp/pp-' + name + '.plist'
+              open(tmp_plist, 'wb').write(plist_bytes)
+              out_path = out_dir + '/' + name + '.mobileprovision'
+              r = subprocess.run(
+                  ['openssl', 'smime', '-sign', '-in', tmp_plist,
+                   '-signer', '/tmp/fake-cert.pem', '-inkey', '/tmp/fake-key.pem',
+                   '-outform', 'DER', '-nodetach', '-out', out_path],
+                  capture_output=True
+              )
+              print(('Created: ' if r.returncode == 0 else 'Error: ') + name + '.mobileprovision')
+
+          print('Profiles done')
+          for f in sorted(os.listdir(out_dir)):
+              print('  ', f, os.path.getsize(os.path.join(out_dir, f)), 'bytes')
+          CSEOF
+
+          # Optional keychain with fake PEM (harmless; main signing uses disable_legacy_signing).
+          KEYCHAIN=/tmp/aorus-build.keychain-db
+          security delete-keychain "$KEYCHAIN" 2>/dev/null || true
+          security create-keychain -p aorusbuild "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p aorusbuild "$KEYCHAIN"
+          security import /tmp/fake-cert.pem -A -k "$KEYCHAIN" 2>/dev/null || true
+          security import /tmp/fake-key.pem  -A -k "$KEYCHAIN" 2>/dev/null || true
+          security list-keychain -d user -s "$KEYCHAIN" \
+            "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || \
+            security list-keychain -d user -s "$KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple: -s -k aorusbuild "$KEYCHAIN" 2>/dev/null || true
+          echo "=== Signing identities (informational) ==="
+          security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null || true
+
+      - name: Build release_arm64 (device, no extensions; unsigned via disable_legacy_signing)
+        working-directory: telegram-ios
+        run: |
+          echo "=== Python version ==="
+          python3 --version
+          echo "=== release_arm64 (iphoneos) + disable_legacy_signing — CI artifact without Apple cert match ==="
+          set -o pipefail
+          # PIPESTATUS[0] is Make.py — tail must not mask a failed build (last pipe cmd would be 0).
+          python3 build-system/Make/Make.py \
+            --overrideXcodeVersion \
+            --cacheDir ~/tg-bazel-cache \
+            build \
+            --configurationPath build-system/appstore-configuration.json \
+            --codesigningInformationPath $RUNNER_TEMP/signing \
+            --buildNumber=${{ github.run_number }} \
+            --configuration=release_arm64 \
+            --outputBuildArtifactsPath $RUNNER_TEMP/artifacts \
+            2>&1 | tee "$RUNNER_TEMP/build.log" | tail -100
+          exit "${PIPESTATUS[0]}"
+
+      - name: Show compile errors
+        if: always()
+        run: |
+          echo "=== First 80 lines ==="
+          head -80 $RUNNER_TEMP/build.log 2>/dev/null || echo "(log not available)"
+          echo "=== Errors (compiler + Bazel) ==="
+          grep -iE " error:|^ERROR:|FAILED:" $RUNNER_TEMP/build.log | head -120 || echo "(none)"
+          echo "=== Last 80 lines ==="
+          tail -80 $RUNNER_TEMP/build.log 2>/dev/null || echo "(log not available)"
+
+      - name: Collect build artifacts info
+        if: always()
+        working-directory: telegram-ios
+        run: |
+          echo "=== All .app and .ipa files (with symlinks) ===" > $RUNNER_TEMP/found_files.txt
+          find -L . -name "*.app" -type d 2>/dev/null | grep -v ".dSYM" >> $RUNNER_TEMP/found_files.txt || true
+          find -L . -name "*.ipa" 2>/dev/null >> $RUNNER_TEMP/found_files.txt || true
+          echo "=== bazel-bin top-level ===" >> $RUNNER_TEMP/found_files.txt
+          ls -la bazel-bin/ 2>/dev/null >> $RUNNER_TEMP/found_files.txt || true
+          echo "=== artifacts ===" >> $RUNNER_TEMP/found_files.txt
+          find $RUNNER_TEMP/artifacts -type f 2>/dev/null >> $RUNNER_TEMP/found_files.txt || true
+          cat $RUNNER_TEMP/found_files.txt
+
+      - name: Package unsigned IPA
+        run: |
+          # 1. Проверяем --outputBuildArtifactsPath
+          IPA=$(find $RUNNER_TEMP/artifacts -name "*.ipa" 2>/dev/null | head -1 || true)
+
+          # 2. Ищем .ipa в bazel-bin (с -L для симлинков)
+          if [ -z "$IPA" ]; then
+            IPA=$(find -L telegram-ios/bazel-bin -name "*.ipa" 2>/dev/null | head -1 || true)
+          fi
+
+          if [ -n "$IPA" ]; then
+            echo "Found IPA: $IPA"
+            cp "$IPA" $RUNNER_TEMP/AorusGram-unsigned.ipa
+          else
+            # 3. Ищем .app — сначала в bazel-bin с симлинками, потом везде
+            APP=$(find -L telegram-ios/bazel-bin -name "Telegram.app" -type d 2>/dev/null \
+              | grep -v ".dSYM" | head -1 || true)
+
+            if [ -z "$APP" ]; then
+              APP=$(find -L telegram-ios/bazel-out -name "Telegram.app" -type d 2>/dev/null \
+                | grep -v ".dSYM" | head -1 || true)
+            fi
+
+            if [ -z "$APP" ]; then
+              APP=$(find -L telegram-ios -name "*.app" -type d 2>/dev/null \
+                | grep -v ".dSYM" | head -1 || true)
+            fi
+
+            if [ -z "$APP" ]; then
+              APP=$(find -L $RUNNER_TEMP/artifacts -name "*.app" -type d 2>/dev/null \
+                | grep -v ".dSYM" | head -1 || true)
+            fi
+
+            if [ -z "$APP" ]; then
+              echo "ERROR: No .app found anywhere."
+              echo "=== bazel-bin contents ==="
+              ls -la telegram-ios/bazel-bin/ 2>/dev/null || echo "(empty or missing)"
+              echo "=== artifacts contents ==="
+              find $RUNNER_TEMP/artifacts -type f 2>/dev/null || echo "(empty)"
+              exit 1
+            fi
+
+            echo "Packaging $APP → IPA"
+            mkdir -p $RUNNER_TEMP/Payload
+            cp -r "$APP" $RUNNER_TEMP/Payload/AorusGram.app
+            cd $RUNNER_TEMP && zip -qr AorusGram-unsigned.ipa Payload/
+          fi
+
+          ls -lh $RUNNER_TEMP/AorusGram-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: AorusGram-unsigned-${{ github.run_number }}
+          path: ${{ runner.temp }}/AorusGram-unsigned.ipa
+          retention-days: 14
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.run_number }}
+          path: ${{ runner.temp }}/build.log
+          retention-days: 7
