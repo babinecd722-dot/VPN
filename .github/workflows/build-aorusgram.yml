@@ -857,6 +857,42 @@ jobs:
 
           ls -lh $RUNNER_TEMP/AorusGram-unsigned.ipa
 
+      - name: Inject App Group fix dylib (clean, TeleDark-style)
+        run: |
+          set -e
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          SRC="$GITHUB_WORKSPACE/aorusgram/patches/dylib/AorusFix.m"
+          echo "=== Compiling AorusFix.dylib ==="
+          xcrun --sdk iphoneos clang -arch arm64 \
+            -isysroot "$SDK" \
+            -miphoneos-version-min=12.0 \
+            -dynamiclib -fobjc-arc \
+            -framework Foundation -framework Security \
+            -install_name "@executable_path/AorusFix.dylib" \
+            -o "$RUNNER_TEMP/AorusFix.dylib" "$SRC"
+          file "$RUNNER_TEMP/AorusFix.dylib"
+
+          python3 -m pip install --quiet --disable-pip-version-check lief
+
+          WORK="$RUNNER_TEMP/inject"
+          rm -rf "$WORK"; mkdir -p "$WORK"
+          cd "$WORK"
+          unzip -q "$RUNNER_TEMP/AorusGram-unsigned.ipa"
+          APP=$(find Payload -maxdepth 1 -name "*.app" -type d | head -1)
+          if [ -z "$APP" ]; then echo "ERROR: no .app inside IPA"; exit 1; fi
+
+          echo "=== Extensions bundled into the app (PlugIns) ==="
+          ls -1 "$APP/PlugIns" 2>/dev/null || echo "(no PlugIns — extensions missing!)"
+
+          echo "=== Injecting AorusFix.dylib ==="
+          python3 "$GITHUB_WORKSPACE/aorusgram/patches/dylib/inject_dylib.py" \
+            "$WORK/$APP" "$RUNNER_TEMP/AorusFix.dylib"
+
+          rm -f "$RUNNER_TEMP/AorusGram-unsigned.ipa"
+          zip -qr "$RUNNER_TEMP/AorusGram-unsigned.ipa" Payload/
+          echo "=== Final IPA ==="
+          ls -lh "$RUNNER_TEMP/AorusGram-unsigned.ipa"
+
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
