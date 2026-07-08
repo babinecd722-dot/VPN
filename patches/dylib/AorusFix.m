@@ -22,7 +22,10 @@
 #import <Security/Security.h>
 #import <objc/runtime.h>
 
-// SecTask entitlement APIs are available on iOS but not in the public headers.
+// SecTask is a private CoreFoundation type on iOS: the opaque struct and these
+// entitlement APIs exist in the Security framework but are not in the public SDK
+// headers, so declare them ourselves.
+typedef struct __SecTask *SecTaskRef;
 extern SecTaskRef SecTaskCreateFromSelf(CFAllocatorRef allocator);
 extern CFTypeRef SecTaskCopyValueForEntitlement(SecTaskRef task, CFStringRef entitlement, CFErrorRef *error);
 
