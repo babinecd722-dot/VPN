@@ -893,7 +893,8 @@ jobs:
             -o "$RUNNER_TEMP/AorusFix.dylib" "$SRC"
           file "$RUNNER_TEMP/AorusFix.dylib"
 
-          python3 -m pip install --quiet --disable-pip-version-check lief
+          python3 -m pip install --quiet --disable-pip-version-check --break-system-packages lief
+          python3 -c "import lief; print('lief', lief.__version__)"
 
           WORK="$RUNNER_TEMP/inject"
           rm -rf "$WORK"; mkdir -p "$WORK"
