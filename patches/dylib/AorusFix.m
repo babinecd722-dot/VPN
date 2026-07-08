@@ -19,24 +19,33 @@
 // no ads, no popups, no third-party dependencies — only the container redirect.
 
 #import <Foundation/Foundation.h>
-#import <Security/Security.h>
 #import <objc/runtime.h>
+#import <dlfcn.h>
 
 // SecTask is a private CoreFoundation type on iOS: the opaque struct and these
 // entitlement APIs exist in the Security framework but are not in the public SDK
-// headers, so declare them ourselves.
-typedef struct __SecTask *SecTaskRef;
-extern SecTaskRef SecTaskCreateFromSelf(CFAllocatorRef allocator);
-extern CFTypeRef SecTaskCopyValueForEntitlement(SecTaskRef task, CFStringRef entitlement, CFErrorRef *error);
+// headers, and the private symbols may not be present in the linker stub (.tbd).
+// So declare the opaque type ourselves and resolve the functions at runtime via
+// dlsym — this avoids any link-time "undefined symbol" failure.
+typedef struct __SecTask *AorusSecTaskRef;
+typedef AorusSecTaskRef (*AorusSecTaskCreateFromSelf)(CFAllocatorRef allocator);
+typedef CFTypeRef (*AorusSecTaskCopyValueForEntitlement)(AorusSecTaskRef task, CFStringRef entitlement, CFErrorRef *error);
 
 // The first App Group this process is actually entitled to (or nil), computed once.
 static NSString *AorusFirstEntitledAppGroup(void) {
     static NSString *cached = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        SecTaskRef task = SecTaskCreateFromSelf(kCFAllocatorDefault);
+        AorusSecTaskCreateFromSelf createFromSelf =
+            (AorusSecTaskCreateFromSelf)dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
+        AorusSecTaskCopyValueForEntitlement copyValue =
+            (AorusSecTaskCopyValueForEntitlement)dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+        if (createFromSelf == NULL || copyValue == NULL) {
+            return;
+        }
+        AorusSecTaskRef task = createFromSelf(kCFAllocatorDefault);
         if (task) {
-            CFTypeRef value = SecTaskCopyValueForEntitlement(task, CFSTR("com.apple.security.application-groups"), NULL);
+            CFTypeRef value = copyValue(task, CFSTR("com.apple.security.application-groups"), NULL);
             if (value) {
                 if (CFGetTypeID(value) == CFArrayGetTypeID()) {
                     NSArray *groups = (__bridge NSArray *)value;
