@@ -1,15 +1,17 @@
 """
-Telegram-бот: отправь стикер — получи файл .tgs (для анимированных).
+Telegram-бот: отправь анимированный стикер — получи .tgs (в zip).
 """
 
 from __future__ import annotations
 
+import io
 import logging
 import os
+import zipfile
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InputFile, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -33,30 +35,18 @@ DOWNLOADS.mkdir(exist_ok=True)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Пришли анимированный стикер — верну файл .tgs.\n\n"
-        "Статические стикеры (.webp) и видео-стикеры (.webm) тоже скачаю, "
-        "но .tgs бывает только у анимированных."
+        "Пришли анимированный стикер (Lottie) — верну файл .tgs.\n\n"
+        "Обычные (.webp) и видео-стикеры (.webm) не принимаю: "
+        "у них нет формата .tgs."
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Как пользоваться:\n"
-        "1. Отправь боту стикер из любого стикерпака\n"
-        "2. Бот скачает файл и пришлёт его документом\n\n"
-        "• Анимированный → .tgs\n"
-        "• Обычный → .webp\n"
-        "• Видео-стикер → .webm"
+        "Только анимированные стикеры → файл .tgs.\n\n"
+        "Как отличить: анимированный стикер крутится как векторная "
+        "анимация (не видео). Видео-стикеры и статичные не подойдут."
     )
-
-
-def _sticker_meta(sticker) -> tuple[str, str]:
-    """Возвращает (расширение, подпись) для стикера."""
-    if sticker.is_animated:
-        return "tgs", "Анимированный стикер (.tgs)"
-    if sticker.is_video:
-        return "webm", "Видео-стикер (.webm)"
-    return "webp", "Статический стикер (.webp)"
 
 
 async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -65,24 +55,44 @@ async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     sticker = message.sticker
-    ext, caption = _sticker_meta(sticker)
-    emoji = sticker.emoji or ""
+
+    if sticker.is_video:
+        await message.reply_text(
+            "Это видео-стикер (.webm), не .tgs.\n"
+            "Нужен анимированный Lottie-стикер."
+        )
+        return
+
+    if not sticker.is_animated:
+        await message.reply_text(
+            "Это обычный стикер (.webp), не .tgs.\n"
+            "Нужен анимированный Lottie-стикер."
+        )
+        return
 
     await message.chat.send_action(ChatAction.UPLOAD_DOCUMENT)
 
-    filename = f"sticker_{sticker.file_unique_id}.{ext}"
-    local_path = DOWNLOADS / filename
+    tgs_name = f"sticker_{sticker.file_unique_id}.tgs"
+    local_path = DOWNLOADS / tgs_name
 
     try:
         tg_file = await context.bot.get_file(sticker.file_id)
         await tg_file.download_to_drive(custom_path=str(local_path))
 
-        with local_path.open("rb") as f:
-            await message.reply_document(
-                document=f,
-                filename=filename,
-                caption=f"{caption} {emoji}".strip(),
-            )
+        # Telegram часто показывает «голый» .tgs как стикер, а не как файл.
+        # Кладём .tgs в zip — тогда это однозначно скачиваемый документ.
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", compression=zipfile.ZIP_STORED) as zf:
+            zf.write(local_path, arcname=tgs_name)
+        zip_buf.seek(0)
+
+        zip_name = f"sticker_{sticker.file_unique_id}.zip"
+        emoji = sticker.emoji or ""
+        await message.reply_document(
+            document=InputFile(zip_buf, filename=zip_name),
+            caption=f"Внутри архива: {tgs_name} {emoji}".strip(),
+        )
+        logger.info("Отправлен .tgs в zip: %s", tgs_name)
     except Exception:
         logger.exception("Не удалось скачать стикер")
         await message.reply_text("Не получилось скачать стикер. Попробуй ещё раз.")
@@ -91,7 +101,9 @@ async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Пришли стикер — верну файл.")
+    await update.message.reply_text(
+        "Пришли анимированный стикер — верну .tgs."
+    )
 
 
 def main() -> None:
