@@ -1,6 +1,6 @@
 package com.vrcontroler.app.core
 
-import com.vrcontroler.app.shizuku.ShizukuGate
+import com.vrcontroler.app.privilege.PrivilegeGate
 import org.json.JSONObject
 
 data class FsEntry(
@@ -15,7 +15,8 @@ data class ListResult(val entries: List<FsEntry>? = null, val error: String? = n
 
 /**
  * Routes file operations: paths under Android/data and Android/obb go through
- * the shell-privileged Shizuku service, everything else uses direct file access.
+ * the embedded shell-privileged FileDaemon (wireless ADB). Everything else uses
+ * direct java.io access.
  */
 object Backend {
 
@@ -30,11 +31,11 @@ object Backend {
         restrictedPrefixes.any { path == it || path.startsWith("$it/") }
 
     private fun useShell(vararg paths: String): Boolean =
-        paths.any { isRestricted(it) } && ShizukuGate.remote != null
+        paths.any { isRestricted(it) } && PrivilegeGate.isReady
 
-    fun listDir(path: String): ListResult {
+    suspend fun listDir(path: String): ListResult {
         val raw = if (useShell(path)) {
-            ShizukuGate.remote!!.listDir(path)
+            PrivilegeGate.listDir(path)
         } else {
             FileCore.listDir(path)
         }
@@ -56,36 +57,40 @@ object Backend {
                 )
             )
         }
-        return ListResult(entries = list.sortedWith(
-            compareByDescending<FsEntry> { it.isDir }.thenBy { it.name.lowercase() }
-        ))
+        return ListResult(
+            entries = list.sortedWith(
+                compareByDescending<FsEntry> { it.isDir }.thenBy { it.name.lowercase() }
+            )
+        )
     }
 
-    fun delete(path: String): Boolean =
-        if (useShell(path)) ShizukuGate.remote!!.deletePath(path) else FileCore.deletePath(path)
+    suspend fun delete(path: String): Boolean =
+        if (useShell(path)) PrivilegeGate.deletePath(path) else FileCore.deletePath(path)
 
-    fun createDir(path: String): Boolean =
-        if (useShell(path)) ShizukuGate.remote!!.createDir(path) else FileCore.createDir(path)
+    suspend fun createDir(path: String): Boolean =
+        if (useShell(path)) PrivilegeGate.createDir(path) else FileCore.createDir(path)
 
-    fun rename(src: String, dst: String): Boolean =
-        if (useShell(src, dst)) ShizukuGate.remote!!.renamePath(src, dst) else FileCore.renamePath(src, dst)
+    suspend fun rename(src: String, dst: String): Boolean =
+        if (useShell(src, dst)) PrivilegeGate.renamePath(src, dst) else FileCore.renamePath(src, dst)
 
-    fun copy(src: String, dstDir: String): String =
-        if (useShell(src, dstDir)) ShizukuGate.remote!!.copyPath(src, dstDir) else FileCore.copyPath(src, dstDir)
+    suspend fun copy(src: String, dstDir: String): String =
+        if (useShell(src, dstDir)) PrivilegeGate.copyPath(src, dstDir) else FileCore.copyPath(src, dstDir)
 
-    fun move(src: String, dstDir: String): String =
-        if (useShell(src, dstDir)) ShizukuGate.remote!!.movePath(src, dstDir) else FileCore.movePath(src, dstDir)
+    suspend fun move(src: String, dstDir: String): String =
+        if (useShell(src, dstDir)) PrivilegeGate.movePath(src, dstDir) else FileCore.movePath(src, dstDir)
 
-    fun readText(path: String): Pair<String?, String?> {
-        val raw = if (useShell(path)) ShizukuGate.remote!!.readTextFile(path) else FileCore.readTextFile(path)
+    suspend fun readText(path: String): Pair<String?, String?> {
+        val raw = if (useShell(path)) PrivilegeGate.readTextFile(path) else FileCore.readTextFile(path)
         val json = JSONObject(raw)
         return if (json.optBoolean("ok")) json.getString("text") to null
         else null to json.optString("error", "Ошибка чтения")
     }
 
-    fun writeText(path: String, content: String): String =
-        if (useShell(path)) ShizukuGate.remote!!.writeTextFile(path, content) else FileCore.writeTextFile(path, content)
+    suspend fun writeText(path: String, content: String): String =
+        if (useShell(path)) PrivilegeGate.writeTextFile(path, content)
+        else FileCore.writeTextFile(path, content)
 
-    fun extractZip(zipPath: String, dstDir: String): String =
-        if (useShell(zipPath, dstDir)) ShizukuGate.remote!!.extractZip(zipPath, dstDir) else FileCore.extractZip(zipPath, dstDir)
+    suspend fun extractZip(zipPath: String, dstDir: String): String =
+        if (useShell(zipPath, dstDir)) PrivilegeGate.extractZip(zipPath, dstDir)
+        else FileCore.extractZip(zipPath, dstDir)
 }

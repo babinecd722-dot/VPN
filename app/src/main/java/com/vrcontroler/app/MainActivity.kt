@@ -1,5 +1,6 @@
 package com.vrcontroler.app
 
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -17,6 +18,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
@@ -28,13 +30,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.lifecycleScope
 import com.vrcontroler.app.core.FsEntry
-import com.vrcontroler.app.shizuku.ShizukuGate
-import com.vrcontroler.app.shizuku.ShizukuState
+import com.vrcontroler.app.privilege.PrivilegeGate
+import com.vrcontroler.app.privilege.PrivilegeState
 import com.vrcontroler.app.ui.FileManagerViewModel
 import com.vrcontroler.app.ui.VRControlerTheme
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -45,20 +50,25 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        ShizukuGate.init()
+        PrivilegeGate.init(this)
         setContent {
             VRControlerTheme {
-                AppScreen(vm,
+                AppScreen(
+                    vm = vm,
                     hasAllFiles = { Environment.isExternalStorageManager() },
-                    requestAllFiles = { requestAllFilesAccess() })
+                    requestAllFiles = { requestAllFilesAccess() },
+                    openDeveloperSettings = { openDeveloperSettings() },
+                )
             }
         }
     }
 
     override fun onResume() {
         super.onResume()
-        ShizukuGate.refresh()
-        vm.refresh()
+        lifecycleScope.launch {
+            PrivilegeGate.refresh()
+            vm.refresh()
+        }
     }
 
     private fun requestAllFilesAccess() {
@@ -69,8 +79,22 @@ class MainActivity : ComponentActivity() {
                     Uri.parse("package:$packageName")
                 )
             )
-        } catch (e: Exception) {
+        } catch (_: Exception) {
             startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+        }
+    }
+
+    private fun openDeveloperSettings() {
+        val intent = Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        }
+        try {
+            startActivity(intent)
+        } catch (_: ActivityNotFoundException) {
+            try {
+                startActivity(Intent(Settings.ACTION_SETTINGS))
+            } catch (_: Exception) {
+            }
         }
     }
 }
@@ -81,13 +105,18 @@ fun AppScreen(
     vm: FileManagerViewModel,
     hasAllFiles: () -> Boolean,
     requestAllFiles: () -> Unit,
+    openDeveloperSettings: () -> Unit,
 ) {
-    val shizukuState by ShizukuGate.state.collectAsState()
+    val privilegeState by PrivilegeGate.state.collectAsState()
+    val privilegeMsg by PrivilegeGate.message.collectAsState()
     var allFiles by remember { mutableStateOf(hasAllFiles()) }
     var showNewFolder by remember { mutableStateOf(false) }
     var renameTarget by remember { mutableStateOf<FsEntry?>(null) }
     var deleteConfirm by remember { mutableStateOf(false) }
+    var showPairing by remember { mutableStateOf(false) }
+    var connecting by remember { mutableStateOf(false) }
     val snackbar = remember { SnackbarHostState() }
+    val scope = rememberCoroutineScope()
 
     LaunchedEffect(vm.toast) {
         vm.toast?.let {
@@ -130,20 +159,58 @@ fun AppScreen(
                     onClick = requestAllFiles
                 )
             }
-            if (shizukuState != ShizukuState.READY) {
+
+            if (privilegeState != PrivilegeState.READY) {
+                val title = when (privilegeState) {
+                    PrivilegeState.NEED_PAIRING -> "Android/data: нужен pairing"
+                    PrivilegeState.NEED_WIRELESS -> "Android/data: включи Wireless Debugging"
+                    PrivilegeState.CONNECTING -> "Android/data: подключение…"
+                    PrivilegeState.ERROR -> "Android/data: ошибка"
+                    else -> "Android/data"
+                }
+                val body = privilegeMsg ?: when (privilegeState) {
+                    PrivilegeState.NEED_WIRELESS ->
+                        "Shizuku отдельно ставить не нужно. Включи Wireless Debugging в параметрах разработчика, затем «Подключить»."
+                    PrivilegeState.NEED_PAIRING ->
+                        "Один раз: Wireless Debugging → Pair device with pairing code → введи 6 цифр здесь."
+                    PrivilegeState.CONNECTING -> "Ищем порт и поднимаем встроенный shell-daemon…"
+                    else -> "Не удалось получить shell-доступ."
+                }
+                val primary = when {
+                    connecting || privilegeState == PrivilegeState.CONNECTING -> "Ждём…"
+                    privilegeState == PrivilegeState.NEED_PAIRING -> "Ввести код"
+                    else -> "Подключить"
+                }
                 PermissionCard(
-                    title = "Android/data: нужен Shizuku",
-                    body = when (shizukuState) {
-                        ShizukuState.NOT_RUNNING -> "Shizuku не запущен. Установи Shizuku (Quest-совместимую сборку), запусти сервис через Wireless Debugging и вернись сюда."
-                        ShizukuState.NO_PERMISSION -> "Shizuku запущен — дай разрешение приложению."
-                        ShizukuState.CONNECTING -> "Подключение к Shizuku…"
-                        else -> "Shizuku недоступен."
-                    },
-                    button = if (shizukuState == ShizukuState.NO_PERMISSION) "Дать доступ" else "Проверить",
+                    title = title,
+                    body = body,
+                    button = primary,
+                    enabled = !connecting && privilegeState != PrivilegeState.CONNECTING,
+                    secondary = "Настройки разработчика",
+                    onSecondary = openDeveloperSettings,
                     onClick = {
-                        if (shizukuState == ShizukuState.NO_PERMISSION) ShizukuGate.requestAccess()
-                        else ShizukuGate.refresh()
+                        if (privilegeState == PrivilegeState.NEED_PAIRING) {
+                            showPairing = true
+                        } else {
+                            connecting = true
+                            scope.launch {
+                                PrivilegeGate.connect()
+                                connecting = false
+                                if (PrivilegeGate.state.value == PrivilegeState.NEED_PAIRING) {
+                                    showPairing = true
+                                } else if (PrivilegeGate.isReady) {
+                                    vm.refresh()
+                                }
+                            }
+                        }
                     }
+                )
+            } else {
+                AssistChip(
+                    onClick = {},
+                    label = { Text("Android/data: shell OK") },
+                    leadingIcon = { Icon(Icons.Default.Verified, null, Modifier.size(18.dp)) },
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp)
                 )
             }
 
@@ -192,6 +259,24 @@ fun AppScreen(
         }
     }
 
+    if (showPairing) {
+        PairingDialog(
+            onDismiss = { showPairing = false },
+            onOpenSettings = openDeveloperSettings,
+            onPair = { code ->
+                connecting = true
+                scope.launch {
+                    val ok = PrivilegeGate.pair(code)
+                    connecting = false
+                    if (ok) {
+                        showPairing = false
+                        vm.refresh()
+                    }
+                }
+            }
+        )
+    }
+
     if (showNewFolder) {
         TextDialog(
             title = "Новая папка",
@@ -238,7 +323,60 @@ fun AppScreen(
 }
 
 @Composable
-private fun PermissionCard(title: String, body: String, button: String, onClick: () -> Unit) {
+private fun PairingDialog(
+    onDismiss: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onPair: (String) -> Unit,
+) {
+    var code by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Pairing Wireless Debugging") },
+        text = {
+            Column {
+                Text(
+                    "1. Открой параметры разработчика → Wireless debugging\n" +
+                        "2. Включи тумблер\n" +
+                        "3. Нажми «Pair device with pairing code»\n" +
+                        "4. Введи 6 цифр ниже (порт найдётся сам)",
+                    fontSize = 14.sp
+                )
+                Spacer(Modifier.height(12.dp))
+                OutlinedTextField(
+                    value = code,
+                    onValueChange = { code = it.filter { ch -> ch.isDigit() }.take(6) },
+                    label = { Text("Код pairing") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = code.length >= 6,
+                onClick = { onPair(code) }
+            ) { Text("Связать") }
+        },
+        dismissButton = {
+            Row {
+                TextButton(onClick = onOpenSettings) { Text("Настройки") }
+                TextButton(onClick = onDismiss) { Text("Отмена") }
+            }
+        }
+    )
+}
+
+@Composable
+private fun PermissionCard(
+    title: String,
+    body: String,
+    button: String,
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    secondary: String? = null,
+    onSecondary: (() -> Unit)? = null,
+) {
     Card(
         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
@@ -248,7 +386,12 @@ private fun PermissionCard(title: String, body: String, button: String, onClick:
             Spacer(Modifier.height(4.dp))
             Text(body, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(8.dp))
-            Button(onClick = onClick) { Text(button) }
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Button(onClick = onClick, enabled = enabled) { Text(button) }
+                if (secondary != null && onSecondary != null) {
+                    OutlinedButton(onClick = onSecondary) { Text(secondary) }
+                }
+            }
         }
     }
 }
@@ -336,7 +479,7 @@ private fun FileRow(
             )
         }
         IconButton(onClick = onRename) {
-            Icon(Icons.Default.Edit, "Переименовать", modifier = Modifier.size(20.dp))
+            Icon(Icons.Default.Edit, "Переименовать", Modifier.size(20.dp))
         }
     }
     HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant, thickness = 0.5.dp)
@@ -360,7 +503,12 @@ private fun BottomBar(vm: FileManagerViewModel, onNewFolder: () -> Unit, onDelet
 }
 
 @Composable
-private fun BarButton(icon: androidx.compose.ui.graphics.vector.ImageVector, label: String, enabled: Boolean, onClick: () -> Unit) {
+private fun BarButton(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+) {
     Column(
         Modifier
             .clip(RoundedCornerShape(12.dp))

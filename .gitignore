@@ -8,3 +8,4 @@ local.properties
 .externalNativeBuild
 .cxx
 keystore.jks
+.android-sdk/

@@ -1,0 +1,149 @@
+package moe.shizuku.manager.adb
+
+import android.os.Build
+import android.util.Log
+import moe.shizuku.manager.adb.AdbProtocol.ADB_AUTH_RSAPUBLICKEY
+import moe.shizuku.manager.adb.AdbProtocol.ADB_AUTH_SIGNATURE
+import moe.shizuku.manager.adb.AdbProtocol.ADB_AUTH_TOKEN
+import moe.shizuku.manager.adb.AdbProtocol.A_AUTH
+import moe.shizuku.manager.adb.AdbProtocol.A_CLSE
+import moe.shizuku.manager.adb.AdbProtocol.A_CNXN
+import moe.shizuku.manager.adb.AdbProtocol.A_MAXDATA
+import moe.shizuku.manager.adb.AdbProtocol.A_OKAY
+import moe.shizuku.manager.adb.AdbProtocol.A_OPEN
+import moe.shizuku.manager.adb.AdbProtocol.A_STLS
+import moe.shizuku.manager.adb.AdbProtocol.A_STLS_VERSION
+import moe.shizuku.manager.adb.AdbProtocol.A_VERSION
+import moe.shizuku.manager.adb.AdbProtocol.A_WRTE
+import java.io.Closeable
+import java.io.DataInputStream
+import java.io.DataOutputStream
+import java.net.Socket
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.concurrent.atomic.AtomicInteger
+import javax.net.ssl.SSLSocket
+
+/**
+ * Minimal ADB client (TLS + auth). Adapted from RikkaApps/Shizuku (Apache-2.0).
+ * Extended with bidirectional shell streams for the embedded file daemon.
+ */
+class AdbClient(private val host: String, private val port: Int, private val key: AdbKey) : Closeable {
+
+    private lateinit var socket: Socket
+    private lateinit var plainInputStream: DataInputStream
+    private lateinit var plainOutputStream: DataOutputStream
+
+    private var useTls = false
+    private lateinit var tlsSocket: SSLSocket
+    private lateinit var tlsInputStream: DataInputStream
+    private lateinit var tlsOutputStream: DataOutputStream
+
+    private val inputStream get() = if (useTls) tlsInputStream else plainInputStream
+    private val outputStream get() = if (useTls) tlsOutputStream else plainOutputStream
+
+    private val nextLocalId = AtomicInteger(1)
+    private val writeLock = Any()
+
+    fun connect() {
+        socket = Socket(host, port)
+        socket.tcpNoDelay = true
+        plainInputStream = DataInputStream(socket.getInputStream())
+        plainOutputStream = DataOutputStream(socket.getOutputStream())
+
+        write(A_CNXN, A_VERSION, A_MAXDATA, "host::")
+
+        var message = read()
+        if (message.command == A_STLS) {
+            if (Build.VERSION.SDK_INT < 29) {
+                error("Connect to adb with TLS is not supported before Android 9")
+            }
+            write(A_STLS, A_STLS_VERSION, 0)
+
+            val sslContext = key.sslContext
+            tlsSocket = sslContext.socketFactory.createSocket(socket, host, port, true) as SSLSocket
+            tlsSocket.startHandshake()
+            Log.d(TAG, "Handshake succeeded.")
+
+            tlsInputStream = DataInputStream(tlsSocket.inputStream)
+            tlsOutputStream = DataOutputStream(tlsSocket.outputStream)
+            useTls = true
+            message = read()
+        } else if (message.command == A_AUTH) {
+            write(A_AUTH, ADB_AUTH_SIGNATURE, 0, key.sign(message.data))
+            message = read()
+            if (message.command != A_CNXN) {
+                write(A_AUTH, ADB_AUTH_RSAPUBLICKEY, 0, key.adbPublicKey)
+                message = read()
+            }
+        }
+
+        if (message.command != A_CNXN) error("not A_CNXN")
+    }
+
+    /**
+     * Opens an interactive shell stream. Only one stream should be active at a time
+     * because this client is single-threaded on the ADB connection.
+     */
+    fun openShell(command: String = ""): AdbShellStream {
+        val localId = nextLocalId.getAndIncrement()
+        val dest = if (command.isEmpty()) "shell:" else "shell:$command"
+        write(A_OPEN, localId, 0, dest)
+        val message = read()
+        when (message.command) {
+            A_OKAY -> return AdbShellStream(this, localId, message.arg0)
+            A_CLSE -> {
+                write(A_CLSE, localId, message.arg0)
+                error("shell stream closed immediately")
+            }
+            else -> error("failed to open shell")
+        }
+    }
+
+    internal fun write(command: Int, arg0: Int, arg1: Int, data: ByteArray? = null) =
+        write(AdbMessage(command, arg0, arg1, data))
+
+    internal fun write(command: Int, arg0: Int, arg1: Int, data: String) =
+        write(AdbMessage(command, arg0, arg1, data))
+
+    internal fun write(message: AdbMessage) {
+        synchronized(writeLock) {
+            outputStream.write(message.toByteArray())
+            outputStream.flush()
+        }
+        Log.d(TAG, "write ${message.toStringShort()}")
+    }
+
+    internal fun read(): AdbMessage {
+        val buffer = ByteBuffer.allocate(AdbMessage.HEADER_LENGTH).order(ByteOrder.LITTLE_ENDIAN)
+        inputStream.readFully(buffer.array(), 0, 24)
+        val command = buffer.int
+        val arg0 = buffer.int
+        val arg1 = buffer.int
+        val dataLength = buffer.int
+        val checksum = buffer.int
+        val magic = buffer.int
+        val data: ByteArray? = if (dataLength >= 0) {
+            ByteArray(dataLength).also { inputStream.readFully(it, 0, dataLength) }
+        } else null
+        val message = AdbMessage(command, arg0, arg1, dataLength, checksum, magic, data)
+        message.validateOrThrow()
+        Log.d(TAG, "read ${message.toStringShort()}")
+        return message
+    }
+
+    override fun close() {
+        try { plainInputStream.close() } catch (_: Throwable) {}
+        try { plainOutputStream.close() } catch (_: Throwable) {}
+        try { socket.close() } catch (_: Exception) {}
+        if (useTls) {
+            try { tlsInputStream.close() } catch (_: Throwable) {}
+            try { tlsOutputStream.close() } catch (_: Throwable) {}
+            try { tlsSocket.close() } catch (_: Exception) {}
+        }
+    }
+
+    companion object {
+        private const val TAG = "AdbClient"
+    }
+}

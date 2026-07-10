@@ -7,7 +7,7 @@ import java.util.zip.ZipFile
 
 /**
  * Pure java.io file operations, shared by the in-process backend and the
- * Shizuku user service (which runs the same code with shell privileges).
+ * shell-privileged FileDaemon (started over wireless ADB).
  */
 object FileCore {
 

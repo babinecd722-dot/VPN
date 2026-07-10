@@ -1,49 +1,68 @@
 # VR CONTROLER
 
-Файловый менеджер для Meta Quest (Quest 2 / 3 / 3S / Pro) с полным доступом ко всему хранилищу, включая `Android/data` и `Android/obb` — папки, которые Horizon OS блокирует для обычных приложений (нужно для модов BONELAB / Fusion и т.д.).
+Файловый менеджер для Meta Quest (Quest 2 / 3 / 3S / Pro) с полным доступом ко всему хранилищу, включая `Android/data` и `Android/obb`.
 
-Весь код открыт и находится в этом репозитории — никаких чужих бинарников и закладок.
+**Один APK — портативный.** Отдельный Shizuku ставить не нужно: shell-доступ встроен через Wireless Debugging.
+
+Весь код открыт в этом репозитории.
 
 ## Возможности
 
-- Полный доступ ко всему `/sdcard` через разрешение «Управление всеми файлами»
-- Доступ к `Android/data` и `Android/obb` через Shizuku (файловые операции выполняются с правами shell/ADB)
+- Полный доступ ко всему `/sdcard` через «Управление всеми файлами»
+- Доступ к `Android/data` и `Android/obb` через встроенный shell-daemon (права ADB)
 - Копирование, перемещение, переименование, удаление, создание папок, мультивыбор
-- Распаковка ZIP-архивов (моды) прямо в нужную папку
-- Встроенный текстовый редактор (например, `repositories.txt` для репозиториев Fusion)
-- Быстрые ярлыки: Загрузки, Android/data, папка BONELAB
-- Тёмный VR-интерфейс с крупными элементами под контроллеры
+- Распаковка ZIP (моды) прямо в нужную папку
+- Встроенный текстовый редактор (`repositories.txt` для Fusion и т.п.)
+- Ярлыки: Загрузки, Android/data, BONELAB
+- Тёмный VR-интерфейс с крупными элементами
 
 ## Установка
 
-1. Включи режим разработчика на Quest (через приложение Meta Horizon на телефоне).
-2. Установи APK через SideQuest или `adb install VR-CONTROLER-v1.0.apk`.
-3. Запусти «VR CONTROLER» из раздела *Неизвестные источники* в библиотеке.
-4. Разреши «Управление всеми файлами» по кнопке в приложении.
+1. Включи режим разработчика на Quest (Meta Horizon на телефоне) — у тебя уже есть.
+2. Установи APK через SideQuest / `adb install`.
+3. Запусти **VR CONTROLER** из *Неизвестные источники*.
+4. Разреши «Управление всеми файлами».
 
-## Доступ к Android/data (Shizuku)
+## Android/data (встроенный privilege, без Shizuku)
 
-Horizon OS (v63+) блокирует `Android/data` для всех обычных приложений — это ограничение самой ОС.
-Единственный способ обойти его без ПК — поднять права до уровня shell через [Shizuku](https://shizuku.rikka.app/).
+Horizon OS блокирует `Android/data` для обычных приложений. VR CONTROLER поднимает свой shell-daemon через Wireless Debugging — **отдельный APK Shizuku не нужен**.
 
-1. Установи APK Shizuku (для Horizon OS v83+ штатный pairing сломан — используй Quest-совместимую сборку, например форк shizuku4quest).
-2. В настройках Quest включи **Wireless Debugging** и выполни pairing по инструкции Shizuku.
-3. Запусти сервис Shizuku, затем открой VR CONTROLER и нажми «Дать доступ».
-4. После этого папки `Android/data` и `Android/obb` открываются и редактируются как обычные.
+### Первый раз (pairing, один раз)
 
-Пока Shizuku не подключён, приложение работает как обычный файловый менеджер (всё, кроме `Android/data`/`Android/obb`).
+1. Параметры → Система → Параметры разработчика → **Wireless debugging** — включи.
+2. В VR CONTROLER нажми **Подключить** / **Ввести код**.
+3. В Wireless debugging открой **Pair device with pairing code**.
+4. Введи 6 цифр в диалоге приложения (порт находится по mDNS сам).
+5. После pairing приложение само поднимет daemon — ярлык Android/data заработает.
 
-## Моды BONELAB Fusion — краткий путь
+### После перезагрузки очков
 
-1. Скачай мод (zip) браузером Quest → он попадёт в `Download`.
-2. В VR CONTROLER: ярлык «Загрузки» → тап по zip — он распакуется.
-3. Выдели папку мода → «Вырез.» → ярлык «BONELAB» → зайди в `Mods` → «Встав.».
-4. Для репозиториев Fusion: ярлык «BONELAB» → открой `repositories.txt` — встроенный редактор позволит добавить URL.
+Wireless Debugging нужно включить снова, затем в приложении нажать **Подключить** (повторный pairing не нужен, пока не сбросишь данные приложения).
 
-## Сборка из исходников
+Пока privilege не подключён, менеджер работает как обычный (всё, кроме `Android/data` / `Android/obb`).
+
+## Моды BONELAB Fusion
+
+1. Скачай мод (zip) браузером Quest → `Download`.
+2. VR CONTROLER → «Загрузки» → тап по zip — распаковка.
+3. Выдели папку мода → «Вырез.» → «BONELAB» → `Mods` → «Встав.».
+4. Репозитории Fusion: «BONELAB» → `repositories.txt` — встроенный редактор.
+
+## Сборка
 
 ```bash
 ./gradlew assembleRelease
 ```
 
-Требуется JDK 17 и Android SDK 34. Подписать: `zipalign` + `apksigner` из build-tools.
+JDK 17, Android SDK 34. Подпись: `zipalign` + `apksigner`.
+
+## Технологии privilege-слоя
+
+- Wireless ADB pairing/client (адаптация протокола из [Shizuku](https://github.com/RikkaApps/Shizuku), Apache-2.0)
+- `libadb.so` (SPAKE2) из релиза Shizuku
+- Встроенный `FileDaemon` через `app_process` с shell UID
+- Quest-friendly in-app pairing (без notification RemoteInput — на Horizon OS v83+ он сломан)
+
+## Лицензии стороннего кода
+
+См. `app/src/main/java/moe/shizuku/manager/adb/NOTICE.txt`.
