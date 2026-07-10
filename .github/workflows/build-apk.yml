@@ -6,6 +6,9 @@ on:
       - claude/vr-file-manager-quest-x6kfmg
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -82,3 +85,20 @@ jobs:
           name: vr-controler-release
           path: app/build/outputs/apk/release/vr-controler-release.apk
           retention-days: 30
+
+      # Also commits the APK straight into the branch so it can be downloaded
+      # with a plain link, without going through the Actions artifacts UI
+      # (which the sandbox this repo is developed from can't reach directly).
+      - name: Commit APK to repo
+        run: |
+          mkdir -p releases
+          cp app/build/outputs/apk/release/vr-controler-release.apk releases/vr-controler-latest.apk
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add releases/vr-controler-latest.apk
+          if git diff --cached --quiet; then
+            echo "APK unchanged, nothing to commit"
+          else
+            git commit -m "Update built APK [skip ci]"
+            git push
+          fi
