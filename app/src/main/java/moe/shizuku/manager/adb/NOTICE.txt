@@ -1,0 +1,5 @@
+ADB wireless pairing/client code adapted from RikkaApps/Shizuku
+Copyright (c) RikkaApps
+Licensed under the Apache License, Version 2.0
+https://github.com/RikkaApps/Shizuku
+Native libadb.so extracted from Shizuku release (SPAKE2 pairing).
