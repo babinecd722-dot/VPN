@@ -1,0 +1,149 @@
+{
+  "name": "teledark-kit-v12.7",
+  "source": "TeleDark v12.7.ipa reverse engineering",
+  "date": "2026-07-07",
+  "dylib_count": 15,
+  "plugin_count": 6,
+  "files": [
+    {
+      "path": "GAYD-TOCHNO-KAK-TELEDARK.txt",
+      "size_bytes": 14259,
+      "sha256": "427f7f1a74d158be0e96b44a6a5c627c80bb5820aa79e705722ea2bd986b7a89"
+    },
+    {
+      "path": "README.txt",
+      "size_bytes": 740,
+      "sha256": "1d1f317835905dbdf018470b72c4b29f758ff12919407600c24216ee9dcabd24"
+    },
+    {
+      "path": "docs/TeleDark-push-notifications-reverse-engineering.txt",
+      "size_bytes": 25848,
+      "sha256": "09cd4ba49fa3e7b305e9e4adb00224814d09dd4edcf187b59fcba3d8c84183ed"
+    },
+    {
+      "path": "dylibs/FilePickerFix.dylib",
+      "size_bytes": 112352,
+      "sha256": "5e572ef2ccf23b3a3dfeb6227d3fc22d56d0bacd30b7cd3f7b184c9b0562d716"
+    },
+    {
+      "path": "dylibs/LOAD_ORDER.txt",
+      "size_bytes": 294,
+      "sha256": "121e1f6579edafe2a3c9a8dbe5840940a6870d24378f94994b53e393a44bca3b"
+    },
+    {
+      "path": "dylibs/SatellaJailed.dylib",
+      "size_bytes": 102560,
+      "sha256": "655d91dadcdf40bf0dab65447225df7311af1000ee0e2e3a7026bb8d637cc53b"
+    },
+    {
+      "path": "dylibs/TelegramChatFixer.dylib",
+      "size_bytes": 112352,
+      "sha256": "b0918f7c60c73d57b653e64a196ed73925f71c5b3d90fb07abeda65476b66e11"
+    },
+    {
+      "path": "dylibs/TelegramNotificationFix.dylib",
+      "size_bytes": 237952,
+      "sha256": "075c21b8c886e50a1cbfacbbe4f43352e3595c030a0e4d675e3ff6677843a385"
+    },
+    {
+      "path": "dylibs/ZiSpop-up.dylib",
+      "size_bytes": 102560,
+      "sha256": "e865f2222b93e02ba638a3597c6dd5480e84f1a37be3568f33a5d0ca1e72eac2"
+    },
+    {
+      "path": "dylibs/flutersult.dylib",
+      "size_bytes": 102560,
+      "sha256": "a576a8b4c65bab39386d6818cef850cac91ff6d0a6f8035b3692c99eef0f5615"
+    },
+    {
+      "path": "dylibs/iOSGods.dylib",
+      "size_bytes": 102560,
+      "sha256": "4a457cba19b472b5e597e40f4a25546f92d1a8d42bafe8bee9f7740e2c652ee1"
+    },
+    {
+      "path": "dylibs/liberdade.dylib",
+      "size_bytes": 5903136,
+      "sha256": "d63de21a2be59583c482a6c3d6e92e182cbd8b1b0a4d0efd8b08cb79f5d3b9e7"
+    },
+    {
+      "path": "dylibs/libobjcpatch.dylib",
+      "size_bytes": 454720,
+      "sha256": "34d0667ad68f0ffde66f8f770945a6c1ee313bfa97a6a8cff882df2e89d3ee61"
+    },
+    {
+      "path": "dylibs/libps.dylib",
+      "size_bytes": 102560,
+      "sha256": "a5f96105895b6a7451fcbb69eee56abecc0a444ad4ef0e71f6dbc8b4dd8f400d"
+    },
+    {
+      "path": "dylibs/libsubstrate.dylib",
+      "size_bytes": 308224,
+      "sha256": "9cdd0149c3ac797cc63aecb89991cf5bfb20710355e4f30a3fb27afa98be9504"
+    },
+    {
+      "path": "dylibs/lidersunframe.dylib",
+      "size_bytes": 102560,
+      "sha256": "531f1b32dcc7913507a4c87d5111dd8539ece977b3506618816380848b79764b"
+    },
+    {
+      "path": "dylibs/liframesatrate.dylib",
+      "size_bytes": 102560,
+      "sha256": "b81e139ee24ac58228c0d7a194d836cb6cb0c6507fd85f0dfdae6aed42dea351"
+    },
+    {
+      "path": "dylibs/putcher_concurent.dylib",
+      "size_bytes": 102560,
+      "sha256": "98d934507fc243540aae11773c50e19c65efff73ee9ec61095b9a53d0623d749"
+    },
+    {
+      "path": "dylibs/sideloadFixerLol.dylib",
+      "size_bytes": 87456,
+      "sha256": "0f36051c472cdf09bfd4ae8bf970d725707b53cb2616db66326f53012f23583e"
+    },
+    {
+      "path": "reference/Info.plist.main",
+      "size_bytes": 7253,
+      "sha256": "a6d4bdc35eb2750ebaeb90f47daa43a79df46793355ad17e1cdc2b568d45d206"
+    },
+    {
+      "path": "reference/PlugIns/BroadcastUploadExtension.appex/Info.plist",
+      "size_bytes": 1791,
+      "sha256": "617affe73febb434a5b491bb0b76edf56f6ed2773b80ad33f37939ce01798707"
+    },
+    {
+      "path": "reference/PlugIns/IntentsExtension.appex/Info.plist",
+      "size_bytes": 2216,
+      "sha256": "5ca4ba1ad22882992474b0f32746d29a6a6e47ce31418dcb08b570cff22d4c37"
+    },
+    {
+      "path": "reference/PlugIns/NotificationContentExtension.appex/Info.plist",
+      "size_bytes": 1995,
+      "sha256": "fe351fd4c41ca5a1540774df146220632c2fd61910c2023738b1adcf1f1c4488"
+    },
+    {
+      "path": "reference/PlugIns/NotificationServiceExtensionv1.appex/Info.plist",
+      "size_bytes": 1851,
+      "sha256": "6e7d7ad43f4a7a1785cff11db82a082526fd84ca6eaa766530561f22d4873818"
+    },
+    {
+      "path": "reference/PlugIns/ShareExtension.appex/Info.plist",
+      "size_bytes": 2815,
+      "sha256": "3a96859ef01b1bccc9ad4479a79e52b5a9401c1079d81ea86138fe16eb8a7152"
+    },
+    {
+      "path": "reference/PlugIns/WidgetExtension.appex/Info.plist",
+      "size_bytes": 1590,
+      "sha256": "7b3ad016e4dfa9488841d1685deaa8217acb49ee134b39dfcc13f7267d3c59a5"
+    },
+    {
+      "path": "reference/SignedByEsign",
+      "size_bytes": 61,
+      "sha256": "063e8bb2359eef8501e2f8aad45390ddd255b77c81fbd3c35103b04467b35992"
+    },
+    {
+      "path": "reference/embedded.mobileprovision.example",
+      "size_bytes": 19332,
+      "sha256": "2370b88f05614232fb61960d97b063e2952553942860f30a42ef3e5f3ac2903f"
+    }
+  ]
+}

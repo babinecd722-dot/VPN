@@ -1,0 +1,292 @@
+================================================================================
+  ГАЙД: СДЕЛАТЬ УВЕДОМЛЕНИЯ И МОД КАК У TeleDark v12.7
+  Архив: teledark-kit-v12.7.zip
+================================================================================
+
+Этот архив — точная копия компонентов из TeleDark v12.7.ipa (реверс 2026-07-07).
+Внутри: 15 dylib, эталонные plist, пример профиля, полный тех. разбор.
+
+
+================================================================================
+СОДЕРЖИМОЕ АРХИВА
+================================================================================
+
+dylibs/                          — 15 injected-библиотек (скопировать в .app)
+  LOAD_ORDER.txt                 — порядок загрузки (ВАЖНО соблюдать)
+  FilePickerFix.dylib
+  TelegramChatFixer.dylib
+  TelegramNotificationFix.dylib  ← фикс push / App Groups
+  sideloadFixerLol.dylib         ← фикс sideload App Groups
+  libsubstrate.dylib             ← Substrate runtime (обязателен)
+  liberade.dylib                 ← основной мод TeleDark (5.7 MB)
+  libps.dylib
+  flutersult.dylib
+  lidersunframe.dylib
+  ZiSpop-up.dylib                ← попап канала ZiSipa
+  iOSGods.dylib
+  SatellaJailed.dylib
+  putcher_concurent.dylib
+  liframesatrate.dylib
+  libobjcpatch.dylib
+
+reference/
+  Info.plist.main                — эталон главного приложения
+  embedded.mobileprovision.example — пример профиля из IPA
+  SignedByEsign                  — маркер что подписывали через ESign
+  PlugIns/*/Info.plist           — эталоны 6 extensions
+
+docs/
+  TeleDark-push-notifications-reverse-engineering.txt — полный реверс
+
+MANIFEST.json                    — sha256 всех файлов
+README.txt                       — краткая справка
+
+
+================================================================================
+ЧАСТЬ 1. ЧТО ДЕЛАЕТ КАЖДЫЙ DYLIB
+================================================================================
+
+  №  Файл                          Размер   Назначение
+  -- ----------------------------- -------- ---------------------------------
+  1  FilePickerFix.dylib           110 KB   Фикс выбора файлов
+  2  TelegramChatFixer.dylib       110 KB   Фикс чатов
+  3  TelegramNotificationFix.dylib 233 KB   PUSH + App Groups (DzMohaipa)
+  4  sideloadFixerLol.dylib         86 KB   Sideload App Groups fix
+  5  libsubstrate.dylib            301 KB   MobileSubstrate runtime
+  6  liberade.dylib                5.7 MB   Основной мод (TDGhostMode и т.д.)
+  7  libps.dylib                   101 KB   Вспомогательный
+  8  flutersult.dylib              101 KB   Вспомогательный
+  9  lidersunframe.dylib           101 KB   Вспомогательный
+  10 ZiSpop-up.dylib               101 KB   Попап ZiSipa
+  11 iOSGods.dylib                 101 KB   Маркер iOSGods
+  12 SatellaJailed.dylib           101 KB   IAP bypass
+  13 putcher_concurent.dylib       101 KB   Вспомогательный
+  14 liframesatrate.dylib          101 KB   Вспомогательный
+  15 libobjcpatch.dylib            445 KB   ObjC/Swift runtime патчи
+
+КРИТИЧНЫ ДЛЯ УВЕДОМЛЕНИЙ: №3, №4, №5
+КРИТИЧЕН ДЛЯ МОДА: №6 (liberdade.dylib)
+
+
+================================================================================
+ЧАСТЬ 2. СТРУКТУРА ПРИЛОЖЕНИЯ (КАК У TELEDARK)
+================================================================================
+
+Telegram.app/
+  Telegram                       ← главный бинарник (executable)
+  Info.plist                     ← CFBundleIdentifier = app.teledark
+  [все 15 dylib из папки dylibs/]
+  embedded.mobileprovision       ← твой профиль при подписи
+  PlugIns/
+    NotificationServiceExtensionv1.appex/   ← ОБЯЗАТЕЛЕН для push
+      Bundle: app.teledark.NotificationService
+    NotificationContentExtension.appex/
+      Bundle: app.teledark.NotificationContent
+    WidgetExtension.appex/
+      Bundle: app.teledark.Widget
+    ShareExtension.appex/
+      Bundle: app.teledark.Share
+    IntentsExtension.appex/
+      Bundle: app.teledark.SiriIntents
+    BroadcastUploadExtension.appex/
+      Bundle: app.teledark.BroadcastUpload
+  Frameworks/
+    TelegramCoreFramework.framework
+    TelegramUIFramework.framework
+    PostboxFramework.framework
+    MtProtoKitFramework.framework
+    SwiftSignalKitFramework.framework
+
+
+================================================================================
+ЧАСТЬ 3. Info.plist — ОБЯЗАТЕЛЬНЫЕ КЛЮЧИ
+================================================================================
+
+Смотри reference/Info.plist.main. Главное:
+
+  CFBundleIdentifier:        app.teledark
+  CFBundleDisplayName:       Teledark
+  CFBundleExecutable:        Telegram
+
+  UIBackgroundModes:
+    - audio
+    - fetch
+    - location
+    - remote-notification      ← БЕЗ ЭТОГО PUSH НЕ РАБОТАЕТ
+    - voip
+    - processing
+
+  BGTaskSchedulerPermittedIdentifiers:
+    - app.teledark.refresh
+    - app.teledark.cleanup
+    - app.teledark.upload.*
+
+
+================================================================================
+ЧАСТЬ 4. КАК ВСТРОИТЬ DYLIB В СВОЙ IPA (НА MAC)
+================================================================================
+
+Вариант A — если собираешь из исходников Telegram-iOS:
+  1. Добавь все 15 dylib в Copy Bundle Resources таргета Telegram
+  2. В Build Phases → Link Binary: НЕ линкуй, только копируй в бандл
+  3. Используй insert_dylib (https://github.com/Tyilo/insert_dylib)
+     Вставляй в ОБРАТНОМ порядке (последний в списке — первым вставляется):
+
+     insert_dylib --strip-codesig --inplace \
+       @executable_path/libobjcpatch.dylib Payload/Telegram.app/Telegram
+
+     insert_dylib --strip-codesig --inplace \
+       @executable_path/liframesatrate.dylib Payload/Telegram.app/Telegram
+
+     ... (повтори для всех 15, см. dylibs/LOAD_ORDER.txt снизу вверх)
+
+  4. Итоговый порядок загрузки в бинарнике (сверху вниз при старте):
+     FilePickerFix → TelegramChatFixer → TelegramNotificationFix →
+     sideloadFixerLol → libsubstrate → liberade → libps → flutersult →
+     lidersunframe → ZiSpop-up → iOSGods → SatellaJailed →
+     putcher_concurent → liframesatrate → libobjcpatch
+
+Вариант B — если уже есть готовый IPA (Telegram или свой форк):
+  1. Распакуй:  unzip MyApp.ipa -d unpacked/
+  2. Скопируй все dylib из архива в unpacked/Payload/Telegram.app/
+  3. insert_dylib для каждого (как выше)
+  4. Замени Info.plist на reference/Info.plist.main (или поправь bundle id)
+  5. Убедись что PlugIns/ содержит все 6 extensions
+  6. Переподпиши (см. Часть 5)
+
+
+================================================================================
+ЧАСТЬ 5. ПОДПИСЬ — КАК У TELEDARK (ESign / Scarlet)
+================================================================================
+
+TeleDark в оригинале подписан через ESign (файл SignedByEsign в бандле).
+
+ЧТО НУЖНО:
+  - Платный Apple Developer ($99/год)
+  - Файл .p12 (сертификат)
+  - Файл .mobileprovision (профиль)
+  - В профиле ОБЯЗАТЕЛЬНО:
+      aps-environment = production
+      App Groups (минимум 1, у TeleDark — 5 штук)
+      Push Notifications capability
+
+СХЕМА TELEDARK (как в оригинальном IPA):
+  Info.plist bundle:     app.teledark
+  App ID в профиле:      может отличаться (у них: app.polarbear5166.durian2960)
+  Dylib-фиксы:           TelegramNotificationFix + sideloadFixerLol
+                         подменяют App Group пути при таком расхождении
+
+СХЕМА ДЛЯ ТЕБЯ (проще, если свой сертификат):
+  1. Создай App ID: app.teledark (или свой, но тогда поменяй везде)
+  2. Включи Push Notifications + App Groups
+  3. Создай provisioning profile с твоим UDID
+  4. В ESign:
+     - Импорт .p12 + .mobileprovision
+     - Выбери IPA
+     - Bundle ID: НЕ МЕНЯТЬ (оставить app.teledark)
+     - Подписать
+  5. Установить → Настройки iOS → Уведомления → Разрешить
+
+Инструменты (как у канала ZiSipa):
+  ESign, Scarlet, GBox, Feather, KSign
+
+
+================================================================================
+ЧАСТЬ 6. ENTITLEMENTS — ЧТО ДОЛЖНО БЫТЬ В ПРОФИЛЕ
+================================================================================
+
+Минимум для push (из реального TeleDark embedded.mobileprovision):
+
+  aps-environment = production
+
+  com.apple.developer.usernotifications.communication = true
+  com.apple.developer.usernotifications.time-sensitive = true
+
+  com.apple.security.application-groups:
+    - group.1f56048729375e2d.1
+    - group.1f56048729375e2d.2
+    - group.1f56048729375e2d.3
+    - group.1f56048729375e2d.4
+    - group.1f56048729375e2d.5
+
+  com.apple.developer.team-identifier = ТВОЙ_TEAM_ID
+
+У ТЕБЯ App Groups будут другие (group.ТВОЙ_HASH.1 и т.д.) — это нормально.
+Главное: одинаковые группы в app И во всех 6 extensions.
+
+
+================================================================================
+ЧАСТЬ 7. ХУКИ В TelegramNotificationFix.dylib (РЕВЕРС)
+================================================================================
+
+Автор: DzMohaipa (dzmohaipa.com/ipa)
+
+Перехваты (Logos/Substrate):
+
+  1. [AppDelegate application:didFinishLaunchingWithOptions:]
+     → код при старте
+
+  2. [NSFileManager containerURLForSecurityApplicationGroupIdentifier:]
+     → ГЛАВНЫЙ ФИКС: подмена пути App Group при sideload
+     → без этого NotificationService extension не видит данные app
+
+  3. [INPreferences _siriAuthorizationStatus]
+     → фикс Siri
+
+  4. [AppDelegate FCAlertView:clickedButtonIndex:buttonTitle:]
+     → попап автора
+
+
+================================================================================
+ЧАСТЬ 8. ПРОВЕРКА ЧТО ВСЁ РАБОТАЕТ
+================================================================================
+
+  [ ] Все 15 dylib лежат в Telegram.app/
+  [ ] insert_dylib выполнен, бинарник грузит dylib (проверка: otool -L Telegram)
+  [ ] CFBundleIdentifier = app.teledark в Info.plist
+  [ ] PlugIns/ содержит NotificationServiceExtensionv1.appex
+  [ ] UIBackgroundModes содержит remote-notification
+  [ ] Подписано своим .p12 + .mobileprovision с aps-environment
+  [ ] Bundle ID не менялся при подписи в ESign
+  [ ] iOS Settings → приложение → Уведомления → Включено
+  [ ] Тест: отправить сообщение с другого аккаунта в фоне
+
+
+================================================================================
+ЧАСТЬ 9. ЧАСТЫЕ ОШИБКИ
+================================================================================
+
+  Проблема                          Решение
+  --------------------------------  ------------------------------------------
+  Push не приходят                  Проверь aps-environment в профиле
+  Push только когда app открыт      Проверь remote-notification в Info.plist
+  Rich notifications не работают    Подписан ли NotificationService extension?
+  App Group ошибки                  Нужны dylib №3 и №4, или выровняй группы
+  Не устанавливается                UDID в профиле? Сертификат не revoked?
+  Мод-меню нет                      Нет liberade.dylib или не загружается
+  Вылет при старте                  Неверный порядок dylib / нет libsubstrate
+
+
+================================================================================
+ЧАСТЬ 10. БЫСТРЫЙ СТАРТ (МИНИМУМ ДЕЙСТВИЙ)
+================================================================================
+
+  Если хочешь просто поставить TeleDark как есть:
+    1. Скачай TeleDark v12.7.ipa
+    2. Купи личный сертификат (с Push Notifications)
+    3. ESign → импорт .p12 + .mobileprovision
+    4. Подписать IPA, Bundle ID НЕ МЕНЯТЬ
+    5. Установить
+
+  Если хочешь свой клиент с теми же уведомлениями:
+    1. Собери/возьми IPA Telegram 12.7
+    2. Скопируй dylibs/ из этого архива в .app
+    3. insert_dylib все 15 (порядок — LOAD_ORDER.txt)
+    4. Добавь PlugIns из эталонного Telegram (6 extensions)
+    5. Info.plist — как reference/Info.plist.main
+    6. Подпиши своим сертификатом с push
+    7. Установи
+
+================================================================================
+КОНЕЦ ГАЙДА
+================================================================================
