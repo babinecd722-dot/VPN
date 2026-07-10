@@ -61,6 +61,7 @@ class MainActivity : ComponentActivity() {
                     hasAllFiles = { Environment.isExternalStorageManager() },
                     requestAllFiles = { requestAllFilesAccess() },
                     openDeveloperSettings = { openDeveloperSettings() },
+                    openSystemFiles = { openSystemFileManager() },
                 )
             }
         }
@@ -100,6 +101,30 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    /**
+     * Horizon OS ships its own system Files app with privileged access to
+     * Android/data (bypasses scoped storage — not available to third-party apps
+     * even with MANAGE_EXTERNAL_STORAGE). No ADB/Developer Mode needed for this;
+     * we just hand off to it instead of re-implementing that privilege ourselves.
+     */
+    private fun openSystemFileManager(): Boolean {
+        val attempts = listOf(
+            { Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_APP_FILES) },
+            { packageManager.getLaunchIntentForPackage("com.oculus.filemanager") },
+            { packageManager.getLaunchIntentForPackage("com.meta.horizon.filemanager") },
+        )
+        for (make in attempts) {
+            val intent = try { make() } catch (_: Exception) { null } ?: continue
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            try {
+                startActivity(intent)
+                return true
+            } catch (_: ActivityNotFoundException) {
+            }
+        }
+        return false
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -109,6 +134,7 @@ fun AppScreen(
     hasAllFiles: () -> Boolean,
     requestAllFiles: () -> Unit,
     openDeveloperSettings: () -> Unit,
+    openSystemFiles: () -> Boolean,
 ) {
     val privilegeState by PrivilegeGate.state.collectAsState()
     val privilegeMsg by PrivilegeGate.message.collectAsState()
@@ -236,6 +262,19 @@ fun AppScreen(
                     leadingIcon = { Icon(Icons.Default.Verified, null, Modifier.size(18.dp)) },
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp)
                 )
+            }
+
+            if (privilegeState != PrivilegeState.READY) {
+                TextButton(
+                    onClick = {
+                        if (!openSystemFiles()) {
+                            scope.launch { snackbar.showSnackbar("Системный проводник не найден на этом устройстве") }
+                        }
+                    },
+                    modifier = Modifier.padding(horizontal = 8.dp)
+                ) {
+                    Text("…или открыть Android/data прямо сейчас в системном проводнике очков", fontSize = 12.sp)
+                }
             }
 
             ShortcutRow(vm)
