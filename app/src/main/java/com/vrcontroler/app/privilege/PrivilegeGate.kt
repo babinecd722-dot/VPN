@@ -44,6 +44,13 @@ object PrivilegeGate {
     private const val PREFS = "vr_adb"
     private const val KEY_PAIRED = "paired"
 
+    /** Classic `adb tcpip` port. No mDNS/pairing needed — just the on-device
+     *  "Allow USB debugging" prompt, same as any wireless `adb connect`. Used
+     *  as a bootstrap path when the Wireless Debugging screen itself is
+     *  missing/broken (Horizon OS) and adbd was switched into tcpip mode via
+     *  a one-off shell session (e.g. aShellYou over USB-OTG from a phone). */
+    const val CLASSIC_TCPIP_PORT = 5555
+
     private val _state = MutableStateFlow(PrivilegeState.NEED_WIRELESS)
     val state: StateFlow<PrivilegeState> = _state
 
@@ -173,23 +180,7 @@ object PrivilegeGate {
             val client = AdbClient("127.0.0.1", port, key)
             client.connect()
             clientRef.set(client)
-
-            val apk = ctx.applicationInfo.sourceDir
-            // Launch FileDaemon with shell identity via app_process
-            val cmd =
-                "CLASSPATH=$apk app_process /system/bin --nice-name=vr_file_daemon " +
-                    "com.vrcontroler.app.service.FileDaemon"
-            val shell = client.openShell(cmd)
-            shellRef.set(shell)
-
-            val banner = shell.readUntil(FileDaemon.READY, maxBytes = 64_000)
-            if (!banner.contains(FileDaemon.READY)) {
-                throw IllegalStateException("Daemon не прислал ready: $banner")
-            }
-
-            val pong = rpc(JSONObject().put("op", "ping"))
-            if (!pong.optBoolean("ok")) throw IllegalStateException("ping failed")
-
+            startDaemon(ctx, client)
             _state.value = PrivilegeState.READY
             _message.value = null
             Log.i(TAG, "FileDaemon ready on adb:$port")
@@ -209,6 +200,63 @@ object PrivilegeGate {
                 _message.value = "Не удалось подключить: $msg"
             }
         }
+    }
+
+    /**
+     * Bootstrap path for headsets where the whole "Wireless debugging" screen is
+     * missing from Developer options (seen on some Horizon OS builds). Requires a
+     * one-off shell session from any other device — e.g. an Android phone running
+     * aShellYou connected via a USB-C OTG cable — to run once on the headset:
+     *
+     *   setprop service.adb.tcp.port 5555 && stop adbd && start adbd
+     *
+     * That switches adbd into classic (non-TLS) tcpip mode, which doesn't need a
+     * pairing code — just the same "Allow USB debugging" prompt any adb connection
+     * triggers. This app then talks to it over loopback, no phone required anymore.
+     */
+    suspend fun connectClassicTcpip() = withContext(Dispatchers.IO) {
+        val ctx = appContext ?: return@withContext
+        val key = adbKey ?: return@withContext
+
+        _state.value = PrivilegeState.CONNECTING
+        _message.value = "Подключаемся к 127.0.0.1:$CLASSIC_TCPIP_PORT…"
+        teardown()
+        try {
+            val client = AdbClient("127.0.0.1", CLASSIC_TCPIP_PORT, key)
+            client.connect()
+            clientRef.set(client)
+            startDaemon(ctx, client)
+            prefs?.edit()?.putBoolean(KEY_PAIRED, true)?.apply()
+            _state.value = PrivilegeState.READY
+            _message.value = null
+            Log.i(TAG, "FileDaemon ready on classic adb:$CLASSIC_TCPIP_PORT")
+        } catch (e: Exception) {
+            Log.e(TAG, "classic tcpip connect failed", e)
+            teardown()
+            _state.value = PrivilegeState.ERROR
+            _message.value = "Порт $CLASSIC_TCPIP_PORT не отвечает (${e.message}). Через OTG " +
+                "(aShellYou) выполни на очках: setprop service.adb.tcp.port 5555 && stop adbd " +
+                "&& start adbd — потом подтверди «Allow USB debugging» и нажми ещё раз."
+        }
+    }
+
+    /** Launches the shell-privileged FileDaemon over an already-connected [client]. */
+    private suspend fun startDaemon(ctx: Context, client: AdbClient) {
+        val apk = ctx.applicationInfo.sourceDir
+        // Launch FileDaemon with shell identity via app_process
+        val cmd =
+            "CLASSPATH=$apk app_process /system/bin --nice-name=vr_file_daemon " +
+                "com.vrcontroler.app.service.FileDaemon"
+        val shell = client.openShell(cmd)
+        shellRef.set(shell)
+
+        val banner = shell.readUntil(FileDaemon.READY, maxBytes = 64_000)
+        if (!banner.contains(FileDaemon.READY)) {
+            throw IllegalStateException("Daemon не прислал ready: $banner")
+        }
+
+        val pong = rpc(JSONObject().put("op", "ping"))
+        if (!pong.optBoolean("ok")) throw IllegalStateException("ping failed")
     }
 
     private suspend fun discoverPort(context: Context, type: String, timeoutMs: Long): Int? =

@@ -117,6 +117,7 @@ fun AppScreen(
     var renameTarget by remember { mutableStateOf<FsEntry?>(null) }
     var deleteConfirm by remember { mutableStateOf(false) }
     var showPairing by remember { mutableStateOf(false) }
+    var showOtgHelp by remember { mutableStateOf(false) }
     var connecting by remember { mutableStateOf(false) }
     val snackbar = remember { SnackbarHostState() }
     val scope = rememberCoroutineScope()
@@ -189,11 +190,11 @@ fun AppScreen(
                 }
                 val body = privilegeMsg ?: when (privilegeState) {
                     PrivilegeState.NEED_WIRELESS ->
-                        "Shizuku отдельно ставить не нужно. Включи Wireless Debugging в параметрах разработчика, затем «Подключить»."
+                        "Shizuku отдельно ставить не нужно. Включи Wireless Debugging в параметрах разработчика, затем «Подключить». Нет такого пункта в списке? Жми «Через OTG»."
                     PrivilegeState.NEED_PAIRING ->
                         "Один раз: Wireless Debugging → Pair device with pairing code → введи 6 цифр здесь."
                     PrivilegeState.CONNECTING -> "Ищем порт и поднимаем встроенный shell-daemon…"
-                    else -> "Не удалось получить shell-доступ."
+                    else -> "Не удалось получить shell-доступ. Нет Wireless Debugging совсем? Жми «Через OTG»."
                 }
                 val primary = when {
                     connecting || privilegeState == PrivilegeState.CONNECTING -> "Ждём…"
@@ -207,6 +208,10 @@ fun AppScreen(
                     enabled = !connecting && privilegeState != PrivilegeState.CONNECTING,
                     secondary = "Настройки разработчика",
                     onSecondary = openDeveloperSettings,
+                    tertiary = if (privilegeState == PrivilegeState.NEED_WIRELESS ||
+                        privilegeState == PrivilegeState.ERROR
+                    ) "Через OTG" else null,
+                    onTertiary = { showOtgHelp = true },
                     onClick = {
                         if (privilegeState == PrivilegeState.NEED_PAIRING) {
                             showPairing = true
@@ -296,6 +301,24 @@ fun AppScreen(
         )
     }
 
+    if (showOtgHelp) {
+        OtgHelpDialog(
+            connecting = connecting,
+            onDismiss = { showOtgHelp = false },
+            onConnect = {
+                connecting = true
+                scope.launch {
+                    PrivilegeGate.connectClassicTcpip()
+                    connecting = false
+                    if (PrivilegeGate.isReady) {
+                        showOtgHelp = false
+                        vm.refresh()
+                    }
+                }
+            }
+        )
+    }
+
     if (showNewFolder) {
         TextDialog(
             title = "Новая папка",
@@ -339,6 +362,45 @@ fun AppScreen(
     vm.editorPath?.let { path ->
         EditorDialog(vm, path)
     }
+}
+
+@Composable
+private fun OtgHelpDialog(
+    connecting: Boolean,
+    onDismiss: () -> Unit,
+    onConnect: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Bootstrap через OTG") },
+        text = {
+            Column {
+                Text(
+                    "Если пункта «Wireless debugging» нет в параметрах разработчика вообще — " +
+                        "нужен один разовый шаг с другого устройства (ПК/Mac или Android-телефон " +
+                        "с OTG-кабелем USB-C, приложение aShellYou):\n\n" +
+                        "1. Включи «USB debugging» в параметрах разработчика на очках\n" +
+                        "2. Подключи очки по кабелю к ПК/телефону, получи shell (aShellYou → OTG)\n" +
+                        "3. Выполни в шелле:\n" +
+                        "   setprop service.adb.tcp.port 5555\n" +
+                        "   stop adbd\n" +
+                        "   start adbd\n" +
+                        "4. Подтверди «Allow USB debugging» на очках, если попросит\n" +
+                        "5. Отключи кабель, вернись сюда и нажми «Подключить»",
+                    fontSize = 13.sp,
+                    fontFamily = FontFamily.Monospace
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = !connecting, onClick = onConnect) {
+                Text(if (connecting) "Ждём…" else "Подключить (5555)")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Закрыть") }
+        }
+    )
 }
 
 @Composable
@@ -395,6 +457,8 @@ private fun PermissionCard(
     enabled: Boolean = true,
     secondary: String? = null,
     onSecondary: (() -> Unit)? = null,
+    tertiary: String? = null,
+    onTertiary: (() -> Unit)? = null,
 ) {
     Card(
         Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
@@ -405,10 +469,16 @@ private fun PermissionCard(
             Spacer(Modifier.height(4.dp))
             Text(body, fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.horizontalScroll(rememberScrollState())
+            ) {
                 Button(onClick = onClick, enabled = enabled) { Text(button) }
                 if (secondary != null && onSecondary != null) {
                     OutlinedButton(onClick = onSecondary) { Text(secondary) }
+                }
+                if (tertiary != null && onTertiary != null) {
+                    OutlinedButton(onClick = onTertiary) { Text(tertiary) }
                 }
             }
         }
