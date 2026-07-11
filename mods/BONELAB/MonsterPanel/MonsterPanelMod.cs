@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.9.1", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.10.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -30,8 +30,11 @@ namespace MonsterPanel
         /// <summary>Бесконечные патроны: запас в инвентаре бесконечный (магазин расходуется штатно).</summary>
         public static bool InfiniteAmmo { get; private set; }
 
-        /// <summary>Tank: тебя нельзя схватить/поднять, а ты хватаешь с мега-силой (жёстко кидаешь игроков).</summary>
+        /// <summary>Tank: тебя нельзя схватить/поднять (движение и удары как обычно).</summary>
         public static bool TankMode { get; private set; }
+
+        /// <summary>Super Throw: всё, что отпускаешь из руки, улетает с огромной силой (йит игроков/врагов/объектов).</summary>
+        public static bool SuperThrow { get; private set; }
 
         private const float LaunchSpeed = 28f;
         private const float MaxDamage = 1_000_000f;
@@ -40,6 +43,13 @@ namespace MonsterPanel
         private const float TankReapplyInterval = 0.5f;
         private static bool _tankApplied;
         private static float _tankTimer;
+
+        // Super Throw (йит)
+        private const float YeetSpeed = 45f;   // м/с при отпускании — швыряет через полкарты
+        private static readonly YeetState _leftYeet = new YeetState();
+        private static readonly YeetState _rightYeet = new YeetState();
+
+        private class YeetState { public bool WasHolding; public GameObject Held; }
 
         // Remote Kill
         private const float RkRange = 40f;          // дальность наведения
@@ -89,6 +99,12 @@ namespace MonsterPanel
             }
 
             TankUpdate();
+
+            if (SuperThrow)
+            {
+                YeetHand(BoneLib.Player.LeftHand, _leftYeet);
+                YeetHand(BoneLib.Player.RightHand, _rightYeet);
+            }
         }
 
         // ---------------- Remote Kill ----------------
@@ -307,6 +323,8 @@ namespace MonsterPanel
                 v => { InfiniteAmmo = v; Log("Infinite Ammo", v); });
             page.CreateBool("Tank Mode", new Color(0.4f, 0.6f, 0.9f), TankMode,
                 v => { TankMode = v; Log("Tank Mode", v); });
+            page.CreateBool("Super Throw", new Color(0.9f, 0.5f, 0.1f), SuperThrow,
+                v => { SuperThrow = v; Log("Super Throw", v); });
 
             // Teleport + ник: только когда загружен LabFusion.
             if (Teleporter.FusionLoaded)
@@ -471,6 +489,51 @@ namespace MonsterPanel
                     if (g != null && g.enabled != enabled) g.enabled = enabled;
             }
             catch (Exception e) { MelonLogger.Warning("Tank grips: " + e.Message); }
+        }
+
+        // ---------------- Super Throw (йит) ----------------
+        //
+        // Ловим момент отпускания из руки и швыряем то, что держали, с огромной скоростью.
+        // Работает на игроков с чужим бессмертием: это физика захвата, а не урон — god mode
+        // блокирует только урон, а брошенное тело всё равно летит. Себя не задевает: действуем
+        // только на удерживаемый объект.
+        private static void YeetHand(Hand hand, YeetState state)
+        {
+            if (hand == null) return;
+            try
+            {
+                bool holding = hand.HasAttachedObject();
+                if (holding)
+                {
+                    var go = hand.m_CurrentAttachedGO;   // запоминаем, пока держим (при отпускании уже null)
+                    if (go != null) { state.Held = go; state.WasHolding = true; }
+                }
+                else if (state.WasHolding)
+                {
+                    Yeet(state.Held, hand);
+                    state.WasHolding = false;
+                    state.Held = null;
+                }
+            }
+            catch (Exception e) { MelonLogger.Warning("Super Throw: " + e.Message); }
+        }
+
+        private static void Yeet(GameObject go, Hand hand)
+        {
+            if (go == null) return;
+            // Направление: куда двигалась рука; если почти неподвижна — вперёд от руки.
+            Vector3 dir;
+            var hrb = hand.rb;
+            if (hrb != null && hrb.velocity.sqrMagnitude > 1f) dir = hrb.velocity.normalized;
+            else dir = hand.transform.forward;
+
+            Vector3 v = dir * YeetSpeed;
+            var root = go.transform.root;
+            if (root == null) return;
+            int n = 0;
+            foreach (var rb in root.GetComponentsInChildren<Rigidbody>())
+                if (rb != null) { try { rb.velocity = v; n++; } catch { } }
+            MelonLogger.Msg($"Super Throw: йитнул {root.name} ({n} тел) со скоростью {YeetSpeed} м/с.");
         }
 
         // ---------------- Свой ник: скрытие и цветные DEV-пресеты (LabFusion) ----------------
