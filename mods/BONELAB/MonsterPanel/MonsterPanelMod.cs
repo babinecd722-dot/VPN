@@ -10,7 +10,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.4.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.4.1", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -86,6 +86,9 @@ namespace MonsterPanel
                 Vector3 away = marker.transform.position - head.position;
                 if (away.sqrMagnitude > 0.0001f)
                     marker.transform.rotation = Quaternion.LookRotation(away, Vector3.up);
+                // Масштаб по дистанции — крестик читаем и вблизи, и издалека.
+                float dist = away.magnitude;
+                marker.transform.localScale = Vector3.one * Mathf.Clamp(dist * 0.25f, 0.6f, 4f);
             }
 
             bool grip = controller.GetGripForce() > RkGripThreshold;
@@ -146,6 +149,27 @@ namespace MonsterPanel
             return root;
         }
 
+        private static Material _markerMat;
+
+        /// <summary>URP-совместимый светящийся материал (без него рантайм-примитивы в URP невидимы/розовые).</summary>
+        private static Material MarkerMaterial()
+        {
+            if (_markerMat != null) return _markerMat;
+            Color c = new Color(0.2f, 1f, 0.35f);
+            Shader sh = Shader.Find("Universal Render Pipeline/Unlit");
+            if (sh == null) sh = Shader.Find("Universal Render Pipeline/Lit");
+            if (sh == null) sh = Shader.Find("Sprites/Default");
+            if (sh == null) sh = Shader.Find("Unlit/Color");
+            var m = new Material(sh);
+            try { m.color = c; } catch { }
+            try { m.SetColor("_BaseColor", c); } catch { }
+            try { m.SetColor("_Color", c); } catch { }
+            try { m.EnableKeyword("_EMISSION"); m.SetColor("_EmissionColor", c * 2f); } catch { }
+            UnityEngine.Object.DontDestroyOnLoad(m);
+            _markerMat = m;
+            return m;
+        }
+
         private static void Bar(Transform parent, Vector3 localPos, Vector3 scale, Color c)
         {
             var g = GameObject.CreatePrimitive(PrimitiveType.Cube);
@@ -155,11 +179,7 @@ namespace MonsterPanel
             g.transform.localPosition = localPos;
             g.transform.localScale = scale;
             var r = g.GetComponent<Renderer>();
-            if (r != null)
-            {
-                r.material.color = c;
-                try { r.material.EnableKeyword("_EMISSION"); r.material.SetColor("_EmissionColor", c * 2.2f); } catch { }
-            }
+            if (r != null) r.sharedMaterial = MarkerMaterial();  // URP-материал, иначе не видно
         }
 
         private static void HideMarker(GameObject marker)
