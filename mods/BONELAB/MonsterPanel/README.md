@@ -1,52 +1,46 @@
 # MONSTER Panel (BONELAB MelonLoader mod)
 
-Страница **MONSTER Panel** в BoneMenu с двумя тумблерами:
+Страница **MONSTER Panel** в BoneMenu, два тумблера (без кнопок — вкл/выкл):
 
 - **Invincible** — бессмертие. Игрок не получает урон и не умирает.
-- **Monster Damage** — любой урон, который ты наносишь врагам (и удары, и стрельба),
-  становится максимальным → всё с одного попадания. Включено = монстер-урон,
-  выключено = обычный урон. Без кнопок, просто тумблер.
+- **Monster Damage** — ваншот с жёстким отбросом:
+  - **враги-гуманоиды** (PuppetMaster) — мгновенно убиваются и **отлетают** в сторону удара;
+  - **объекты/ящики** (Health) — уничтожаются с одного касания;
+  - **игроки в Fusion** — сетевой урон по игроку подменяется на максимум (ваншот по сети).
 
-Подписи латиницей специально: в шрифте BoneMenu (arlon) нет кириллицы, русские
-буквы отобразились бы кракозябрами. Логи в `Latest.log` — на русском (в файл пишутся
-нормально).
+Работает и для ближнего боя, и для стрельбы.
 
-## Как работает
+## Как работает (Harmony-префиксы, типизированно)
 
-Harmony-префиксы на методах из `Il2CppSLZ.Marrow`:
-- Бессмертие → `Player_Health.TAKEDAMAGE / ApplyKillDamage / Death` — префикс
-  возвращает `false`, оригинал не выполняется (урон/смерть игрока отменяются).
-- Монстер-урон → `Health.TAKEDAMAGE(float damage)` — префикс подменяет `damage`
-  на 1 000 000 (через него проходит любой урон по врагам: и ближний бой, и пули).
+- Бессмертие → `Player_Health.TAKEDAMAGE / ApplyKillDamage / Death` (префикс возвращает `false`).
+- Враги → `PuppetMasta.SubBehaviourHealth.TakeDamage` → зовём `Kill()` + раскидываем
+  риг задетого тела через `attack.collider` (скорость `velocity` всем Rigidbody от корня).
+- Объекты → `Health.TAKEDAMAGE` → `Death()`.
+- Игроки (Fusion) → `LabFusion.Patching.PlayerDamageReceiverPatches.ReceiveAttack(ref Attack attack)` →
+  ставим `attack.damage` в максимум до того, как Fusion отправит урон по сети.
 
-Игрока это не задевает: у игрока свой `Player_Health.TAKEDAMAGE`, а не базовый
-`Health.TAKEDAMAGE`, так что монстер-урон бьёт только по врагам.
-
-Имена методов и параметров (`TAKEDAMAGE(damage)`) сверены с метаданными твоего
-`Il2CppSLZ.Marrow.dll` с очков. Собрано (0 ошибок) против реальных `BoneLib.dll`
-v3.1.4 и `MelonLoader.dll` v0.6.5.
+Всё собрано **типизированно** против реальных сборок с твоих очков:
+`Il2CppSLZ.Marrow.dll`, `LabFusion.dll` (v1.14.2), `BoneLib.dll` v3.1.4,
+`MelonLoader.dll` v0.6.5, `Il2CppInterop.Runtime`. Сигнатуры методов сверены с
+метаданными. Компиляция — 0 ошибок.
 
 ## Установка
 
-1. Положи `MonsterPanel.dll` → `MelonLoader/Mods/` (BoneLib уже стоит — нужен для меню).
-2. Запусти BONELAB → BoneMenu → **MONSTER Panel** → тумблеры.
-3. В `Latest.log` ищи «MONSTER Panel: пропатчен Player_Health.TAKEDAMAGE / Health.TAKEDAMAGE».
+1. `MonsterPanel.dll` → `MelonLoader/Mods/` (замени старый!).
+2. BONELAB → BoneMenu → **MONSTER Panel**.
+3. В `Latest.log` проверь строки «пропатчен …»: `SubBehaviourHealth.TakeDamage`,
+   `Health.TAKEDAMAGE`, `Player_Health.*`, и (если Fusion) `PlayerDamageReceiverPatches.ReceiveAttack`.
 
-## Проверено / не проверено
+## Нюансы / не проверено на устройстве
 
-- **Компиляция**: да, против реальных сборок, 0 ошибок; имена/параметры сверены с
-  игровой сборкой.
-- **Рантайм**: God-режим (бессмертие) уже подтверждён тобой в игре. Монстер-урон
-  скомпилирован верно, но на устройстве мной не гонялся — если какой-то тип врага
-  использует свой override `TAKEDAMAGE` (не базовый `Health`), по нему может не
-  сработать; тогда скинь `Latest.log`, добавлю нужный тип.
-- **Отбрасывание врагов / one-shot по игрокам в Fusion / зажатие кнопки** — не здесь:
-  для этого нужен `Il2CppInterop.Runtime.dll` (доступ к Rigidbody/контроллеру),
-  которого пока нет в репо.
+- Бессмертие уже подтверждено тобой в игре. Остальное собрано верно, но рантайм-тест
+  на очках не делался.
+- **Fusion:** префикс `ReceiveAttack` бустит урон для любой атаки, проходящей через
+  ресивер. Рекомендую в PvP держать **Invincible** тоже включённым (на случай, если
+  ресивер сработает и на входящий по тебе урон).
+- Если по какому-то врагу/объекту не сработает — скинь `Latest.log`, добавлю нужный тип.
 
 ## Пересборка
 
-```bash
-cd mods/BONELAB/MonsterPanel
-dotnet build -c Release MonsterPanel.csproj   # net8, референсы см. в .csproj
-```
+Референсы берутся из `third_party/BONELAB-libs/` (Il2CppAssemblies + LabFusion) и
+NuGet `Il2CppInterop.Runtime`. См. `MonsterPanel.csproj`.
