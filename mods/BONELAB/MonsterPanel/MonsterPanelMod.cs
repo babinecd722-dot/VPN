@@ -10,7 +10,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.4.2", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.5.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -32,13 +32,27 @@ namespace MonsterPanel
         // Remote Kill
         private const float RkRange = 40f;          // дальность наведения
         private const float RkGripThreshold = 0.6f;
-        private static GameObject _leftMarker, _rightMarker;
-        private static bool _leftGripPrev, _rightGripPrev;
+        private const float RkAimRadius = 0.28f;    // «толщина» луча (SphereCast) — крестик не скачет
+        private const float RkPersist = 0.4f;       // сколько держим цель после потери луча, сек
+        private static readonly HandState _left = new HandState();
+        private static readonly HandState _right = new HandState();
+
+        /// <summary>Флаг: мы прямо сейчас шлём Remote Kill — бустим урон даже если Monster Damage выкл.</summary>
+        private static bool _remoteKillSending;
 
         private const string PlayerHealthType = "Il2CppSLZ.Marrow.Player_Health";
         private const string FusionReceiverPatch = "LabFusion.Patching.PlayerDamageReceiverPatches";
 
         [ThreadStatic] private static bool _reentry;
+
+        /// <summary>Состояние наведения одной руки (маркер, grip, удержание цели против мерцания).</summary>
+        private class HandState
+        {
+            public GameObject Marker;
+            public bool GripPrev;
+            public PlayerDamageReceiver LastTarget;
+            public float LastSeen;
+        }
 
         public override void OnInitializeMelon()
         {
@@ -51,57 +65,69 @@ namespace MonsterPanel
         {
             if (RemoteKill)
             {
-                AimHand(BoneLib.Player.LeftHand?.transform, BoneLib.Player.LeftController, ref _leftMarker, ref _leftGripPrev);
-                AimHand(BoneLib.Player.RightHand?.transform, BoneLib.Player.RightController, ref _rightMarker, ref _rightGripPrev);
+                AimHand(BoneLib.Player.LeftHand?.transform, BoneLib.Player.LeftController, _left);
+                AimHand(BoneLib.Player.RightHand?.transform, BoneLib.Player.RightController, _right);
             }
             else
             {
-                HideMarker(_leftMarker); HideMarker(_rightMarker);
-                _leftGripPrev = _rightGripPrev = false;
+                HideMarker(_left.Marker); HideMarker(_right.Marker);
+                _left.GripPrev = _right.GripPrev = false;
+                _left.LastTarget = _right.LastTarget = null;
             }
         }
 
         // ---------------- Remote Kill ----------------
 
-        private static void AimHand(Transform hand, BaseController controller, ref GameObject marker, ref bool gripPrev)
+        private static void AimHand(Transform hand, BaseController controller, HandState state)
         {
-            if (hand == null || controller == null) { HideMarker(marker); gripPrev = false; return; }
+            if (hand == null || controller == null) { HideMarker(state.Marker); state.GripPrev = false; return; }
 
             PlayerDamageReceiver target = FindTargetPlayer(hand, out RaycastHit hit);
 
+            if (target != null)
+            {
+                state.LastTarget = target;
+                state.LastSeen = Time.time;
+            }
+            else if (state.LastTarget != null && Time.time - state.LastSeen < RkPersist)
+            {
+                // Луч соскользнул (игрок движется) — держим прежнюю цель короткое время, чтобы крестик не мерцал.
+                target = state.LastTarget;
+            }
+
             if (target == null)
             {
-                HideMarker(marker);
-                gripPrev = controller.GetGripForce() > RkGripThreshold; // не «стреляем» при появлении цели во время зажатого grip
+                HideMarker(state.Marker);
+                state.GripPrev = controller.GetGripForce() > RkGripThreshold; // не «стреляем» при повторном захвате цели
                 return;
             }
 
             // Боевой крестик на цели (зелёный = можно убить), всегда развёрнут к лицу.
-            if (marker == null) marker = CreateCrosshair();
-            marker.SetActive(true);
-            marker.transform.position = target.transform.position + Vector3.up * 0.25f;
+            if (state.Marker == null) state.Marker = CreateCrosshair();
+            state.Marker.SetActive(true);
+            state.Marker.transform.position = target.transform.position + Vector3.up * 0.25f;
             var head = BoneLib.Player.Head;
             if (head != null)
             {
-                Vector3 away = marker.transform.position - head.position;
+                Vector3 away = state.Marker.transform.position - head.position;
                 if (away.sqrMagnitude > 0.0001f)
-                    marker.transform.rotation = Quaternion.LookRotation(away, Vector3.up);
+                    state.Marker.transform.rotation = Quaternion.LookRotation(away, Vector3.up);
                 // Масштаб по дистанции — крестик читаем и вблизи, и издалека.
                 float dist = away.magnitude;
-                marker.transform.localScale = Vector3.one * Mathf.Clamp(dist * 0.25f, 0.6f, 4f);
+                state.Marker.transform.localScale = Vector3.one * Mathf.Clamp(dist * 0.25f, 0.6f, 4f);
             }
 
             bool grip = controller.GetGripForce() > RkGripThreshold;
-            if (grip && !gripPrev) KillPlayer(target, hand, hit);   // срабатывание по нажатию, не по удержанию
-            gripPrev = grip;
+            if (grip && !state.GripPrev) KillPlayer(target, hand, hit);   // срабатывание по нажатию, не по удержанию
+            state.GripPrev = grip;
         }
 
-        /// <summary>Луч из руки → ближайший игрок (PlayerDamageReceiver), не считая себя. Отдаёт и попадание.</summary>
+        /// <summary>«Толстый» луч (SphereCast) из руки → ближайший игрок (PlayerDamageReceiver), не считая себя.</summary>
         private static PlayerDamageReceiver FindTargetPlayer(Transform hand, out RaycastHit bestHit)
         {
             bestHit = default;
             Vector3 origin = hand.position + hand.forward * 0.3f;
-            var hits = Physics.RaycastAll(origin, hand.forward, RkRange,
+            var hits = Physics.SphereCastAll(origin, RkAimRadius, hand.forward, RkRange,
                 Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
             PlayerDamageReceiver best = null;
             float bestDist = float.MaxValue;
@@ -116,25 +142,59 @@ namespace MonsterPanel
             return best;
         }
 
-        /// <summary>Строим полноценную атаку (с реальным коллайдером тела) — LabFusion сериализует её и доставит цели.</summary>
+        /// <summary>
+        /// Бьём по ВСЕМ ресиверам тела цели (голова/грудь/…) максимальным уроном через тот же путь,
+        /// что и рабочий Monster Damage: игровой PlayerDamageReceiver.ReceiveAttack, поверх которого
+        /// сидит патч LabFusion и отправляет урон владельцу по сети. Буст гарантируем флагом.
+        /// </summary>
         private static void KillPlayer(PlayerDamageReceiver target, Transform hand, RaycastHit hit)
         {
             try
             {
-                Vector3 dir = (target.transform.position - hand.position).normalized;
-                var attack = new Attack
+                _remoteKillSending = true;
+
+                var root = target.transform.root;
+                var receivers = root != null
+                    ? root.GetComponentsInChildren<PlayerDamageReceiver>()
+                    : null;
+
+                int sent = 0;
+                if (receivers != null && receivers.Length > 0)
                 {
-                    damage = MaxDamage,
-                    attackType = AttackType.Blunt,
-                    direction = dir,
-                    origin = hand.position,
-                    normal = hit.normal.sqrMagnitude > 0.0001f ? hit.normal : -dir,
-                    collider = hit.collider,      // ключевое: реальная часть тела цели, иначе Fusion не отправит
-                };
-                target.ReceiveAttack(attack);
-                MelonLogger.Msg($"Remote Kill: атака отправлена ({target.gameObject.name}).");
+                    foreach (var recv in receivers)
+                    {
+                        if (recv == null || IsOwnRig(recv.transform)) continue;
+                        SendAttack(recv, hand, hit);
+                        sent++;
+                    }
+                }
+                else
+                {
+                    SendAttack(target, hand, hit);
+                    sent = 1;
+                }
+
+                MelonLogger.Msg($"Remote Kill: {sent} атак отправлено по {target.transform.root?.name ?? target.gameObject.name}.");
             }
             catch (Exception e) { MelonLogger.Warning("Remote Kill: " + e.Message); }
+            finally { _remoteKillSending = false; }
+        }
+
+        /// <summary>Одна максимальная атака в конкретный ресивер тела.</summary>
+        private static void SendAttack(PlayerDamageReceiver recv, Transform hand, RaycastHit hit)
+        {
+            Vector3 dir = (recv.transform.position - hand.position).normalized;
+            if (dir.sqrMagnitude < 0.0001f) dir = hand.forward;
+            var attack = new Attack
+            {
+                damage = MaxDamage,
+                attackType = AttackType.Blunt,
+                direction = dir,
+                origin = hand.position,
+                normal = hit.normal.sqrMagnitude > 0.0001f ? hit.normal : -dir,
+                collider = hit.collider,
+            };
+            try { recv.ReceiveAttack(attack); } catch (Exception e) { MelonLogger.Warning("Remote Kill send: " + e.Message); }
         }
 
         /// <summary>Тактический прицел-крестик: 4 штриха вокруг центра + точка, светящийся зелёный.</summary>
@@ -284,7 +344,9 @@ namespace MonsterPanel
 
         private static void FusionAttackPrefix(ref Attack attack)
         {
-            if (MonsterDamage) attack.damage = MaxDamage;
+            // Буст при Monster Damage, а также всегда во время отправки Remote Kill
+            // (чтобы Remote Kill работал даже с выключенным Monster Damage).
+            if (MonsterDamage || _remoteKillSending) attack.damage = MaxDamage;
         }
 
         private static void Launch(Attack attack)
