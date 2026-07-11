@@ -10,7 +10,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.4.1", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.4.2", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -67,7 +67,7 @@ namespace MonsterPanel
         {
             if (hand == null || controller == null) { HideMarker(marker); gripPrev = false; return; }
 
-            PlayerDamageReceiver target = FindTargetPlayer(hand);
+            PlayerDamageReceiver target = FindTargetPlayer(hand, out RaycastHit hit);
 
             if (target == null)
             {
@@ -92,13 +92,14 @@ namespace MonsterPanel
             }
 
             bool grip = controller.GetGripForce() > RkGripThreshold;
-            if (grip && !gripPrev) KillPlayer(target, hand);   // срабатывание по нажатию, не по удержанию
+            if (grip && !gripPrev) KillPlayer(target, hand, hit);   // срабатывание по нажатию, не по удержанию
             gripPrev = grip;
         }
 
-        /// <summary>Луч из руки → ближайший игрок (PlayerDamageReceiver), не считая себя.</summary>
-        private static PlayerDamageReceiver FindTargetPlayer(Transform hand)
+        /// <summary>Луч из руки → ближайший игрок (PlayerDamageReceiver), не считая себя. Отдаёт и попадание.</summary>
+        private static PlayerDamageReceiver FindTargetPlayer(Transform hand, out RaycastHit bestHit)
         {
+            bestHit = default;
             Vector3 origin = hand.position + hand.forward * 0.3f;
             var hits = Physics.RaycastAll(origin, hand.forward, RkRange,
                 Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
@@ -110,25 +111,28 @@ namespace MonsterPanel
                 var recv = h.collider.GetComponentInParent<PlayerDamageReceiver>();
                 if (recv == null) continue;
                 if (IsOwnRig(recv.transform)) continue;         // не наводимся на себя
-                if (h.distance < bestDist) { bestDist = h.distance; best = recv; }
+                if (h.distance < bestDist) { bestDist = h.distance; best = recv; bestHit = h; }
             }
             return best;
         }
 
-        /// <summary>Строим макс-атаку и отдаём в приёмник урона игрока — LabFusion доставит её цели по сети.</summary>
-        private static void KillPlayer(PlayerDamageReceiver target, Transform hand)
+        /// <summary>Строим полноценную атаку (с реальным коллайдером тела) — LabFusion сериализует её и доставит цели.</summary>
+        private static void KillPlayer(PlayerDamageReceiver target, Transform hand, RaycastHit hit)
         {
             try
             {
+                Vector3 dir = (target.transform.position - hand.position).normalized;
                 var attack = new Attack
                 {
                     damage = MaxDamage,
                     attackType = AttackType.Blunt,
-                    direction = (target.transform.position - hand.position).normalized,
+                    direction = dir,
                     origin = hand.position,
+                    normal = hit.normal.sqrMagnitude > 0.0001f ? hit.normal : -dir,
+                    collider = hit.collider,      // ключевое: реальная часть тела цели, иначе Fusion не отправит
                 };
                 target.ReceiveAttack(attack);
-                MelonLogger.Msg("Remote Kill: урон отправлен игроку.");
+                MelonLogger.Msg($"Remote Kill: атака отправлена ({target.gameObject.name}).");
             }
             catch (Exception e) { MelonLogger.Warning("Remote Kill: " + e.Message); }
         }
