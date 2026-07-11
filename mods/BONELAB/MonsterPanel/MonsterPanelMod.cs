@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.6.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.7.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -24,15 +24,19 @@ namespace MonsterPanel
         /// <summary>Монстер-урон: ваншот врагов/объектов/игроков + жёсткий отброс.</summary>
         public static bool MonsterDamage { get; private set; }
 
-        /// <summary>Remote Kill: наводишь рукой на игрока (зелёный маркер) + grip → максимальный урон по сети.</summary>
+        /// <summary>Remote Kill: наводишь рукой на игрока (зелёный маркер) + grip/триггер → максимальный урон по сети.</summary>
         public static bool RemoteKill { get; private set; }
+
+        /// <summary>Бесконечные патроны: у всех стволов магазин не пустеет + запас в инвентаре бесконечный.</summary>
+        public static bool InfiniteAmmo { get; private set; }
 
         private const float LaunchSpeed = 28f;
         private const float MaxDamage = 1_000_000f;
 
         // Remote Kill
         private const float RkRange = 40f;          // дальность наведения
-        private const float RkGripThreshold = 0.6f;
+        private const float RkGripThreshold = 0.6f; // grip (средний палец)
+        private const float RkTriggerThreshold = 0.7f; // триггер (указательный)
         private const float RkAimRadius = 0.28f;    // «толщина» луча (SphereCast) — крестик не скачет
         private const float RkPersist = 0.4f;       // сколько держим цель после потери луча, сек
         private static readonly HandState _left = new HandState();
@@ -46,11 +50,11 @@ namespace MonsterPanel
 
         [ThreadStatic] private static bool _reentry;
 
-        /// <summary>Состояние наведения одной руки (маркер, grip, удержание цели против мерцания).</summary>
+        /// <summary>Состояние наведения одной руки (маркер, фиксация кнопки, удержание цели против мерцания).</summary>
         private class HandState
         {
             public GameObject Marker;
-            public bool GripPrev;
+            public bool FirePrev;
             public PlayerDamageReceiver LastTarget;
             public float LastSeen;
         }
@@ -72,7 +76,7 @@ namespace MonsterPanel
             else
             {
                 HideMarker(_left.Marker); HideMarker(_right.Marker);
-                _left.GripPrev = _right.GripPrev = false;
+                _left.FirePrev = _right.FirePrev = false;
                 _left.LastTarget = _right.LastTarget = null;
             }
         }
@@ -81,7 +85,14 @@ namespace MonsterPanel
 
         private static void AimHand(Transform hand, BaseController controller, HandState state)
         {
-            if (hand == null || controller == null) { HideMarker(state.Marker); state.GripPrev = false; return; }
+            if (hand == null || controller == null) { HideMarker(state.Marker); state.FirePrev = false; return; }
+
+            // Кнопка «выстрела»: срабатывает и на grip (средний палец), и на триггер (указательный) —
+            // что нажмёшь, то и сработает. Значения пишем в лог, чтобы точно видеть, какая кнопка идёт.
+            float gripF = SafeAxis(() => controller.GetGripForce());
+            float trigF = SafeAxis(() => controller.GetIndexCurlAxis());
+            bool fire = gripF > RkGripThreshold || trigF > RkTriggerThreshold;
+            bool firedNow = fire && !state.FirePrev;
 
             PlayerDamageReceiver target = FindTargetPlayer(hand, out RaycastHit hit);
 
@@ -99,7 +110,10 @@ namespace MonsterPanel
             if (target == null)
             {
                 HideMarker(state.Marker);
-                state.GripPrev = controller.GetGripForce() > RkGripThreshold; // не «стреляем» при повторном захвате цели
+                // Диагностика: даже без цели показываем, что кнопка нажалась — сразу видно, рабочая ли она.
+                if (firedNow)
+                    MelonLogger.Msg($"Remote Kill: кнопка нажата (grip={gripF:0.00} trig={trigF:0.00}), но крестика/цели нет — наведи руку на игрока.");
+                state.FirePrev = fire;
                 return;
             }
 
@@ -118,9 +132,18 @@ namespace MonsterPanel
                 state.Marker.transform.localScale = Vector3.one * Mathf.Clamp(dist * 0.25f, 0.6f, 4f);
             }
 
-            bool grip = controller.GetGripForce() > RkGripThreshold;
-            if (grip && !state.GripPrev) KillPlayer(target, hand, hit);   // срабатывание по нажатию, не по удержанию
-            state.GripPrev = grip;
+            if (firedNow)   // срабатывание по нажатию, не по удержанию
+            {
+                MelonLogger.Msg($"Remote Kill: FIRE (grip={gripF:0.00} trig={trigF:0.00}) → цель {target.gameObject.name}.");
+                KillPlayer(target, hand, hit);
+            }
+            state.FirePrev = fire;
+        }
+
+        /// <summary>Безопасно читаем ось контроллера (0, если метод кинул).</summary>
+        private static float SafeAxis(Func<float> read)
+        {
+            try { return read(); } catch { return 0f; }
         }
 
         /// <summary>«Толстый» луч (SphereCast) из руки → ближайший игрок (PlayerDamageReceiver), не считая себя.</summary>
@@ -270,15 +293,19 @@ namespace MonsterPanel
                 v => { MonsterDamage = v; Log("Monster Damage", v); });
             page.CreateBool("Remote Kill", new Color(0.7f, 0.4f, 1f), RemoteKill,
                 v => { RemoteKill = v; Log("Remote Kill", v); });
+            page.CreateBool("Infinite Ammo", new Color(1f, 0.85f, 0.1f), InfiniteAmmo,
+                v => { InfiniteAmmo = v; Log("Infinite Ammo", v); });
 
-            // Teleport: только когда загружен LabFusion (в одиночке телепортироваться не к кому).
+            // Teleport + скрытие ника: только когда загружен LabFusion.
             if (Teleporter.FusionLoaded)
             {
+                page.CreateBool("Hide My Nickname", new Color(0.5f, 0.8f, 1f), false,
+                    v => NickHider.Apply(v));
                 Teleporter.Install(page);
-                MelonLogger.Msg("MONSTER Panel: раздел Teleport добавлен (LabFusion найден).");
+                MelonLogger.Msg("MONSTER Panel: раздел Teleport + Hide Nickname добавлены (LabFusion найден).");
             }
             else
-                MelonLogger.Msg("MONSTER Panel: LabFusion не загружен — раздел Teleport скрыт.");
+                MelonLogger.Msg("MONSTER Panel: LabFusion не загружен — Teleport/Hide Nickname скрыты.");
         }
 
         private static void Log(string name, bool on) =>
@@ -305,6 +332,27 @@ namespace MonsterPanel
                 TryPatch(fusion, "ReceiveAttack", Hm(nameof(FusionAttackPrefix)));
             else
                 MelonLogger.Msg("MONSTER Panel: LabFusion не найден — урон по игрокам в сети выключен (нормально без Fusion).");
+
+            ApplyAmmoPatches();
+        }
+
+        /// <summary>Бесконечный запас патронов: GetCartridgeCount всегда возвращает большой запас,
+        /// поэтому перезарядка всегда есть. Сам магазин расходуется штатно.</summary>
+        private void ApplyAmmoPatches()
+        {
+            try
+            {
+                var post = Hm(nameof(AmmoCountPostfix));
+                int patched = 0;
+                foreach (var mi in AccessTools.GetDeclaredMethods(typeof(AmmoInventory)))
+                {
+                    if (mi.Name != "GetCartridgeCount" || mi.ReturnType != typeof(int)) continue;
+                    HarmonyInstance.Patch(mi, postfix: post);
+                    patched++;
+                }
+                MelonLogger.Msg($"MONSTER Panel: Infinite Ammo — пропатчен AmmoInventory.GetCartridgeCount ({patched} перегрузк).");
+            }
+            catch (Exception e) { MelonLogger.Warning("MONSTER Panel: Infinite Ammo — " + e.Message); }
         }
 
         private static HarmonyMethod Hm(string name) =>
@@ -359,6 +407,12 @@ namespace MonsterPanel
             if (MonsterDamage || _remoteKillSending) attack.damage = MaxDamage;
         }
 
+        /// <summary>Запас патронов в инвентаре — бесконечный (перезарядка всегда доступна).</summary>
+        private static void AmmoCountPostfix(ref int __result)
+        {
+            if (InfiniteAmmo && __result < 999) __result = 999;
+        }
+
         private static void Launch(Attack attack)
         {
             var col = attack.collider;
@@ -370,6 +424,31 @@ namespace MonsterPanel
             if (root == null) return;
             foreach (var rb in root.GetComponentsInChildren<Rigidbody>())
                 if (rb != null) { try { rb.velocity = v; } catch { } }
+        }
+
+        // ---------------- Скрытие своего ника (LabFusion) ----------------
+        //
+        // Ставим свой Nickname пустым — он синхронизируется по сети как метаданные,
+        // поэтому у других над твоим персонажем ник станет пустым. Изолировано в отдельном
+        // классе (JIT-ится только при загруженном LabFusion).
+        private static class NickHider
+        {
+            public static void Apply(bool hide)
+            {
+                try
+                {
+                    var md = LabFusion.Player.LocalPlayer.Metadata;
+                    if (md == null || md.Nickname == null)
+                    {
+                        MelonLogger.Msg("Hide Nickname: метаданные недоступны — зайди в лобби Fusion и повтори.");
+                        return;
+                    }
+                    if (hide) md.Nickname.SetValue(" ");   // пробел, а не "" — иначе LabFusion откатит на username
+                    else md.Nickname.Remove();             // вернуть обычный ник
+                    MelonLogger.Msg(hide ? "Hide Nickname: ник скрыт (пустой)." : "Hide Nickname: ник восстановлен.");
+                }
+                catch (Exception e) { MelonLogger.Warning("Hide Nickname: " + e.Message); }
+            }
         }
 
         // ---------------- Teleport (LabFusion) ----------------
