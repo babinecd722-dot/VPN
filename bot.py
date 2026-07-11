@@ -101,6 +101,8 @@ async def handle_sticker(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message:
+        return
     await update.message.reply_text(
         "Пришли анимированный стикер — верну .tgs."
     )
