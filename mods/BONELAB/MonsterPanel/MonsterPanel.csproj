@@ -4,8 +4,8 @@
     <TargetFramework>net8.0</TargetFramework>
     <LangVersion>latest</LangVersion>
     <Nullable>disable</Nullable>
-    <AssemblyName>GodMode</AssemblyName>
-    <RootNamespace>GodMode</RootNamespace>
+    <AssemblyName>MonsterPanel</AssemblyName>
+    <RootNamespace>MonsterPanel</RootNamespace>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
