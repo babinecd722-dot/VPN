@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.9.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.9.1", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -37,11 +37,9 @@ namespace MonsterPanel
         private const float MaxDamage = 1_000_000f;
 
         // Tank Mode
-        private const float TankHandMass = 80f;     // масса физ-рук → мега-сила подъёма/броска
         private const float TankReapplyInterval = 0.5f;
         private static bool _tankApplied;
         private static float _tankTimer;
-        private static float _origHandMassL = -1f, _origHandMassR = -1f;
 
         // Remote Kill
         private const float RkRange = 40f;          // дальность наведения
@@ -440,11 +438,9 @@ namespace MonsterPanel
 
         // ---------------- Tank Mode ----------------
         //
-        // Умно и без просадки под весом: массу тела НЕ трогаем (поэтому ходишь и прыгаешь как
-        // обычно). Вместо этого:
-        //  1) отключаем AvatarGrip на своём риге — другие физически не могут схватить/тащить тебя
-        //     (позицией своего тела владеет твой клиент, так что без захвата тебя не сдвинуть);
-        //  2) физ-рукам ставим огромную массу — ты хватаешь и жёстко поднимаешь/кидаешь игроков.
+        // Чисто анти-захват, без изменения массы: отключаем AvatarGrip на своём риге — другие
+        // физически не могут за тебя взяться и сдвинуть (позицией своего тела владеет твой клиент).
+        // Массу/руки НЕ трогаем вообще, поэтому рост, движение и удары — как обычно.
         private static void TankUpdate()
         {
             if (TankMode)
@@ -452,77 +448,29 @@ namespace MonsterPanel
                 _tankTimer -= Time.deltaTime;
                 if (!_tankApplied || _tankTimer <= 0f)
                 {
-                    TankApply();
-                    _tankTimer = TankReapplyInterval;   // переприменяем: гриды/руки могли пересоздаться
+                    TankSetGrips(false);
+                    _tankTimer = TankReapplyInterval;   // переприменяем: грипы могли пересоздаться
                     _tankApplied = true;
                 }
             }
             else if (_tankApplied)
             {
-                TankRestore();
+                TankSetGrips(true);
                 _tankApplied = false;
+                MelonLogger.Msg("Tank Mode: выключен, захваты восстановлены.");
             }
         }
 
-        private static void TankApply()
+        private static void TankSetGrips(bool enabled)
         {
             var rig = BoneLib.Player.RigManager;
             if (rig == null) return;
-
-            // 1) Анти-захват: свои body-грипы выключаем — другие не смогут за них взяться.
             try
             {
                 foreach (var g in rig.GetComponentsInChildren<AvatarGrip>())
-                    if (g != null && g.enabled) g.enabled = false;
+                    if (g != null && g.enabled != enabled) g.enabled = enabled;
             }
             catch (Exception e) { MelonLogger.Warning("Tank grips: " + e.Message); }
-
-            // 2) Мега-сила: тяжёлые физ-руки + полный хват.
-            BoostHand(BoneLib.Player.LeftHand, ref _origHandMassL);
-            BoostHand(BoneLib.Player.RightHand, ref _origHandMassR);
-        }
-
-        private static void BoostHand(Hand hand, ref float origMass)
-        {
-            if (hand == null) return;
-            try
-            {
-                var rb = hand.GetComponent<Rigidbody>();
-                if (rb != null)
-                {
-                    if (origMass < 0f) origMass = rb.mass;   // запомним оригинал один раз
-                    rb.mass = TankHandMass;
-                }
-                hand.SetGripStrength(1f);                     // не роняем тяжёлые цели
-            }
-            catch (Exception e) { MelonLogger.Warning("Tank hand: " + e.Message); }
-        }
-
-        private static void TankRestore()
-        {
-            var rig = BoneLib.Player.RigManager;
-            if (rig != null)
-            {
-                try
-                {
-                    foreach (var g in rig.GetComponentsInChildren<AvatarGrip>())
-                        if (g != null) g.enabled = true;     // возвращаем возможность хватать тебя
-                }
-                catch (Exception e) { MelonLogger.Warning("Tank restore grips: " + e.Message); }
-            }
-            RestoreHand(BoneLib.Player.LeftHand, ref _origHandMassL);
-            RestoreHand(BoneLib.Player.RightHand, ref _origHandMassR);
-            MelonLogger.Msg("Tank Mode: выключен, всё восстановлено.");
-        }
-
-        private static void RestoreHand(Hand hand, ref float origMass)
-        {
-            if (hand != null && origMass >= 0f)
-            {
-                try { var rb = hand.GetComponent<Rigidbody>(); if (rb != null) rb.mass = origMass; }
-                catch { }
-            }
-            origMass = -1f;
         }
 
         // ---------------- Свой ник: скрытие и цветные DEV-пресеты (LabFusion) ----------------
