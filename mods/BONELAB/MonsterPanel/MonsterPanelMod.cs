@@ -1,15 +1,16 @@
 using System;
-using System.Collections.Generic;
 using System.Reflection;
 using BoneLib.BoneMenu;
 using HarmonyLib;
+using Il2CppSLZ.Marrow;
 using Il2CppSLZ.Marrow.Combat;
+using Il2CppSLZ.Marrow.Data;
 using Il2CppSLZ.Marrow.PuppetMasta;
 using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.2.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.3.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -22,29 +23,17 @@ namespace MonsterPanel
         /// <summary>Монстер-урон: ваншот врагов/объектов/игроков + жёсткий отброс.</summary>
         public static bool MonsterDamage { get; private set; }
 
-        /// <summary>Танк: тебя не могут сдвинуть/поднять — риг игрока становится «тяжёлым».</summary>
-        public static bool TankMode { get; private set; }
+        /// <summary>Remote Kill: наводишь рукой на игрока (зелёный маркер) + grip → максимальный урон по сети.</summary>
+        public static bool RemoteKill { get; private set; }
 
-        // Сила отброса врага (VelocityChange, м/с — не зависит от массы тела).
         private const float LaunchSpeed = 28f;
-        // Урон, который проставляем в сетевую атаку по игроку.
         private const float MaxDamage = 1_000_000f;
-        // Во сколько раз утяжеляем риг в Tank Mode (экспериментально — можно крутить).
-        private const float TankMassMultiplier = 40f;
 
-        // Оригинальные массы тел рига (ключ — instanceID), чтобы вернуть при выключении.
-        private static readonly Dictionary<int, float> _origMass = new();
-        private static bool _tankApplied;
-
-        /// <summary>Телекинез: наводишь рукой + зажимаешь grip → поднимаешь тело/игрока как гравипушкой.</summary>
-        public static bool Telekinesis { get; private set; }
-
-        private const float TkRange = 25f;         // дальность захвата лучом
-        private const float TkHoldDistance = 4f;   // на каком расстоянии перед рукой держим цель
-        private const float TkResponsiveness = 10f;// как резко цель тянется к точке удержания
-        private const float TkGripThreshold = 0.6f;
-
-        private static Rigidbody _leftGrab, _rightGrab;
+        // Remote Kill
+        private const float RkRange = 40f;          // дальность наведения
+        private const float RkGripThreshold = 0.6f;
+        private static GameObject _leftMarker, _rightMarker;
+        private static bool _leftGripPrev, _rightGripPrev;
 
         private const string PlayerHealthType = "Il2CppSLZ.Marrow.Player_Health";
         private const string FusionReceiverPatch = "LabFusion.Patching.PlayerDamageReceiverPatches";
@@ -60,80 +49,110 @@ namespace MonsterPanel
 
         public override void OnUpdate()
         {
-            if (TankMode) EnforceTank();
-            else if (_tankApplied) RestoreTank();
-
-            if (Telekinesis) UpdateTelekinesis();
-            else { _leftGrab = null; _rightGrab = null; }
-        }
-
-        /// <summary>Телекинез обеими руками (на каждую — своя цель).</summary>
-        private static void UpdateTelekinesis()
-        {
-            HandTelekinesis(BoneLib.Player.LeftHand?.transform, BoneLib.Player.LeftController, ref _leftGrab);
-            HandTelekinesis(BoneLib.Player.RightHand?.transform, BoneLib.Player.RightController, ref _rightGrab);
-        }
-
-        private static void HandTelekinesis(Transform hand, Il2CppSLZ.Marrow.BaseController controller, ref Rigidbody grabbed)
-        {
-            if (hand == null || controller == null) { grabbed = null; return; }
-
-            bool grip = controller.GetGripForce() > TkGripThreshold;
-            if (!grip) { grabbed = null; return; }   // отпустил grip — бросили
-
-            // Захват цели лучом, если ещё не держим.
-            if (grabbed == null)
+            if (RemoteKill)
             {
-                if (Physics.Raycast(hand.position, hand.forward, out RaycastHit hit, TkRange,
-                        Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                AimHand(BoneLib.Player.LeftHand?.transform, BoneLib.Player.LeftController, ref _leftMarker, ref _leftGripPrev);
+                AimHand(BoneLib.Player.RightHand?.transform, BoneLib.Player.RightController, ref _rightMarker, ref _rightGripPrev);
+            }
+            else
+            {
+                HideMarker(_leftMarker); HideMarker(_rightMarker);
+                _leftGripPrev = _rightGripPrev = false;
+            }
+        }
+
+        // ---------------- Remote Kill ----------------
+
+        private static void AimHand(Transform hand, BaseController controller, ref GameObject marker, ref bool gripPrev)
+        {
+            if (hand == null || controller == null) { HideMarker(marker); gripPrev = false; return; }
+
+            PlayerDamageReceiver target = FindTargetPlayer(hand);
+
+            if (target == null)
+            {
+                HideMarker(marker);
+                gripPrev = controller.GetGripForce() > RkGripThreshold; // не «стреляем» при появлении цели во время зажатого grip
+                return;
+            }
+
+            // Маркер на цели (зелёный = можно убить).
+            if (marker == null) marker = CreateMarker();
+            marker.SetActive(true);
+            marker.transform.position = target.transform.position + Vector3.up * 0.2f;
+
+            bool grip = controller.GetGripForce() > RkGripThreshold;
+            if (grip && !gripPrev) KillPlayer(target, hand);   // срабатывание по нажатию, не по удержанию
+            gripPrev = grip;
+        }
+
+        /// <summary>Луч из руки → ближайший игрок (PlayerDamageReceiver), не считая себя.</summary>
+        private static PlayerDamageReceiver FindTargetPlayer(Transform hand)
+        {
+            Vector3 origin = hand.position + hand.forward * 0.3f;
+            var hits = Physics.RaycastAll(origin, hand.forward, RkRange,
+                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+            PlayerDamageReceiver best = null;
+            float bestDist = float.MaxValue;
+            foreach (var h in hits)
+            {
+                if (h.collider == null) continue;
+                var recv = h.collider.GetComponentInParent<PlayerDamageReceiver>();
+                if (recv == null) continue;
+                if (IsOwnRig(recv.transform)) continue;         // не наводимся на себя
+                if (h.distance < bestDist) { bestDist = h.distance; best = recv; }
+            }
+            return best;
+        }
+
+        /// <summary>Строим макс-атаку и отдаём в приёмник урона игрока — LabFusion доставит её цели по сети.</summary>
+        private static void KillPlayer(PlayerDamageReceiver target, Transform hand)
+        {
+            try
+            {
+                var attack = new Attack
                 {
-                    var rb = hit.collider != null ? hit.collider.attachedRigidbody : null;
-                    if (rb != null && !rb.isKinematic) grabbed = rb;
-                }
-                if (grabbed == null) return;
+                    damage = MaxDamage,
+                    attackType = AttackType.Blunt,
+                    direction = (target.transform.position - hand.position).normalized,
+                    origin = hand.position,
+                };
+                target.ReceiveAttack(attack);
+                MelonLogger.Msg("Remote Kill: урон отправлен игроку.");
             }
-
-            // Держим цель в точке перед рукой и двигаем скоростью (как гравипушка).
-            Vector3 target = hand.position + hand.forward * TkHoldDistance;
-            Vector3 toTarget = target - grabbed.position;
-            grabbed.velocity = toTarget * TkResponsiveness;
-            grabbed.angularVelocity = Vector3.zero;
+            catch (Exception e) { MelonLogger.Warning("Remote Kill: " + e.Message); }
         }
 
-        /// <summary>Утяжеляем все тела физического рига игрока — другие не могут сдвинуть/поднять.</summary>
-        private static void EnforceTank()
+        private static GameObject CreateMarker()
         {
-            var rig = BoneLib.Player.PhysicsRig;
-            if (rig == null) return;
-            foreach (var rb in rig.GetComponentsInChildren<Rigidbody>())
+            var go = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+            var col = go.GetComponent<Collider>();
+            if (col != null) UnityEngine.Object.Destroy(col);           // маркер не мешает лучу/физике
+            go.transform.localScale = Vector3.one * 0.18f;
+            var rend = go.GetComponent<Renderer>();
+            if (rend != null)
             {
-                if (rb == null) continue;
-                int id = rb.GetInstanceID();
-                if (!_origMass.ContainsKey(id)) _origMass[id] = rb.mass;
-                float target = _origMass[id] * TankMassMultiplier;
-                if (rb.mass != target) rb.mass = target;
+                rend.material.color = Color.green;
+                try { rend.material.SetColor("_EmissionColor", Color.green); rend.material.EnableKeyword("_EMISSION"); } catch { }
             }
-            _tankApplied = true;
+            UnityEngine.Object.DontDestroyOnLoad(go);
+            return go;
         }
 
-        /// <summary>Возвращаем оригинальные массы.</summary>
-        private static void RestoreTank()
+        private static void HideMarker(GameObject marker)
         {
-            var rig = BoneLib.Player.PhysicsRig;
-            if (rig != null)
-            {
-                foreach (var rb in rig.GetComponentsInChildren<Rigidbody>())
-                {
-                    if (rb == null) continue;
-                    if (_origMass.TryGetValue(rb.GetInstanceID(), out float m))
-                    {
-                        try { rb.mass = m; } catch { }
-                    }
-                }
-            }
-            _origMass.Clear();
-            _tankApplied = false;
+            if (marker != null && marker.activeSelf) marker.SetActive(false);
         }
+
+        /// <summary>Принадлежит ли трансформ собственному ригу игрока.</summary>
+        private static bool IsOwnRig(Transform t)
+        {
+            var rig = BoneLib.Player.RigManager;
+            if (rig == null || t == null) return false;
+            return t.IsChildOf(rig.transform);
+        }
+
+        // ---------------- Меню ----------------
 
         private void BuildMenu()
         {
@@ -141,18 +160,17 @@ namespace MonsterPanel
             page.CreateBool("Invincible", Color.green, Invincible, v => { Invincible = v; Log("Invincible", v); });
             page.CreateBool("Monster Damage", new Color(1f, 0.4f, 0f), MonsterDamage,
                 v => { MonsterDamage = v; Log("Monster Damage", v); });
-            page.CreateBool("Tank Mode", new Color(0.3f, 0.6f, 1f), TankMode,
-                v => { TankMode = v; Log("Tank Mode", v); });
-            page.CreateBool("Telekinesis", new Color(0.7f, 0.4f, 1f), Telekinesis,
-                v => { Telekinesis = v; Log("Telekinesis", v); });
+            page.CreateBool("Remote Kill", new Color(0.7f, 0.4f, 1f), RemoteKill,
+                v => { RemoteKill = v; Log("Remote Kill", v); });
         }
 
         private static void Log(string name, bool on) =>
             MelonLogger.Msg(on ? $"{name}: ВКЛ" : $"{name}: ВЫКЛ");
 
+        // ---------------- Патчи урона ----------------
+
         private void ApplyPatches()
         {
-            // --- Бессмертие игрока ---
             Type playerHealth = AccessTools.TypeByName(PlayerHealthType);
             if (playerHealth != null)
             {
@@ -162,18 +180,14 @@ namespace MonsterPanel
             }
             else MelonLogger.Error("MONSTER Panel: Player_Health не найден — бессмертие не активно");
 
-            // --- Враги-гуманоиды (PuppetMaster): ваншот + отброс ---
             TryPatchTyped(typeof(SubBehaviourHealth), "TakeDamage", Hm(nameof(PuppetPrefix)), "SubBehaviourHealth.TakeDamage");
-
-            // --- Объекты/ящики с Health: ваншот ---
             TryPatchTyped(typeof(MHealth), "TAKEDAMAGE", Hm(nameof(HealthPrefix)), "Health.TAKEDAMAGE");
 
-            // --- Игроки в Fusion: бустим сетевой урон (если Fusion установлен) ---
             Type fusion = AccessTools.TypeByName(FusionReceiverPatch);
             if (fusion != null)
                 TryPatch(fusion, "ReceiveAttack", Hm(nameof(FusionAttackPrefix)));
             else
-                MelonLogger.Msg("MONSTER Panel: LabFusion не найден — урон по игрокам в сети выключен (это нормально без Fusion).");
+                MelonLogger.Msg("MONSTER Panel: LabFusion не найден — урон по игрокам в сети выключен (нормально без Fusion).");
         }
 
         private static HarmonyMethod Hm(string name) =>
@@ -203,58 +217,40 @@ namespace MonsterPanel
             catch (Exception e) { MelonLogger.Warning($"MONSTER Panel: {label} — {e.Message}"); }
         }
 
-        /// <summary>Бессмертие: false = урон/смерть игрока не выполнится.</summary>
         private static bool GodPrefix() => !Invincible;
 
-        /// <summary>Враг-гуманоид: мгновенно убиваем и отбрасываем в направлении удара.</summary>
         private static void PuppetPrefix(SubBehaviourHealth __instance, Attack attack)
         {
             if (!MonsterDamage || _reentry || __instance == null) return;
-            try
-            {
-                _reentry = true;
-                __instance.Kill();          // распинывает куклу → ragdoll
-                Launch(attack);
-            }
-            catch (Exception e) { MelonLogger.Warning("MONSTER Panel: puppet kill — " + e.Message); }
+            try { _reentry = true; __instance.Kill(); Launch(attack); }
+            catch (Exception e) { MelonLogger.Warning("MONSTER Panel: puppet — " + e.Message); }
             finally { _reentry = false; }
         }
 
-        /// <summary>Объект с Health: уничтожаем.</summary>
         private static void HealthPrefix(MHealth __instance)
         {
             if (!MonsterDamage || _reentry || __instance == null) return;
             try { _reentry = true; __instance.Death(); }
-            catch (Exception e) { MelonLogger.Warning("MONSTER Panel: health death — " + e.Message); }
+            catch (Exception e) { MelonLogger.Warning("MONSTER Panel: health — " + e.Message); }
             finally { _reentry = false; }
         }
 
-        /// <summary>Fusion: подменяем урон сетевой атаки по игроку на максимум (attack по ссылке).</summary>
         private static void FusionAttackPrefix(ref Attack attack)
         {
-            if (MonsterDamage)
-                attack.damage = MaxDamage;
+            if (MonsterDamage) attack.damage = MaxDamage;
         }
 
-        /// <summary>Жёсткий отброс: раскидываем весь риг задетого тела в направлении удара.</summary>
         private static void Launch(Attack attack)
         {
             var col = attack.collider;
             if (col == null) return;
-
             Vector3 dir = attack.direction;
             if (dir.sqrMagnitude < 0.0001f) dir = Vector3.up;
             Vector3 v = dir.normalized * LaunchSpeed;
-
             var root = col.transform.root;
             if (root == null) return;
             foreach (var rb in root.GetComponentsInChildren<Rigidbody>())
-            {
-                if (rb != null)
-                {
-                    try { rb.velocity = v; } catch { }
-                }
-            }
+                if (rb != null) { try { rb.velocity = v; } catch { } }
         }
     }
 }
