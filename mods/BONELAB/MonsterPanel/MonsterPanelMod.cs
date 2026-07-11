@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.8.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.9.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -27,11 +27,21 @@ namespace MonsterPanel
         /// <summary>Remote Kill: наводишь рукой на игрока (зелёный маркер) + grip/триггер → максимальный урон по сети.</summary>
         public static bool RemoteKill { get; private set; }
 
-        /// <summary>Бесконечные патроны: у всех стволов магазин не пустеет + запас в инвентаре бесконечный.</summary>
+        /// <summary>Бесконечные патроны: запас в инвентаре бесконечный (магазин расходуется штатно).</summary>
         public static bool InfiniteAmmo { get; private set; }
+
+        /// <summary>Tank: тебя нельзя схватить/поднять, а ты хватаешь с мега-силой (жёстко кидаешь игроков).</summary>
+        public static bool TankMode { get; private set; }
 
         private const float LaunchSpeed = 28f;
         private const float MaxDamage = 1_000_000f;
+
+        // Tank Mode
+        private const float TankHandMass = 80f;     // масса физ-рук → мега-сила подъёма/броска
+        private const float TankReapplyInterval = 0.5f;
+        private static bool _tankApplied;
+        private static float _tankTimer;
+        private static float _origHandMassL = -1f, _origHandMassR = -1f;
 
         // Remote Kill
         private const float RkRange = 40f;          // дальность наведения
@@ -79,6 +89,8 @@ namespace MonsterPanel
                 _left.FirePrev = _right.FirePrev = false;
                 _left.LastTarget = _right.LastTarget = null;
             }
+
+            TankUpdate();
         }
 
         // ---------------- Remote Kill ----------------
@@ -295,6 +307,8 @@ namespace MonsterPanel
                 v => { RemoteKill = v; Log("Remote Kill", v); });
             page.CreateBool("Infinite Ammo", new Color(1f, 0.85f, 0.1f), InfiniteAmmo,
                 v => { InfiniteAmmo = v; Log("Infinite Ammo", v); });
+            page.CreateBool("Tank Mode", new Color(0.4f, 0.6f, 0.9f), TankMode,
+                v => { TankMode = v; Log("Tank Mode", v); });
 
             // Teleport + ник: только когда загружен LabFusion.
             if (Teleporter.FusionLoaded)
@@ -391,12 +405,11 @@ namespace MonsterPanel
             finally { _reentry = false; }
         }
 
-        private static void HealthPrefix(MHealth __instance)
+        private static void HealthPrefix(MHealth __instance, ref float damage)
         {
-            if (!MonsterDamage || _reentry || __instance == null) return;
-            try { _reentry = true; __instance.Death(); }
-            catch (Exception e) { MelonLogger.Warning("MONSTER Panel: health — " + e.Message); }
-            finally { _reentry = false; }
+            if (!MonsterDamage || __instance == null) return;
+            // Объектам — сразу максимальный урон (проходит их штатным путём с эффектами разрушения).
+            damage = MaxDamage;
         }
 
         private static void FusionAttackPrefix(ref Attack attack)
@@ -423,6 +436,93 @@ namespace MonsterPanel
             if (root == null) return;
             foreach (var rb in root.GetComponentsInChildren<Rigidbody>())
                 if (rb != null) { try { rb.velocity = v; } catch { } }
+        }
+
+        // ---------------- Tank Mode ----------------
+        //
+        // Умно и без просадки под весом: массу тела НЕ трогаем (поэтому ходишь и прыгаешь как
+        // обычно). Вместо этого:
+        //  1) отключаем AvatarGrip на своём риге — другие физически не могут схватить/тащить тебя
+        //     (позицией своего тела владеет твой клиент, так что без захвата тебя не сдвинуть);
+        //  2) физ-рукам ставим огромную массу — ты хватаешь и жёстко поднимаешь/кидаешь игроков.
+        private static void TankUpdate()
+        {
+            if (TankMode)
+            {
+                _tankTimer -= Time.deltaTime;
+                if (!_tankApplied || _tankTimer <= 0f)
+                {
+                    TankApply();
+                    _tankTimer = TankReapplyInterval;   // переприменяем: гриды/руки могли пересоздаться
+                    _tankApplied = true;
+                }
+            }
+            else if (_tankApplied)
+            {
+                TankRestore();
+                _tankApplied = false;
+            }
+        }
+
+        private static void TankApply()
+        {
+            var rig = BoneLib.Player.RigManager;
+            if (rig == null) return;
+
+            // 1) Анти-захват: свои body-грипы выключаем — другие не смогут за них взяться.
+            try
+            {
+                foreach (var g in rig.GetComponentsInChildren<AvatarGrip>())
+                    if (g != null && g.enabled) g.enabled = false;
+            }
+            catch (Exception e) { MelonLogger.Warning("Tank grips: " + e.Message); }
+
+            // 2) Мега-сила: тяжёлые физ-руки + полный хват.
+            BoostHand(BoneLib.Player.LeftHand, ref _origHandMassL);
+            BoostHand(BoneLib.Player.RightHand, ref _origHandMassR);
+        }
+
+        private static void BoostHand(Hand hand, ref float origMass)
+        {
+            if (hand == null) return;
+            try
+            {
+                var rb = hand.GetComponent<Rigidbody>();
+                if (rb != null)
+                {
+                    if (origMass < 0f) origMass = rb.mass;   // запомним оригинал один раз
+                    rb.mass = TankHandMass;
+                }
+                hand.SetGripStrength(1f);                     // не роняем тяжёлые цели
+            }
+            catch (Exception e) { MelonLogger.Warning("Tank hand: " + e.Message); }
+        }
+
+        private static void TankRestore()
+        {
+            var rig = BoneLib.Player.RigManager;
+            if (rig != null)
+            {
+                try
+                {
+                    foreach (var g in rig.GetComponentsInChildren<AvatarGrip>())
+                        if (g != null) g.enabled = true;     // возвращаем возможность хватать тебя
+                }
+                catch (Exception e) { MelonLogger.Warning("Tank restore grips: " + e.Message); }
+            }
+            RestoreHand(BoneLib.Player.LeftHand, ref _origHandMassL);
+            RestoreHand(BoneLib.Player.RightHand, ref _origHandMassR);
+            MelonLogger.Msg("Tank Mode: выключен, всё восстановлено.");
+        }
+
+        private static void RestoreHand(Hand hand, ref float origMass)
+        {
+            if (hand != null && origMass >= 0f)
+            {
+                try { var rb = hand.GetComponent<Rigidbody>(); if (rb != null) rb.mass = origMass; }
+                catch { }
+            }
+            origMass = -1f;
         }
 
         // ---------------- Свой ник: скрытие и цветные DEV-пресеты (LabFusion) ----------------
@@ -456,7 +556,10 @@ namespace MonsterPanel
                     if (value.Length > 32)   // страховка под лимит имени LabFusion
                         value = value.Substring(0, 32);
                     md.Nickname.SetValue(value);
-                    MelonLogger.Msg($"Nickname: установлен «{value}».");
+                    // Читаем обратно — подтверждение, что применилось (свой ник над собой ты НЕ видишь,
+                    // его видят только другие игроки; проверять — по второму игроку).
+                    string readback = md.Nickname.GetValueOrEmpty();
+                    MelonLogger.Msg($"Nickname: задал «{value}», в метаданных сейчас «{readback}». Своего тега ты не видишь — смотри со стороны второго игрока.");
                 }
                 catch (Exception e) { MelonLogger.Warning("Nickname set: " + e.Message); }
             }
@@ -593,17 +696,25 @@ namespace MonsterPanel
                 catch (Exception e) { MelonLogger.Warning("Teleport bring: " + e.Message); }
             }
 
-            /// <summary>Позиция ног рига на полу (луч вниз от физ-рига), с запасным вариантом.</summary>
+            /// <summary>Позиция ног рига на полу. Луч вниз ИГНОРИРУЕТ тела игроков — иначе телепорт
+            /// «косо»: попадали на колено/бедро цели и оказывались в воздухе/внутри неё.</summary>
             private static Vector3 Grounded(RigManager rig)
             {
                 Vector3 p;
                 try { p = rig.physicsRig != null ? rig.physicsRig.transform.position : rig.transform.position; }
                 catch { p = rig.transform.position; }
 
-                if (Physics.Raycast(p + Vector3.up * 0.3f, Vector3.down, out RaycastHit hit, 5f,
-                        Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
-                    return hit.point;
-                return p;
+                var hits = Physics.RaycastAll(p + Vector3.up * 0.4f, Vector3.down, 6f,
+                    Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+                float floorY = float.NegativeInfinity; bool found = false;
+                foreach (var h in hits)
+                {
+                    if (h.collider == null) continue;
+                    if (h.collider.GetComponentInParent<RigManager>() != null) continue; // пропускаем любые тела игроков
+                    if (h.point.y > floorY) { floorY = h.point.y; found = true; }        // ближайший пол под ногами
+                }
+                if (found) return new Vector3(p.x, floorY, p.z);
+                return new Vector3(p.x, p.y - 0.9f, p.z);   // запас: примерно на уровень ног
             }
         }
     }
