@@ -9,7 +9,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.1.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.2.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -36,6 +36,16 @@ namespace MonsterPanel
         private static readonly Dictionary<int, float> _origMass = new();
         private static bool _tankApplied;
 
+        /// <summary>Телекинез: наводишь рукой + зажимаешь grip → поднимаешь тело/игрока как гравипушкой.</summary>
+        public static bool Telekinesis { get; private set; }
+
+        private const float TkRange = 25f;         // дальность захвата лучом
+        private const float TkHoldDistance = 4f;   // на каком расстоянии перед рукой держим цель
+        private const float TkResponsiveness = 10f;// как резко цель тянется к точке удержания
+        private const float TkGripThreshold = 0.6f;
+
+        private static Rigidbody _leftGrab, _rightGrab;
+
         private const string PlayerHealthType = "Il2CppSLZ.Marrow.Player_Health";
         private const string FusionReceiverPatch = "LabFusion.Patching.PlayerDamageReceiverPatches";
 
@@ -52,6 +62,42 @@ namespace MonsterPanel
         {
             if (TankMode) EnforceTank();
             else if (_tankApplied) RestoreTank();
+
+            if (Telekinesis) UpdateTelekinesis();
+            else { _leftGrab = null; _rightGrab = null; }
+        }
+
+        /// <summary>Телекинез обеими руками (на каждую — своя цель).</summary>
+        private static void UpdateTelekinesis()
+        {
+            HandTelekinesis(BoneLib.Player.LeftHand?.transform, BoneLib.Player.LeftController, ref _leftGrab);
+            HandTelekinesis(BoneLib.Player.RightHand?.transform, BoneLib.Player.RightController, ref _rightGrab);
+        }
+
+        private static void HandTelekinesis(Transform hand, Il2CppSLZ.Marrow.BaseController controller, ref Rigidbody grabbed)
+        {
+            if (hand == null || controller == null) { grabbed = null; return; }
+
+            bool grip = controller.GetGripForce() > TkGripThreshold;
+            if (!grip) { grabbed = null; return; }   // отпустил grip — бросили
+
+            // Захват цели лучом, если ещё не держим.
+            if (grabbed == null)
+            {
+                if (Physics.Raycast(hand.position, hand.forward, out RaycastHit hit, TkRange,
+                        Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                {
+                    var rb = hit.collider != null ? hit.collider.attachedRigidbody : null;
+                    if (rb != null && !rb.isKinematic) grabbed = rb;
+                }
+                if (grabbed == null) return;
+            }
+
+            // Держим цель в точке перед рукой и двигаем скоростью (как гравипушка).
+            Vector3 target = hand.position + hand.forward * TkHoldDistance;
+            Vector3 toTarget = target - grabbed.position;
+            grabbed.velocity = toTarget * TkResponsiveness;
+            grabbed.angularVelocity = Vector3.zero;
         }
 
         /// <summary>Утяжеляем все тела физического рига игрока — другие не могут сдвинуть/поднять.</summary>
@@ -97,6 +143,8 @@ namespace MonsterPanel
                 v => { MonsterDamage = v; Log("Monster Damage", v); });
             page.CreateBool("Tank Mode", new Color(0.3f, 0.6f, 1f), TankMode,
                 v => { TankMode = v; Log("Tank Mode", v); });
+            page.CreateBool("Telekinesis", new Color(0.7f, 0.4f, 1f), Telekinesis,
+                v => { Telekinesis = v; Log("Telekinesis", v); });
         }
 
         private static void Log(string name, bool on) =>
