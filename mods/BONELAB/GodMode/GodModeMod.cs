@@ -6,7 +6,7 @@ using MelonLoader;
 using UnityEngine;
 
 [assembly: MelonInfo(typeof(GodMode.GodModeMod), "God Mode", "1.0.0", "you")]
-[assembly: MelonGame("StressLevelZero", "BONELAB")]
+[assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace GodMode
 {
