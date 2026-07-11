@@ -5,7 +5,7 @@ using HarmonyLib;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "1.1.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "1.2.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -15,14 +15,19 @@ namespace MonsterPanel
         /// <summary>Бессмертие игрока (читается god-префиксами Player_Health).</summary>
         public static bool Invincible { get; private set; }
 
-        /// <summary>Монстер-урон: любой наносимый урон = максимум (читается Health.TAKEDAMAGE-префиксом).</summary>
+        /// <summary>Монстер-урон: любой удар/выстрел мгновенно убивает врага.</summary>
         public static bool MonsterDamage { get; private set; }
-
-        // Урон, который ставим при включённом монстер-режиме. Большой, но без overflow/NaN.
-        private const float MaxDamage = 1_000_000f;
 
         private const string PlayerHealthType = "Il2CppSLZ.Marrow.Player_Health";
         private const string HealthType = "Il2CppSLZ.Marrow.Health";
+        private const string PuppetHealthType = "Il2CppSLZ.Marrow.PuppetMasta.SubBehaviourHealth";
+
+        // Кэш методов «смерти» врага (вызываем рефлексией — надёжнее модификации урона).
+        private static MethodInfo _puppetKill;   // SubBehaviourHealth.Kill()
+        private static MethodInfo _healthDeath;  // Health.Death()
+
+        // Защита от рекурсии, если Kill()/Death() внутри снова дёрнут урон.
+        [ThreadStatic] private static bool _inKill;
 
         public override void OnInitializeMelon()
         {
@@ -33,8 +38,7 @@ namespace MonsterPanel
 
         private void BuildMenu()
         {
-            // Page.Root создаётся самим BoneLib до загрузки модов. Латиница — в шрифте
-            // BoneMenu (arlon) нет кириллицы, русские буквы превратились бы в кракозябры.
+            // Латиница: в шрифте BoneMenu (arlon) нет кириллицы.
             Page page = Page.Root.CreatePage("MONSTER Panel", Color.red);
             page.CreateBool("Invincible", Color.green, Invincible, v => { Invincible = v; Log("Invincible", v); });
             page.CreateBool("Monster Damage", new Color(1f, 0.4f, 0f), MonsterDamage,
@@ -52,20 +56,33 @@ namespace MonsterPanel
                 MelonLogger.Error($"MONSTER Panel: тип {PlayerHealthType} не найден — бессмертие не активно");
             else
             {
-                var godPrefix = Method(nameof(GodPrefix));
+                var godPrefix = Hm(nameof(GodPrefix));
                 foreach (string m in new[] { "TAKEDAMAGE", "ApplyKillDamage", "Death" })
                     TryPatch(playerHealth, m, godPrefix);
             }
 
-            // --- Монстер-урон: любой урон по врагам (удары + стрельба) = максимум ---
-            Type health = AccessTools.TypeByName(HealthType);
-            if (health == null)
-                MelonLogger.Error($"MONSTER Panel: тип {HealthType} не найден — монстер-урон не активен");
+            // --- Монстер-урон по гуманоидам (враги-болванчики = PuppetMaster) ---
+            Type puppet = AccessTools.TypeByName(PuppetHealthType);
+            if (puppet == null)
+                MelonLogger.Error($"MONSTER Panel: тип {PuppetHealthType} не найден — монстер-урон по врагам не активен");
             else
-                TryPatch(health, "TAKEDAMAGE", Method(nameof(MonsterDamagePrefix)));
+            {
+                _puppetKill = AccessTools.Method(puppet, "Kill");
+                if (_puppetKill == null)
+                    MelonLogger.Warning("MONSTER Panel: SubBehaviourHealth.Kill не найден");
+                TryPatch(puppet, "TakeDamage", Hm(nameof(PuppetDamagePrefix)));
+            }
+
+            // --- Монстер-урон по прочему (ящики/объекты с Health) ---
+            Type health = AccessTools.TypeByName(HealthType);
+            if (health != null)
+            {
+                _healthDeath = AccessTools.Method(health, "Death");
+                TryPatch(health, "TAKEDAMAGE", Hm(nameof(HealthDamagePrefix)));
+            }
         }
 
-        private static HarmonyMethod Method(string name) =>
+        private static HarmonyMethod Hm(string name) =>
             new HarmonyMethod(typeof(MonsterPanelMod).GetMethod(name,
                 BindingFlags.Static | BindingFlags.NonPublic));
 
@@ -91,11 +108,35 @@ namespace MonsterPanel
         /// <summary>Бессмертие: false = оригинал (урон/смерть игрока) не выполнится.</summary>
         private static bool GodPrefix() => !Invincible;
 
-        /// <summary>Монстер-урон: подменяем наносимый врагу урон на максимум.</summary>
-        private static void MonsterDamagePrefix(ref float damage)
+        /// <summary>Монстер-урон по гуманоиду: мгновенно убиваем врага, оригинал (физика удара) при этом отрабатывает — враг отлетает.</summary>
+        private static void PuppetDamagePrefix(object __instance)
         {
-            if (MonsterDamage)
-                damage = MaxDamage;
+            if (!MonsterDamage || _inKill || _puppetKill == null || __instance == null) return;
+            InvokeDeath(_puppetKill, __instance);
+        }
+
+        /// <summary>Монстер-урон по объекту с Health: убиваем через Death().</summary>
+        private static void HealthDamagePrefix(object __instance)
+        {
+            if (!MonsterDamage || _inKill || _healthDeath == null || __instance == null) return;
+            InvokeDeath(_healthDeath, __instance);
+        }
+
+        private static void InvokeDeath(MethodInfo method, object instance)
+        {
+            try
+            {
+                _inKill = true;
+                method.Invoke(instance, null);
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning($"MONSTER Panel: {method.Name} упал — {e.Message}");
+            }
+            finally
+            {
+                _inKill = false;
+            }
         }
     }
 }
