@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using BoneLib.BoneMenu;
 using HarmonyLib;
@@ -8,7 +9,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.0.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.1.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -21,10 +22,19 @@ namespace MonsterPanel
         /// <summary>Монстер-урон: ваншот врагов/объектов/игроков + жёсткий отброс.</summary>
         public static bool MonsterDamage { get; private set; }
 
+        /// <summary>Танк: тебя не могут сдвинуть/поднять — риг игрока становится «тяжёлым».</summary>
+        public static bool TankMode { get; private set; }
+
         // Сила отброса врага (VelocityChange, м/с — не зависит от массы тела).
         private const float LaunchSpeed = 28f;
         // Урон, который проставляем в сетевую атаку по игроку.
         private const float MaxDamage = 1_000_000f;
+        // Во сколько раз утяжеляем риг в Tank Mode (экспериментально — можно крутить).
+        private const float TankMassMultiplier = 40f;
+
+        // Оригинальные массы тел рига (ключ — instanceID), чтобы вернуть при выключении.
+        private static readonly Dictionary<int, float> _origMass = new();
+        private static bool _tankApplied;
 
         private const string PlayerHealthType = "Il2CppSLZ.Marrow.Player_Health";
         private const string FusionReceiverPatch = "LabFusion.Patching.PlayerDamageReceiverPatches";
@@ -38,12 +48,55 @@ namespace MonsterPanel
             MelonLogger.Msg("MONSTER Panel загружен.");
         }
 
+        public override void OnUpdate()
+        {
+            if (TankMode) EnforceTank();
+            else if (_tankApplied) RestoreTank();
+        }
+
+        /// <summary>Утяжеляем все тела физического рига игрока — другие не могут сдвинуть/поднять.</summary>
+        private static void EnforceTank()
+        {
+            var rig = BoneLib.Player.PhysicsRig;
+            if (rig == null) return;
+            foreach (var rb in rig.GetComponentsInChildren<Rigidbody>())
+            {
+                if (rb == null) continue;
+                int id = rb.GetInstanceID();
+                if (!_origMass.ContainsKey(id)) _origMass[id] = rb.mass;
+                float target = _origMass[id] * TankMassMultiplier;
+                if (rb.mass != target) rb.mass = target;
+            }
+            _tankApplied = true;
+        }
+
+        /// <summary>Возвращаем оригинальные массы.</summary>
+        private static void RestoreTank()
+        {
+            var rig = BoneLib.Player.PhysicsRig;
+            if (rig != null)
+            {
+                foreach (var rb in rig.GetComponentsInChildren<Rigidbody>())
+                {
+                    if (rb == null) continue;
+                    if (_origMass.TryGetValue(rb.GetInstanceID(), out float m))
+                    {
+                        try { rb.mass = m; } catch { }
+                    }
+                }
+            }
+            _origMass.Clear();
+            _tankApplied = false;
+        }
+
         private void BuildMenu()
         {
             Page page = Page.Root.CreatePage("MONSTER Panel", Color.red);
             page.CreateBool("Invincible", Color.green, Invincible, v => { Invincible = v; Log("Invincible", v); });
             page.CreateBool("Monster Damage", new Color(1f, 0.4f, 0f), MonsterDamage,
                 v => { MonsterDamage = v; Log("Monster Damage", v); });
+            page.CreateBool("Tank Mode", new Color(0.3f, 0.6f, 1f), TankMode,
+                v => { TankMode = v; Log("Tank Mode", v); });
         }
 
         private static void Log(string name, bool on) =>
