@@ -20,6 +20,7 @@
     <Reference Include="UnityEngine.CoreModule"><HintPath>refs/UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.PhysicsModule"><HintPath>refs/UnityEngine.PhysicsModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Il2CppSLZ.Marrow"><HintPath>refs/Il2CppSLZ.Marrow.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="LabFusion"><HintPath>refs/LabFusion.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
 
 </Project>

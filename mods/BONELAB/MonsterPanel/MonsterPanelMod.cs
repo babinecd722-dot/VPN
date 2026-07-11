@@ -6,11 +6,12 @@ using Il2CppSLZ.Marrow;
 using Il2CppSLZ.Marrow.Combat;
 using Il2CppSLZ.Marrow.Data;
 using Il2CppSLZ.Marrow.PuppetMasta;
+using LabFusion.Entities;
 using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.5.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.6.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -269,6 +270,15 @@ namespace MonsterPanel
                 v => { MonsterDamage = v; Log("Monster Damage", v); });
             page.CreateBool("Remote Kill", new Color(0.7f, 0.4f, 1f), RemoteKill,
                 v => { RemoteKill = v; Log("Remote Kill", v); });
+
+            // Teleport: только когда загружен LabFusion (в одиночке телепортироваться не к кому).
+            if (Teleporter.FusionLoaded)
+            {
+                Teleporter.Install(page);
+                MelonLogger.Msg("MONSTER Panel: раздел Teleport добавлен (LabFusion найден).");
+            }
+            else
+                MelonLogger.Msg("MONSTER Panel: LabFusion не загружен — раздел Teleport скрыт.");
         }
 
         private static void Log(string name, bool on) =>
@@ -360,6 +370,132 @@ namespace MonsterPanel
             if (root == null) return;
             foreach (var rb in root.GetComponentsInChildren<Rigidbody>())
                 if (rb != null) { try { rb.velocity = v; } catch { } }
+        }
+
+        // ---------------- Teleport (LabFusion) ----------------
+        //
+        // Весь код, трогающий типы LabFusion, изолирован здесь: методы JIT-ятся только
+        // когда класс реально вызван (а вызываем его лишь при загруженном LabFusion),
+        // поэтому без Fusion мод не падает с TypeLoadException.
+        private static class Teleporter
+        {
+            private static Page _page;
+            private static bool _hooked;
+
+            /// <summary>LabFusion загружен? (тип резолвится только если сборка в игре есть.)</summary>
+            public static bool FusionLoaded => AccessTools.TypeByName("LabFusion.Entities.NetworkPlayer") != null;
+
+            /// <summary>Создаёт подстраницу Teleport в корне панели и вешает авто-обновление списка.</summary>
+            public static void Install(Page root)
+            {
+                _page = root.CreatePage("Teleport", new Color(0.3f, 0.7f, 1f), 16, true);
+                if (!_hooked)
+                {
+                    Menu.OnPageOpened += (Action<Page>)OnPageOpened;   // при каждом открытии — свежий список
+                    _hooked = true;
+                }
+                Rebuild();
+            }
+
+            private static void OnPageOpened(Page opened)
+            {
+                if (opened == _page) Rebuild();
+            }
+
+            /// <summary>Пересобираем список: под каждого игрока — подстраница с выбором направления телепорта.</summary>
+            private static void Rebuild()
+            {
+                if (_page == null) return;
+                try
+                {
+                    _page.RemoveAll();
+                    _page.CreateFunction("Refresh", new Color(0.7f, 0.7f, 0.7f), (Action)Rebuild);
+
+                    int count = 0;
+                    foreach (var np in NetworkPlayer.Players)
+                    {
+                        if (np == null || np.PlayerID == null || np.PlayerID.IsMe) continue;
+                        if (!np.HasRig) continue;
+
+                        byte sid = np.PlayerID.SmallID;
+                        string name = string.IsNullOrEmpty(np.Username) ? ("Player " + sid) : np.Username;
+
+                        Page sub = _page.CreatePage(name, new Color(0.6f, 0.85f, 1f), 16, true);
+                        sub.CreateFunction("Teleport to player", new Color(0.3f, 1f, 0.5f), (Action)(() => TeleportSelfTo(sid)));
+                        sub.CreateFunction("Bring player to me", new Color(1f, 0.6f, 0.2f), (Action)(() => BringToMe(sid)));
+                        count++;
+                    }
+
+                    if (count == 0)
+                        _page.CreateFunction("No other players", new Color(0.6f, 0.6f, 0.6f), (Action)(() => { }));
+                }
+                catch (Exception e) { MelonLogger.Warning("Teleport rebuild: " + e.Message); }
+            }
+
+            private static NetworkPlayer Find(byte sid)
+            {
+                foreach (var np in NetworkPlayer.Players)
+                    if (np != null && np.PlayerID != null && np.PlayerID.SmallID == sid)
+                        return np;
+                return null;
+            }
+
+            /// <summary>Телепортируемся к выбранному игроку (свой риг — синхронизируется по сети штатно).</summary>
+            private static void TeleportSelfTo(byte sid)
+            {
+                try
+                {
+                    var np = Find(sid);
+                    if (np == null || !np.HasRig) { MelonLogger.Msg("Teleport: игрок недоступен (вышел?)."); return; }
+                    RigManager target = np.RigRefs.RigManager;
+                    RigManager me = BoneLib.Player.RigManager;
+                    if (target == null || me == null) return;
+
+                    Vector3 dest = Grounded(target);
+                    // Небольшой отступ, чтобы не оказаться внутри игрока.
+                    Vector3 myPos = Grounded(me);
+                    Vector3 off = myPos - dest; off.y = 0f;
+                    off = off.sqrMagnitude > 0.01f ? off.normalized : -target.transform.forward;
+                    me.Teleport(dest + off * 0.8f, true);
+                    MelonLogger.Msg($"Teleport: перенёсся к {np.Username} (sid {sid}).");
+                }
+                catch (Exception e) { MelonLogger.Warning("Teleport self: " + e.Message); }
+            }
+
+            /// <summary>Притягиваем игрока к себе. Best-effort: его позицией владеет его клиент, может не «прилипнуть».</summary>
+            private static void BringToMe(byte sid)
+            {
+                try
+                {
+                    var np = Find(sid);
+                    if (np == null || !np.HasRig) { MelonLogger.Msg("Teleport: игрок недоступен (вышел?)."); return; }
+                    RigManager target = np.RigRefs.RigManager;
+                    RigManager me = BoneLib.Player.RigManager;
+                    if (target == null || me == null) return;
+
+                    Vector3 dest = Grounded(me);
+                    var head = BoneLib.Player.Head;
+                    Vector3 fwd = head != null ? head.forward : me.transform.forward;
+                    fwd.y = 0f;
+                    if (fwd.sqrMagnitude < 0.0001f) fwd = Vector3.forward;
+                    target.Teleport(dest + fwd.normalized * 1.2f, true);
+                    MelonLogger.Msg($"Teleport: притянул {np.Username} (sid {sid}) — если не прилип, это сетевое владение позицией.");
+                }
+                catch (Exception e) { MelonLogger.Warning("Teleport bring: " + e.Message); }
+            }
+
+            /// <summary>Позиция ног рига на полу (луч вниз от физ-рига), с запасным вариантом.</summary>
+            private static Vector3 Grounded(RigManager rig)
+            {
+                Vector3 p;
+                try { p = rig.physicsRig != null ? rig.physicsRig.transform.position : rig.transform.position; }
+                catch { p = rig.transform.position; }
+
+                if (Physics.Raycast(p + Vector3.up * 0.3f, Vector3.down, out RaycastHit hit, 5f,
+                        Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                    return hit.point;
+                return p;
+            }
         }
     }
 }
