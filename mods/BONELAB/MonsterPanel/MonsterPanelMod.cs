@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.10.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.11.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -36,6 +36,9 @@ namespace MonsterPanel
         /// <summary>Super Throw: всё, что отпускаешь из руки, улетает с огромной силой (йит игроков/врагов/объектов).</summary>
         public static bool SuperThrow { get; private set; }
 
+        /// <summary>Disarm: наводишь руку на игрока + grip/триггер → его оружие вырывает силой из рук.</summary>
+        public static bool Disarm { get; private set; }
+
         private const float LaunchSpeed = 28f;
         private const float MaxDamage = 1_000_000f;
 
@@ -50,6 +53,11 @@ namespace MonsterPanel
         private static readonly YeetState _rightYeet = new YeetState();
 
         private class YeetState { public bool WasHolding; public GameObject Held; }
+
+        // Disarm
+        private const float DisarmRadius = 1.3f;   // радиус вокруг цели, откуда вырываем предметы
+        private const float DisarmSpeed = 22f;     // сила вырывания
+        private static bool _leftDisarmPrev, _rightDisarmPrev;
 
         // Remote Kill
         private const float RkRange = 40f;          // дальность наведения
@@ -104,6 +112,12 @@ namespace MonsterPanel
             {
                 YeetHand(BoneLib.Player.LeftHand, _leftYeet);
                 YeetHand(BoneLib.Player.RightHand, _rightYeet);
+            }
+
+            if (Disarm)
+            {
+                DisarmHand(BoneLib.Player.LeftHand?.transform, BoneLib.Player.LeftController, ref _leftDisarmPrev);
+                DisarmHand(BoneLib.Player.RightHand?.transform, BoneLib.Player.RightController, ref _rightDisarmPrev);
             }
         }
 
@@ -325,6 +339,8 @@ namespace MonsterPanel
                 v => { TankMode = v; Log("Tank Mode", v); });
             page.CreateBool("Super Throw", new Color(0.9f, 0.5f, 0.1f), SuperThrow,
                 v => { SuperThrow = v; Log("Super Throw", v); });
+            page.CreateBool("Disarm", new Color(0.9f, 0.2f, 0.5f), Disarm,
+                v => { Disarm = v; Log("Disarm", v); });
 
             // Teleport + ник: только когда загружен LabFusion.
             if (Teleporter.FusionLoaded)
@@ -534,6 +550,53 @@ namespace MonsterPanel
             foreach (var rb in root.GetComponentsInChildren<Rigidbody>())
                 if (rb != null) { try { rb.velocity = v; n++; } catch { } }
             MelonLogger.Msg($"Super Throw: йитнул {root.name} ({n} тел) со скоростью {YeetSpeed} м/с.");
+        }
+
+        // ---------------- Disarm ----------------
+        //
+        // Наводишь руку на игрока + grip/триггер → вырываем силой все предметы (стволы) рядом
+        // с ним. Это физика, а не урон — чужое бессмертие не мешает. Тела самих игроков (риги)
+        // не трогаем, только отдельные предметы.
+        private static void DisarmHand(Transform hand, BaseController controller, ref bool prev)
+        {
+            if (hand == null || controller == null) { prev = false; return; }
+            float gripF = SafeAxis(() => controller.GetGripForce());
+            float trigF = SafeAxis(() => controller.GetIndexCurlAxis());
+            bool fire = gripF > RkGripThreshold || trigF > RkTriggerThreshold;
+
+            if (fire && !prev)
+            {
+                var target = FindTargetPlayer(hand, out _);
+                if (target != null) YankItemsFrom(target);
+                else MelonLogger.Msg("Disarm: нажал, но крестика/цели нет — наведи руку на игрока.");
+            }
+            prev = fire;
+        }
+
+        private static void YankItemsFrom(PlayerDamageReceiver target)
+        {
+            try
+            {
+                Vector3 center = target.transform.position;
+                var cols = Physics.OverlapSphere(center, DisarmRadius,
+                    Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+                var done = new System.Collections.Generic.HashSet<int>();
+                int n = 0;
+                foreach (var col in cols)
+                {
+                    if (col == null) continue;
+                    var rb = col.attachedRigidbody;
+                    if (rb == null) continue;
+                    if (rb.transform.root != null && rb.transform.root.GetComponentInParent<RigManager>() != null)
+                        continue;                                   // это тело игрока — не трогаем
+                    if (!done.Add(rb.GetInstanceID())) continue;    // каждое тело один раз
+                    Vector3 dir = rb.position - center; dir.y += 0.4f;
+                    if (dir.sqrMagnitude < 0.0001f) dir = Vector3.up;
+                    try { rb.velocity = dir.normalized * DisarmSpeed; n++; } catch { }
+                }
+                MelonLogger.Msg($"Disarm: вырвал {n} предметов у {target.gameObject.name}.");
+            }
+            catch (Exception e) { MelonLogger.Warning("Disarm: " + e.Message); }
         }
 
         // ---------------- Свой ник: скрытие и цветные DEV-пресеты (LabFusion) ----------------
