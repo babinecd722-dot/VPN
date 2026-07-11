@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.7.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.8.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -296,16 +296,15 @@ namespace MonsterPanel
             page.CreateBool("Infinite Ammo", new Color(1f, 0.85f, 0.1f), InfiniteAmmo,
                 v => { InfiniteAmmo = v; Log("Infinite Ammo", v); });
 
-            // Teleport + скрытие ника: только когда загружен LabFusion.
+            // Teleport + ник: только когда загружен LabFusion.
             if (Teleporter.FusionLoaded)
             {
-                page.CreateBool("Hide My Nickname", new Color(0.5f, 0.8f, 1f), false,
-                    v => NickHider.Apply(v));
+                NickHider.Install(page);
                 Teleporter.Install(page);
-                MelonLogger.Msg("MONSTER Panel: раздел Teleport + Hide Nickname добавлены (LabFusion найден).");
+                MelonLogger.Msg("MONSTER Panel: разделы Teleport + Nickname добавлены (LabFusion найден).");
             }
             else
-                MelonLogger.Msg("MONSTER Panel: LabFusion не загружен — Teleport/Hide Nickname скрыты.");
+                MelonLogger.Msg("MONSTER Panel: LabFusion не загружен — Teleport/Nickname скрыты.");
         }
 
         private static void Log(string name, bool on) =>
@@ -426,28 +425,59 @@ namespace MonsterPanel
                 if (rb != null) { try { rb.velocity = v; } catch { } }
         }
 
-        // ---------------- Скрытие своего ника (LabFusion) ----------------
+        // ---------------- Свой ник: скрытие и цветные DEV-пресеты (LabFusion) ----------------
         //
-        // Ставим свой Nickname пустым — он синхронизируется по сети как метаданные,
-        // поэтому у других над твоим персонажем ник станет пустым. Изолировано в отдельном
-        // классе (JIT-ится только при загруженном LabFusion).
+        // Ник синхронизируется по сети как метаданные, поэтому меняет то, что видят другие
+        // над твоим персонажем. Nametag рисуется через TextMeshPro — он понимает rich-text
+        // теги (<color=…>, <b>), а лимит имени = 32 символа (теги «съедают» его).
+        // Изолировано в отдельном классе (JIT-ится только при загруженном LabFusion).
         private static class NickHider
         {
-            public static void Apply(bool hide)
+            public static void Install(Page root)
             {
+                Page p = root.CreatePage("Nickname", new Color(0.5f, 0.8f, 1f), 16, true);
+                // Пресеты MONSTER в цвете (каждый ≤32 символов вместе с тегами).
+                p.CreateFunction("MONSTER (red)",   new Color(1f, 0.2f, 0.2f), (Action)(() => SetNick("<color=#ff2020>MONSTER</color>")));
+                p.CreateFunction("MONSTER (green)", new Color(0.2f, 1f, 0.3f),  (Action)(() => SetNick("<color=#20ff40>MONSTER</color>")));
+                p.CreateFunction("MONSTER (gold)",  new Color(1f, 0.82f, 0.12f),(Action)(() => SetNick("<color=#ffd21e>MONSTER</color>")));
+                p.CreateFunction("MONSTER (cyan)",  new Color(0.2f, 0.88f, 1f), (Action)(() => SetNick("<color=#20e0ff>MONSTER</color>")));
+                p.CreateFunction("MONSTER (pink)",  new Color(1f, 0.4f, 0.8f),  (Action)(() => SetNick("<color=#ff40c0>MONSTER</color>")));
+                p.CreateFunction("DEV (gold)",      new Color(1f, 0.82f, 0.12f),(Action)(() => SetNick("<color=#ffd21e>DEV</color>")));
+                p.CreateFunction("Hide (empty)",    new Color(0.6f, 0.6f, 0.6f),(Action)(() => SetNick(" ")));
+                p.CreateFunction("Reset to default",new Color(0.8f, 0.8f, 0.8f),(Action)ResetNick);
+            }
+
+            private static void SetNick(string value)
+            {
+                var md = Metadata();
+                if (md == null) return;
                 try
                 {
-                    var md = LabFusion.Player.LocalPlayer.Metadata;
-                    if (md == null || md.Nickname == null)
-                    {
-                        MelonLogger.Msg("Hide Nickname: метаданные недоступны — зайди в лобби Fusion и повтори.");
-                        return;
-                    }
-                    if (hide) md.Nickname.SetValue(" ");   // пробел, а не "" — иначе LabFusion откатит на username
-                    else md.Nickname.Remove();             // вернуть обычный ник
-                    MelonLogger.Msg(hide ? "Hide Nickname: ник скрыт (пустой)." : "Hide Nickname: ник восстановлен.");
+                    if (value.Length > 32)   // страховка под лимит имени LabFusion
+                        value = value.Substring(0, 32);
+                    md.Nickname.SetValue(value);
+                    MelonLogger.Msg($"Nickname: установлен «{value}».");
                 }
-                catch (Exception e) { MelonLogger.Warning("Hide Nickname: " + e.Message); }
+                catch (Exception e) { MelonLogger.Warning("Nickname set: " + e.Message); }
+            }
+
+            private static void ResetNick()
+            {
+                var md = Metadata();
+                if (md == null) return;
+                try { md.Nickname.Remove(); MelonLogger.Msg("Nickname: сброшен на обычный."); }
+                catch (Exception e) { MelonLogger.Warning("Nickname reset: " + e.Message); }
+            }
+
+            private static LabFusion.Player.PlayerMetadata Metadata()
+            {
+                var md = LabFusion.Player.LocalPlayer.Metadata;
+                if (md == null || md.Nickname == null)
+                {
+                    MelonLogger.Msg("Nickname: метаданные недоступны — зайди в лобби Fusion и повтори.");
+                    return null;
+                }
+                return md;
             }
         }
 
