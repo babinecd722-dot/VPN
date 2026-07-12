@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.20.3", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.20.4", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -79,7 +79,6 @@ namespace MonsterPanel
                 if (KillAura) Aura.KillTick();
                 if (Disarm) Aura.DisarmTick();
                 Guards.Tick();
-                Teleporter.Poll();   // перестройка списка телепорта — вне цикла отрисовки меню
             }
         }
 
@@ -695,7 +694,6 @@ namespace MonsterPanel
         {
             private static Page _page;
             private static bool _hooked;
-            private static bool _dirty;   // перестроить список в следующем кадре (не во время отрисовки!)
 
             /// <summary>LabFusion загружен? (тип резолвится только если сборка в игре есть.)</summary>
             public static bool FusionLoaded => AccessTools.TypeByName("LabFusion.Entities.NetworkPlayer") != null;
@@ -703,28 +701,18 @@ namespace MonsterPanel
             /// <summary>Создаёт подстраницу Teleport в корне панели и вешает авто-обновление списка.</summary>
             public static void Install(Page root)
             {
-                _page = root.CreatePage("Teleport", new Color(0.3f, 0.7f, 1f), 64, true);   // без пагинации/стрелок
+                _page = root.CreatePage("Teleport", new Color(0.3f, 0.7f, 1f), 16, true);
                 if (!_hooked)
                 {
-                    Menu.OnPageOpened += (Action<Page>)OnPageOpened;
+                    Menu.OnPageOpened += (Action<Page>)OnPageOpened;   // при каждом открытии — свежий список
                     _hooked = true;
                 }
-                _dirty = true;   // построить отложенно, а не сейчас
+                Rebuild();
             }
 
-            /// <summary>Открыли Teleport → помечаем на перестройку. НЕ трогаем страницу здесь:
-            /// это колбэк ВНУТРИ отрисовки BoneMenu, менять элементы сейчас = краш GUIPool.</summary>
             private static void OnPageOpened(Page opened)
             {
-                if (opened == _page) _dirty = true;
-            }
-
-            /// <summary>Вызывается из OnUpdate — перестраиваем список ВНЕ цикла отрисовки (безопасно).</summary>
-            public static void Poll()
-            {
-                if (!_dirty) return;
-                _dirty = false;
-                Rebuild();
+                if (opened == _page) Rebuild();
             }
 
             /// <summary>Пересобираем список: под каждого игрока — подстраница с выбором направления телепорта.</summary>
@@ -734,7 +722,7 @@ namespace MonsterPanel
                 try
                 {
                     _page.RemoveAll();
-                    _page.CreateFunction("Refresh", new Color(0.7f, 0.7f, 0.7f), (Action)(() => _dirty = true));
+                    _page.CreateFunction("Refresh", new Color(0.7f, 0.7f, 0.7f), (Action)Rebuild);
 
                     int count = 0;
                     foreach (var np in NetworkPlayer.Players)
