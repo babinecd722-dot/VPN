@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.20.4", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.21.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -100,6 +100,8 @@ namespace MonsterPanel
         private static void SendAttackTo(PlayerDamageReceiver recv, Vector3 fromPos)
         {
             if (recv == null) return;
+            var proxy = LocalProxy();
+            if (proxy == null) return;   // без proxy патч LabFusion не отправит урон владельцу
             Vector3 dir = (recv.transform.position - fromPos).normalized;
             if (dir.sqrMagnitude < 0.0001f) dir = Vector3.forward;
             var attack = new Attack
@@ -110,8 +112,26 @@ namespace MonsterPanel
                 origin = fromPos,
                 normal = -dir,
                 collider = recv.GetComponentInChildren<Collider>(),
+                proxy = proxy,   // КЛЮЧ: root proxy → мой локальный риг, иначе ReceiveAttack не шлёт SendPlayerDamage
             };
             try { recv.ReceiveAttack(attack); } catch (Exception e) { MelonLogger.Warning("Kill Aura send: " + e.Message); }
+        }
+
+        /// <summary>TriggerRefProxy собственного рига (по нему NPC видят игрока). Его root резолвится
+        /// в мой локальный риг, поэтому патч LabFusion.ReceiveAttack посылает SendPlayerDamage владельцу.
+        /// Пересоздаётся при смене аватара — поэтому перечитываем, если ссылка протухла.</summary>
+        private static Il2CppSLZ.Marrow.AI.TriggerRefProxy _localProxy;
+        private static Il2CppSLZ.Marrow.AI.TriggerRefProxy LocalProxy()
+        {
+            try
+            {
+                if (_localProxy != null) return _localProxy;
+                var rig = BoneLib.Player.RigManager;
+                if (rig == null) return null;
+                _localProxy = rig.GetComponentInChildren<Il2CppSLZ.Marrow.AI.TriggerRefProxy>(true);
+            }
+            catch (Exception e) { MelonLogger.Warning("LocalProxy: " + e.Message); }
+            return _localProxy;
         }
 
         private static readonly Collider[] _overlapBuf = new Collider[64];
