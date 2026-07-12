@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.21.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.22.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -26,6 +26,16 @@ namespace MonsterPanel
 
         /// <summary>Kill Aura: макс. урон всем игрокам рядом (радиус AuraRange), без наведения.</summary>
         public static bool KillAura { get; private set; }
+
+        // ---- Kill Aura настройки (меню) ----
+        /// <summary>Режим: бить ВСЕХ игроков (true) или только выбранного (false).</summary>
+        public static bool AuraGlobal = true;
+        /// <summary>Скорость: сколько раз в секунду шлём урон (1 = медленно, 60 = моментально).</summary>
+        public static float AuraRate = 15f;
+        /// <summary>Игнорировать дистанцию (бить независимо от расстояния).</summary>
+        public static bool AuraIgnoreDist = true;
+        /// <summary>SmallID выбранной цели (для одиночного режима). -1 = не выбран.</summary>
+        public static int AuraTargetSid = -1;
 
         /// <summary>Бесконечные патроны: запас в инвентаре бесконечный (магазин расходуется штатно).</summary>
         public static bool InfiniteAmmo { get; private set; }
@@ -165,18 +175,22 @@ namespace MonsterPanel
         // Весь код с типами LabFusion — здесь (JIT только при загруженном Fusion).
         private static class Aura
         {
-            private static float _killTimer, _disarmTimer;
+            private static float _killTimer, _disarmTimer, _logTimer;
 
-            /// <summary>Kill Aura: раз в KillTickInterval — макс. урон всем игрокам в радиусе.</summary>
+            /// <summary>Kill Aura: с частотой AuraRate/сек — макс. урон цели(ям).
+            /// Режим ALL (AuraGlobal) — по всем; иначе только по AuraTargetSid.
+            /// AuraIgnoreDist — без ограничения радиуса.</summary>
             public static void KillTick()
             {
+                float rate = AuraRate < 1f ? 1f : (AuraRate > 60f ? 60f : AuraRate);
                 _killTimer -= Time.deltaTime;
                 if (_killTimer > 0f) return;
-                _killTimer = KillTickInterval;
+                _killTimer = 1f / rate;
 
                 var meRig = BoneLib.Player.RigManager;
                 if (meRig == null) return;
                 Vector3 me = RigPos(meRig);
+                bool useDist = !AuraIgnoreDist;
                 float r2 = AuraRange * AuraRange;
 
                 try
@@ -186,14 +200,21 @@ namespace MonsterPanel
                     foreach (var np in NetworkPlayer.Players)
                     {
                         if (np == null || np.PlayerID == null || np.PlayerID.IsMe || !np.HasRig) continue;
+                        if (!AuraGlobal && np.PlayerID.SmallID != AuraTargetSid) continue;   // одиночная цель
                         RigManager rig = np.RigRefs.RigManager;
                         if (rig == null) continue;
-                        if ((RigPos(rig) - me).sqrMagnitude > r2) continue;
+                        if (useDist && (RigPos(rig) - me).sqrMagnitude > r2) continue;
                         foreach (var recv in rig.GetComponentsInChildren<PlayerDamageReceiver>())
                             if (recv != null) SendAttackTo(recv, me);
                         hit++;
                     }
-                    if (hit > 0) MelonLogger.Msg($"Kill Aura: hit {hit} nearby player(s).");
+                    // лог не чаще раза в 2 сек, иначе спам на высокой скорости
+                    _logTimer -= 1f / rate;
+                    if (hit > 0 && _logTimer <= 0f)
+                    {
+                        _logTimer = 2f;
+                        MelonLogger.Msg($"Kill Aura: hitting {hit} player(s) at {rate:0}/s ({(AuraGlobal ? "ALL" : "target " + AuraTargetSid)}).");
+                    }
                 }
                 catch (Exception e) { MelonLogger.Warning("Kill Aura: " + e.Message); }
                 finally { _remoteKillSending = false; }
@@ -224,6 +245,95 @@ namespace MonsterPanel
                     }
                 }
                 catch (Exception e) { MelonLogger.Warning("Disarm Aura: " + e.Message); }
+            }
+        }
+
+        // ---------------- Kill Aura: меню-настройки (LabFusion) ----------------
+        //
+        // Подстраница "Kill Aura": режим (все/один), скорость (ползунок), игнор дистанции,
+        // мастер-выключатель и список игроков с пометкой [HOST]. Список обновляется при
+        // открытии страницы (как Teleport). Клик по игроку → одиночная цель + включить.
+        private static class KillAuraMenu
+        {
+            private static Page _page;
+            private static bool _hooked;
+
+            public static void Install(Page root)
+            {
+                _page = root.CreatePage("Kill Aura", new Color(0.7f, 0.4f, 1f), 16, true);
+                if (!_hooked)
+                {
+                    Menu.OnPageOpened += (Action<Page>)OnPageOpened;
+                    _hooked = true;
+                }
+                Rebuild();
+            }
+
+            private static void OnPageOpened(Page opened)
+            {
+                if (opened == _page) Rebuild();
+            }
+
+            private static void Rebuild()
+            {
+                if (_page == null) return;
+                try
+                {
+                    _page.RemoveAll();
+
+                    _page.CreateBool("ENABLE (start killing)", new Color(1f, 0.15f, 0.15f), KillAura,
+                        v => { KillAura = v; Log("Kill Aura", v); });
+                    _page.CreateBool("Mode: ALL players", new Color(1f, 0.6f, 0.2f), AuraGlobal,
+                        v => { AuraGlobal = v; MelonLogger.Msg("Kill Aura mode: " + (v ? "ALL" : "single target")); });
+                    _page.CreateFloat("Speed (hits/sec)", new Color(0.9f, 0.8f, 0.2f), AuraRate, 1f, 1f, 60f,
+                        v => { AuraRate = v; });
+                    _page.CreateBool("Ignore distance", new Color(0.4f, 0.7f, 1f), AuraIgnoreDist,
+                        v => { AuraIgnoreDist = v; MelonLogger.Msg("Kill Aura distance: " + (v ? "ignored (any range)" : "limited")); });
+                    _page.CreateFunction("Refresh player list", new Color(0.6f, 0.6f, 0.6f), (Action)Rebuild);
+
+                    int count = 0;
+                    foreach (var np in NetworkPlayer.Players)
+                    {
+                        if (np == null || np.PlayerID == null || np.PlayerID.IsMe || !np.HasRig) continue;
+                        byte sid = np.PlayerID.SmallID;
+                        bool host = false; try { host = np.PlayerID.IsHost; } catch { }
+                        bool sel = (!AuraGlobal && AuraTargetSid == sid);
+                        string label = (sel ? "> " : "") + SafeName(np.Username, sid) + (host ? " [HOST]" : "");
+                        Color col = sel ? new Color(0.3f, 1f, 0.4f) : (host ? new Color(1f, 0.85f, 0.2f) : Color.white);
+                        _page.CreateFunction(label, col, (Action)(() => SelectTarget(sid)));
+                        count++;
+                    }
+                    if (count == 0)
+                        _page.CreateFunction("No other players", new Color(0.6f, 0.6f, 0.6f), (Action)(() => { }));
+                }
+                catch (Exception e) { MelonLogger.Warning("Kill Aura menu: " + e.Message); }
+            }
+
+            /// <summary>Выбрать одиночную цель, выключить режим ALL и включить ауру.</summary>
+            private static void SelectTarget(byte sid)
+            {
+                AuraTargetSid = sid;
+                AuraGlobal = false;
+                KillAura = true;
+                MelonLogger.Msg($"Kill Aura: single target sid {sid}, ENABLED.");
+                Rebuild();   // обновить пометку выбранной цели
+            }
+
+            /// <summary>Имя для BoneMenu: без rich-text тегов и не-ASCII (шрифт меню — латиница).</summary>
+            private static string SafeName(string username, byte sid)
+            {
+                if (string.IsNullOrEmpty(username)) return "Player " + sid;
+                var sb = new System.Text.StringBuilder(username.Length);
+                bool inTag = false;
+                foreach (char c in username)
+                {
+                    if (c == '<') { inTag = true; continue; }
+                    if (c == '>') { inTag = false; continue; }
+                    if (inTag) continue;
+                    if (c >= 32 && c < 127) sb.Append(c);
+                }
+                string s = sb.ToString().Trim();
+                return s.Length == 0 ? ("Player " + sid) : s;
             }
         }
 
@@ -380,8 +490,6 @@ namespace MonsterPanel
             page.CreateBool("Invincible", Color.green, Invincible, v => { Invincible = v; Log("Invincible", v); });
             page.CreateBool("Monster Damage", new Color(1f, 0.4f, 0f), MonsterDamage,
                 v => { MonsterDamage = v; Log("Monster Damage", v); });
-            page.CreateBool("Kill Aura", new Color(0.7f, 0.4f, 1f), KillAura,
-                v => { KillAura = v; Log("Kill Aura", v); });
             page.CreateBool("Infinite Ammo", new Color(1f, 0.85f, 0.1f), InfiniteAmmo,
                 v => { InfiniteAmmo = v; Log("Infinite Ammo", v); });
             page.CreateBool("Tank Mode", new Color(0.4f, 0.6f, 0.9f), TankMode,
@@ -395,9 +503,10 @@ namespace MonsterPanel
                 page.CreateFunction("Spawn 3 Bodyguards", new Color(0.2f, 0.55f, 1f), (Action)Guards.Spawn);
                 page.CreateFunction("Despawn Bodyguards", new Color(0.5f, 0.5f, 0.5f), (Action)Guards.Despawn);
                 page.CreateFunction("Avatar preview 6114112", new Color(0.7f, 0.5f, 1f), (Action)NickHider.SetAvatarPreview);
+                KillAuraMenu.Install(page);
                 NickHider.Install(page);
                 Teleporter.Install(page);
-                MelonLogger.Msg("MONSTER Panel: Teleport + Nickname + Bodyguards added (LabFusion found).");
+                MelonLogger.Msg("MONSTER Panel: Kill Aura + Teleport + Nickname + Bodyguards added (LabFusion found).");
             }
             else
                 MelonLogger.Msg("MONSTER Panel: LabFusion not loaded - Teleport/Nickname/Bodyguards hidden.");
