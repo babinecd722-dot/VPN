@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.16.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.17.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -424,17 +424,25 @@ namespace MonsterPanel
                 {
                     if (value != null && value.Length > 32)   // страховка под лимит имени LabFusion
                         value = value.Substring(0, 32);
-                    // Применяем ник через настройки LabFusion — он раскидывает его ВЕЗДЕ:
-                    // nametag, меню Fusion, и синхронизирует другим игрокам.
+                    // 1) Ник (nametag над головой) — через настройки LabFusion (правильный синхро-путь).
                     LabFusion.Preferences.Client.ClientSettings.Nickname.Value = value;
                     LabFusion.Preferences.Client.ClientSettings.NicknameVisibility.Value = LabFusion.Senders.NicknameVisibility.SHOW;
                     SendSettings();
 
+                    // 2) Username и имя аватара в списке игроков — тоже метаданные, синхронизируются.
+                    //    Так меняются ОБЕ строки имени в ростере (не только Nickname), и подпись аватара.
+                    var md = LabFusion.Player.LocalPlayer.Metadata;
+                    if (md != null)
+                    {
+                        try { md.Username?.SetValue(value); } catch { }
+                        try { md.AvatarTitle?.SetValue(value); } catch { }
+                    }
+
                     string shown = StripTags(value);
-                    Notify("Nickname changed", string.IsNullOrWhiteSpace(shown) ? "(empty)" : shown);
-                    MelonLogger.Msg($"Nickname: set '{value}' via ClientSettings (synced everywhere).");
+                    Notify("Identity changed", string.IsNullOrWhiteSpace(shown) ? "(empty)" : shown);
+                    MelonLogger.Msg($"Identity: nick + username + avatar-title set '{value}' (synced).");
                 }
-                catch (Exception e) { MelonLogger.Warning("Nickname set: " + e.Message); }
+                catch (Exception e) { MelonLogger.Warning("Identity set: " + e.Message); }
             }
 
             private static void ResetNick()
@@ -443,10 +451,20 @@ namespace MonsterPanel
                 {
                     LabFusion.Preferences.Client.ClientSettings.Nickname.Value = "";   // пусто → откат на платформенный ник
                     SendSettings();
-                    Notify("Nickname reset", "default");
-                    MelonLogger.Msg("Nickname: reset to default.");
+
+                    // Возвращаем Username к реальному платформенному, имя аватара убираем (LabFusion
+                    // переброадкастит его при следующей смене аватара).
+                    var md = LabFusion.Player.LocalPlayer.Metadata;
+                    if (md != null)
+                    {
+                        try { md.Username?.SetValue(LabFusion.Player.LocalPlayer.Username); } catch { }
+                        try { md.AvatarTitle?.Remove(); } catch { }
+                    }
+
+                    Notify("Identity reset", "default");
+                    MelonLogger.Msg("Identity: reset to default.");
                 }
-                catch (Exception e) { MelonLogger.Warning("Nickname reset: " + e.Message); }
+                catch (Exception e) { MelonLogger.Warning("Identity reset: " + e.Message); }
             }
 
             /// <summary>Проталкиваем настройки клиента по сети (метод internal — зовём рефлексией).</summary>
