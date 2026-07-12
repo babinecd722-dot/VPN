@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.14.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.15.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -52,7 +52,7 @@ namespace MonsterPanel
         private const float RkRange = 40f;          // дальность наведения
         private const float RkGripThreshold = 0.6f; // grip (средний палец)
         private const float RkTriggerThreshold = 0.7f; // триггер (указательный)
-        private const float RkAimRadius = 0.28f;    // «толщина» луча (SphereCast) — крестик не скачет
+        private const float RkAimRadius = 0.35f;    // «толщина» второй ступени (SphereCast) — прощает промах
         private const float RkPersist = 0.4f;       // сколько держим цель после потери луча, сек
         private static readonly HandState _left = new HandState();
         private static readonly HandState _right = new HandState();
@@ -135,7 +135,7 @@ namespace MonsterPanel
                 HideMarker(state.Marker);
                 // Диагностика: даже без цели показываем, что кнопка нажалась — сразу видно, рабочая ли она.
                 if (firedNow)
-                    MelonLogger.Msg($"Remote Kill: button pressed (grip={gripF:0.00} trig={trigF:0.00}), but no crosshair/target - aim your hand at a player.");
+                    MelonLogger.Msg($"Remote Kill: button pressed (grip={gripF:0.00} trig={trigF:0.00}), no target [{DescribeAim(hand)}].");
                 state.FirePrev = fire;
                 return;
             }
@@ -167,36 +167,78 @@ namespace MonsterPanel
         private static float SafeGrip(BaseController c) { try { return c.GetGripForce(); } catch { return 0f; } }
         private static float SafeTrigger(BaseController c) { try { return c.GetIndexCurlAxis(); } catch { return 0f; } }
 
-        // Переиспользуемый буфер для SphereCastNonAlloc — не мусорим массивами каждый кадр.
-        private static readonly RaycastHit[] _castBuf = new RaycastHit[32];
+        // Переиспользуемый буфер (256 с запасом: при переполнении буфера коллайдер игрока
+        // мог бы не попасть в выдачу — именно так 32-слотовый буфер ломал наведение).
+        private static readonly RaycastHit[] _castBuf = new RaycastHit[256];
 
-        /// <summary>«Толстый» луч (SphereCast) из руки → ближайший игрок, не считая себя.
-        /// Ключевое: цепляемся за РИГ игрока по любому его коллайдеру (в т.ч. триггер-хитбоксу),
-        /// а PlayerDamageReceiver берём С РИГА — он может висеть не на том коллайдере, куда попал луч.</summary>
+        /// <summary>Наведение из руки → ближайший ЧУЖОЙ игрок. Двухступенчато:
+        /// 1) тонкий луч — точная и проверенная на устройстве схема (логи 2.4.2: цели находились);
+        /// 2) «толстая» сфера — прощает промах по движущейся цели.
+        /// Триггеры ИГНОРИРУЕМ: коллайдеры тел игроков физические (факт из логов 2.4.2), а
+        /// режим Collide забивал буфер огромными триггер-зонами уровня и цель терялась.</summary>
         private static PlayerDamageReceiver FindTargetPlayer(Transform hand, out RaycastHit bestHit)
         {
+            Vector3 fwd = hand.forward;
+
+            int count = Physics.RaycastNonAlloc(hand.position + fwd * 0.05f, fwd, _castBuf, RkRange,
+                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+            PlayerDamageReceiver best = ScanHits(count, out bestHit);
+            if (best != null) return best;
+
+            count = Physics.SphereCastNonAlloc(hand.position + fwd * 0.3f, RkAimRadius, fwd, _castBuf, RkRange,
+                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+            return ScanHits(count, out bestHit);
+        }
+
+        /// <summary>Ближайший чужой игрок среди попаданий в _castBuf.</summary>
+        private static PlayerDamageReceiver ScanHits(int count, out RaycastHit bestHit)
+        {
             bestHit = default;
-            Vector3 origin = hand.position + hand.forward * 0.3f;
-            int count = Physics.SphereCastNonAlloc(origin, RkAimRadius, hand.forward, _castBuf, RkRange,
-                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Collide);   // триггеры-хитбоксы тоже ловим
             PlayerDamageReceiver best = null;
             float bestDist = float.MaxValue;
             for (int i = 0; i < count; i++)
             {
                 RaycastHit h = _castBuf[i];
-                if (h.collider == null) continue;
-
-                var rig = h.collider.GetComponentInParent<RigManager>();
-                if (rig == null) continue;                       // не риг игрока — мимо
-                if (IsOwnRig(rig.transform)) continue;           // не наводимся на себя
-
-                var recv = h.collider.GetComponentInParent<PlayerDamageReceiver>();
-                if (recv == null) recv = rig.GetComponentInChildren<PlayerDamageReceiver>();
+                var recv = ReceiverFromCollider(h.collider);
                 if (recv == null) continue;
-
                 if (h.distance < bestDist) { bestDist = h.distance; best = recv; bestHit = h; }
             }
             return best;
+        }
+
+        /// <summary>Ресивер урона чужого игрока по его коллайдеру (null — не игрок или это я сам).</summary>
+        private static PlayerDamageReceiver ReceiverFromCollider(Collider c)
+        {
+            if (c == null) return null;
+            var rig = c.GetComponentInParent<RigManager>();
+            if (rig == null) return null;                    // не риг игрока
+            if (IsOwnRig(rig.transform)) return null;        // не наводимся на себя
+            var recv = c.GetComponentInParent<PlayerDamageReceiver>();
+            if (recv == null) recv = rig.GetComponentInChildren<PlayerDamageReceiver>();
+            return recv;
+        }
+
+        /// <summary>Диагностика наведения — зовётся ТОЛЬКО по неудачному нажатию (не в горячем пути).
+        /// По логу сразу видно: hits=0 → луч не туда/маска; other-rig-hits=0 при наведении на игрока →
+        /// не находится RigManager; иначе — ресивер.</summary>
+        private static string DescribeAim(Transform hand)
+        {
+            Vector3 fwd = hand.forward;
+            int count = Physics.SphereCastNonAlloc(hand.position + fwd * 0.3f, RkAimRadius, fwd, _castBuf, RkRange,
+                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+            int rigs = 0, own = 0;
+            string firstRig = null;
+            for (int i = 0; i < count; i++)
+            {
+                var c = _castBuf[i].collider;
+                if (c == null) continue;
+                var rig = c.GetComponentInParent<RigManager>();
+                if (rig == null) continue;
+                if (IsOwnRig(rig.transform)) { own++; continue; }
+                rigs++;
+                if (firstRig == null) firstRig = rig.name;
+            }
+            return $"hits={count}, other-rig-hits={rigs}{(firstRig != null ? " (" + firstRig + ")" : "")}, own-rig-hits={own}";
         }
 
         /// <summary>
@@ -512,7 +554,7 @@ namespace MonsterPanel
 
             var target = FindTargetPlayer(hand, out _);
             if (target != null) YankItemsFrom(target);
-            else MelonLogger.Msg("Disarm: A pressed, no target - point your hand at a player.");
+            else MelonLogger.Msg($"Disarm: A pressed, no target [{DescribeAim(hand)}].");
         }
 
         private static readonly Collider[] _overlapBuf = new Collider[64];
