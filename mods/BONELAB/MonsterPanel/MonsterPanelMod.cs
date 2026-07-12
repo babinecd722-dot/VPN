@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.20.2", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.20.3", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -375,6 +375,7 @@ namespace MonsterPanel
             {
                 page.CreateFunction("Spawn 3 Bodyguards", new Color(0.2f, 0.55f, 1f), (Action)Guards.Spawn);
                 page.CreateFunction("Despawn Bodyguards", new Color(0.5f, 0.5f, 0.5f), (Action)Guards.Despawn);
+                page.CreateFunction("Avatar preview 6114112", new Color(0.7f, 0.5f, 1f), (Action)NickHider.SetAvatarPreview);
                 NickHider.Install(page);
                 Teleporter.Install(page);
                 MelonLogger.Msg("MONSTER Panel: Teleport + Nickname + Bodyguards added (LabFusion found).");
@@ -556,9 +557,11 @@ namespace MonsterPanel
                 p.CreateFunction("MONSTER (pink)",  new Color(1f, 0.4f, 0.8f),  (Action)(() => SetNick("<color=#ff40c0>MONSTER</color>")));
                 p.CreateFunction("DEV (gold)",      new Color(1f, 0.82f, 0.12f),(Action)(() => SetNick("<color=#ffd21e>DEV</color>")));
                 p.CreateFunction("Hide (empty)",    new Color(0.6f, 0.6f, 0.6f),(Action)(() => SetNick(" ")));
-                p.CreateFunction("Avatar preview 6114112", new Color(0.7f, 0.5f, 1f), (Action)(() => SetAvatarModId(6114112)));
                 p.CreateFunction("Reset to default",new Color(0.8f, 0.8f, 0.8f),(Action)ResetNick);
             }
+
+            /// <summary>Кнопка превью аватара — живёт в самой панели, не в подстранице ника.</summary>
+            public static void SetAvatarPreview() => SetAvatarModId(6114112);
 
             private static readonly System.Random _rng = new System.Random();
             private static readonly string[] _handles =
