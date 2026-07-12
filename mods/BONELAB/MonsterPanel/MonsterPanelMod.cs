@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.11.1", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.12.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -33,9 +33,6 @@ namespace MonsterPanel
         /// <summary>Tank: тебя нельзя схватить/поднять (движение и удары как обычно).</summary>
         public static bool TankMode { get; private set; }
 
-        /// <summary>Super Throw: всё, что отпускаешь из руки, улетает с огромной силой (йит игроков/врагов/объектов).</summary>
-        public static bool SuperThrow { get; private set; }
-
         /// <summary>Disarm: наводишь руку на игрока + grip/триггер → его оружие вырывает силой из рук.</summary>
         public static bool Disarm { get; private set; }
 
@@ -46,13 +43,6 @@ namespace MonsterPanel
         private const float TankReapplyInterval = 0.5f;
         private static bool _tankApplied;
         private static float _tankTimer;
-
-        // Super Throw (йит)
-        private const float YeetSpeed = 45f;   // м/с при отпускании — швыряет через полкарты
-        private static readonly YeetState _leftYeet = new YeetState();
-        private static readonly YeetState _rightYeet = new YeetState();
-
-        private class YeetState { public bool WasHolding; public GameObject Held; }
 
         // Disarm
         private const float DisarmRadius = 1.3f;   // радиус вокруг цели, откуда вырываем предметы
@@ -89,7 +79,7 @@ namespace MonsterPanel
         {
             BuildMenu();
             ApplyPatches();
-            MelonLogger.Msg("MONSTER Panel загружен.");
+            MelonLogger.Msg("MONSTER Panel loaded.");
         }
 
         public override void OnUpdate()
@@ -107,12 +97,6 @@ namespace MonsterPanel
             }
 
             TankUpdate();
-
-            if (SuperThrow)
-            {
-                YeetHand(BoneLib.Player.LeftHand, _leftYeet);
-                YeetHand(BoneLib.Player.RightHand, _rightYeet);
-            }
 
             if (Disarm)
             {
@@ -152,7 +136,7 @@ namespace MonsterPanel
                 HideMarker(state.Marker);
                 // Диагностика: даже без цели показываем, что кнопка нажалась — сразу видно, рабочая ли она.
                 if (firedNow)
-                    MelonLogger.Msg($"Remote Kill: кнопка нажата (grip={gripF:0.00} trig={trigF:0.00}), но крестика/цели нет — наведи руку на игрока.");
+                    MelonLogger.Msg($"Remote Kill: button pressed (grip={gripF:0.00} trig={trigF:0.00}), but no crosshair/target - aim your hand at a player.");
                 state.FirePrev = fire;
                 return;
             }
@@ -174,7 +158,7 @@ namespace MonsterPanel
 
             if (firedNow)   // срабатывание по нажатию, не по удержанию
             {
-                MelonLogger.Msg($"Remote Kill: FIRE (grip={gripF:0.00} trig={trigF:0.00}) → цель {target.gameObject.name}.");
+                MelonLogger.Msg($"Remote Kill: FIRE (grip={gripF:0.00} trig={trigF:0.00}) -> target {target.gameObject.name}.");
                 KillPlayer(target, hand, hit);
             }
             state.FirePrev = fire;
@@ -240,7 +224,7 @@ namespace MonsterPanel
                     sent = 1;
                 }
 
-                MelonLogger.Msg($"Remote Kill: {sent} атак отправлено по {target.transform.root?.name ?? target.gameObject.name}.");
+                MelonLogger.Msg($"Remote Kill: {sent} attacks sent to {target.transform.root?.name ?? target.gameObject.name}.");
             }
             catch (Exception e) { MelonLogger.Warning("Remote Kill: " + e.Message); }
             finally { _remoteKillSending = false; }
@@ -339,8 +323,6 @@ namespace MonsterPanel
                 v => { InfiniteAmmo = v; Log("Infinite Ammo", v); });
             page.CreateBool("Tank Mode", new Color(0.4f, 0.6f, 0.9f), TankMode,
                 v => { TankMode = v; Log("Tank Mode", v); });
-            page.CreateBool("Super Throw", new Color(0.9f, 0.5f, 0.1f), SuperThrow,
-                v => { SuperThrow = v; Log("Super Throw", v); });
             page.CreateBool("Disarm", new Color(0.9f, 0.2f, 0.5f), Disarm,
                 v => { Disarm = v; Log("Disarm", v); });
 
@@ -349,14 +331,14 @@ namespace MonsterPanel
             {
                 NickHider.Install(page);
                 Teleporter.Install(page);
-                MelonLogger.Msg("MONSTER Panel: разделы Teleport + Nickname добавлены (LabFusion найден).");
+                MelonLogger.Msg("MONSTER Panel: Teleport + Nickname sections added (LabFusion found).");
             }
             else
-                MelonLogger.Msg("MONSTER Panel: LabFusion не загружен — Teleport/Nickname скрыты.");
+                MelonLogger.Msg("MONSTER Panel: LabFusion not loaded - Teleport/Nickname hidden.");
         }
 
         private static void Log(string name, bool on) =>
-            MelonLogger.Msg(on ? $"{name}: ВКЛ" : $"{name}: ВЫКЛ");
+            MelonLogger.Msg(on ? $"{name}: ON" : $"{name}: OFF");
 
         // ---------------- Патчи урона ----------------
 
@@ -369,7 +351,7 @@ namespace MonsterPanel
                 foreach (string m in new[] { "TAKEDAMAGE", "ApplyKillDamage", "Death" })
                     TryPatch(playerHealth, m, god);
             }
-            else MelonLogger.Error("MONSTER Panel: Player_Health не найден — бессмертие не активно");
+            else MelonLogger.Error("MONSTER Panel: Player_Health not found - invincibility inactive");
 
             TryPatchTyped(typeof(SubBehaviourHealth), "TakeDamage", Hm(nameof(PuppetPrefix)), "SubBehaviourHealth.TakeDamage");
             TryPatchTyped(typeof(MHealth), "TAKEDAMAGE", Hm(nameof(HealthPrefix)), "Health.TAKEDAMAGE");
@@ -378,7 +360,7 @@ namespace MonsterPanel
             if (fusion != null)
                 TryPatch(fusion, "ReceiveAttack", Hm(nameof(FusionAttackPrefix)));
             else
-                MelonLogger.Msg("MONSTER Panel: LabFusion не найден — урон по игрокам в сети выключен (нормально без Fusion).");
+                MelonLogger.Msg("MONSTER Panel: LabFusion not found - network player damage disabled (normal without Fusion).");
 
             ApplyAmmoPatches();
         }
@@ -397,9 +379,9 @@ namespace MonsterPanel
                     HarmonyInstance.Patch(mi, postfix: post);
                     patched++;
                 }
-                MelonLogger.Msg($"MONSTER Panel: Infinite Ammo — пропатчен AmmoInventory.GetCartridgeCount ({patched} перегрузк).");
+                MelonLogger.Msg($"MONSTER Panel: Infinite Ammo - patched AmmoInventory.GetCartridgeCount ({patched} overloads).");
             }
-            catch (Exception e) { MelonLogger.Warning("MONSTER Panel: Infinite Ammo — " + e.Message); }
+            catch (Exception e) { MelonLogger.Warning("MONSTER Panel: Infinite Ammo - " + e.Message); }
         }
 
         private static HarmonyMethod Hm(string name) =>
@@ -410,11 +392,11 @@ namespace MonsterPanel
             try
             {
                 MethodBase target = AccessTools.Method(type, methodName);
-                if (target == null) { MelonLogger.Warning($"MONSTER Panel: {type.Name}.{methodName} не найден"); return; }
+                if (target == null) { MelonLogger.Warning($"MONSTER Panel: {type.Name}.{methodName} not found"); return; }
                 HarmonyInstance.Patch(target, prefix: prefix);
-                MelonLogger.Msg($"MONSTER Panel: пропатчен {type.Name}.{methodName}");
+                MelonLogger.Msg($"MONSTER Panel: patched {type.Name}.{methodName}");
             }
-            catch (Exception e) { MelonLogger.Warning($"MONSTER Panel: {type.Name}.{methodName} — {e.Message}"); }
+            catch (Exception e) { MelonLogger.Warning($"MONSTER Panel: {type.Name}.{methodName} - {e.Message}"); }
         }
 
         private void TryPatchTyped(Type type, string methodName, HarmonyMethod prefix, string label)
@@ -422,11 +404,11 @@ namespace MonsterPanel
             try
             {
                 MethodBase target = AccessTools.Method(type, methodName);
-                if (target == null) { MelonLogger.Warning($"MONSTER Panel: {label} не найден"); return; }
+                if (target == null) { MelonLogger.Warning($"MONSTER Panel: {label} not found"); return; }
                 HarmonyInstance.Patch(target, prefix: prefix);
-                MelonLogger.Msg($"MONSTER Panel: пропатчен {label}");
+                MelonLogger.Msg($"MONSTER Panel: patched {label}");
             }
-            catch (Exception e) { MelonLogger.Warning($"MONSTER Panel: {label} — {e.Message}"); }
+            catch (Exception e) { MelonLogger.Warning($"MONSTER Panel: {label} - {e.Message}"); }
         }
 
         private static bool GodPrefix() => !Invincible;
@@ -435,7 +417,7 @@ namespace MonsterPanel
         {
             if (!MonsterDamage || _reentry || __instance == null) return;
             try { _reentry = true; __instance.Kill(); Launch(attack); }
-            catch (Exception e) { MelonLogger.Warning("MONSTER Panel: puppet — " + e.Message); }
+            catch (Exception e) { MelonLogger.Warning("MONSTER Panel: puppet - " + e.Message); }
             finally { _reentry = false; }
         }
 
@@ -493,7 +475,7 @@ namespace MonsterPanel
             {
                 TankSetGrips(true);
                 _tankApplied = false;
-                MelonLogger.Msg("Tank Mode: выключен, захваты восстановлены.");
+                MelonLogger.Msg("Tank Mode: off, grips restored.");
             }
         }
 
@@ -507,51 +489,6 @@ namespace MonsterPanel
                     if (g != null && g.enabled != enabled) g.enabled = enabled;
             }
             catch (Exception e) { MelonLogger.Warning("Tank grips: " + e.Message); }
-        }
-
-        // ---------------- Super Throw (йит) ----------------
-        //
-        // Ловим момент отпускания из руки и швыряем то, что держали, с огромной скоростью.
-        // Работает на игроков с чужим бессмертием: это физика захвата, а не урон — god mode
-        // блокирует только урон, а брошенное тело всё равно летит. Себя не задевает: действуем
-        // только на удерживаемый объект.
-        private static void YeetHand(Hand hand, YeetState state)
-        {
-            if (hand == null) return;
-            try
-            {
-                bool holding = hand.HasAttachedObject();
-                if (holding)
-                {
-                    var go = hand.m_CurrentAttachedGO;   // запоминаем, пока держим (при отпускании уже null)
-                    if (go != null) { state.Held = go; state.WasHolding = true; }
-                }
-                else if (state.WasHolding)
-                {
-                    Yeet(state.Held, hand);
-                    state.WasHolding = false;
-                    state.Held = null;
-                }
-            }
-            catch (Exception e) { MelonLogger.Warning("Super Throw: " + e.Message); }
-        }
-
-        private static void Yeet(GameObject go, Hand hand)
-        {
-            if (go == null) return;
-            // Направление: куда двигалась рука; если почти неподвижна — вперёд от руки.
-            Vector3 dir;
-            var hrb = hand.rb;
-            if (hrb != null && hrb.velocity.sqrMagnitude > 1f) dir = hrb.velocity.normalized;
-            else dir = hand.transform.forward;
-
-            Vector3 v = dir * YeetSpeed;
-            var root = go.transform.root;
-            if (root == null) return;
-            int n = 0;
-            foreach (var rb in root.GetComponentsInChildren<Rigidbody>())
-                if (rb != null) { try { rb.velocity = v; n++; } catch { } }
-            MelonLogger.Msg($"Super Throw: йитнул {root.name} ({n} тел) со скоростью {YeetSpeed} м/с.");
         }
 
         // ---------------- Disarm ----------------
@@ -568,7 +505,7 @@ namespace MonsterPanel
             {
                 var target = FindTargetPlayer(hand, out _);
                 if (target != null) YankItemsFrom(target);
-                else MelonLogger.Msg("Disarm: нажал, но крестика/цели нет — наведи руку на игрока.");
+                else MelonLogger.Msg("Disarm: pressed, but no crosshair/target - aim your hand at a player.");
             }
             prev = fire;
         }
@@ -598,7 +535,7 @@ namespace MonsterPanel
                     if (dir.sqrMagnitude < 0.0001f) dir = Vector3.up;
                     try { rb.velocity = dir.normalized * DisarmSpeed; n++; } catch { }
                 }
-                MelonLogger.Msg($"Disarm: вырвал {n} предметов у {target.gameObject.name}.");
+                MelonLogger.Msg($"Disarm: ripped {n} items from {target.gameObject.name}.");
             }
             catch (Exception e) { MelonLogger.Warning("Disarm: " + e.Message); }
         }
@@ -637,7 +574,7 @@ namespace MonsterPanel
                     // Читаем обратно — подтверждение, что применилось (свой ник над собой ты НЕ видишь,
                     // его видят только другие игроки; проверять — по второму игроку).
                     string readback = md.Nickname.GetValueOrEmpty();
-                    MelonLogger.Msg($"Nickname: задал «{value}», в метаданных сейчас «{readback}». Своего тега ты не видишь — смотри со стороны второго игрока.");
+                    MelonLogger.Msg($"Nickname: set '{value}', metadata now '{readback}'. You don't see your own tag - check from another player's view.");
                 }
                 catch (Exception e) { MelonLogger.Warning("Nickname set: " + e.Message); }
             }
@@ -646,7 +583,7 @@ namespace MonsterPanel
             {
                 var md = Metadata();
                 if (md == null) return;
-                try { md.Nickname.Remove(); MelonLogger.Msg("Nickname: сброшен на обычный."); }
+                try { md.Nickname.Remove(); MelonLogger.Msg("Nickname: reset to default."); }
                 catch (Exception e) { MelonLogger.Warning("Nickname reset: " + e.Message); }
             }
 
@@ -655,7 +592,7 @@ namespace MonsterPanel
                 var md = LabFusion.Player.LocalPlayer.Metadata;
                 if (md == null || md.Nickname == null)
                 {
-                    MelonLogger.Msg("Nickname: метаданные недоступны — зайди в лобби Fusion и повтори.");
+                    MelonLogger.Msg("Nickname: metadata unavailable - join a Fusion lobby and retry.");
                     return null;
                 }
                 return md;
@@ -708,7 +645,7 @@ namespace MonsterPanel
                         if (!np.HasRig) continue;
 
                         byte sid = np.PlayerID.SmallID;
-                        string name = string.IsNullOrEmpty(np.Username) ? ("Player " + sid) : np.Username;
+                        string name = SafeName(np.Username, sid);   // без rich-text тегов и не-ASCII: шрифт BoneMenu только латиница
 
                         Page sub = _page.CreatePage(name, new Color(0.6f, 0.85f, 1f), 16, true);
                         sub.CreateFunction("Teleport to player", new Color(0.3f, 1f, 0.5f), (Action)(() => TeleportSelfTo(sid)));
@@ -730,13 +667,31 @@ namespace MonsterPanel
                 return null;
             }
 
+            /// <summary>Имя для BoneMenu: срезаем rich-text теги (&lt;color&gt;…) и не-ASCII (кириллицу),
+            /// иначе шрифт меню рисует кашу/квадраты. Пусто → "Player N".</summary>
+            private static string SafeName(string username, byte sid)
+            {
+                if (string.IsNullOrEmpty(username)) return "Player " + sid;
+                var sb = new System.Text.StringBuilder(username.Length);
+                bool inTag = false;
+                foreach (char c in username)
+                {
+                    if (c == '<') { inTag = true; continue; }
+                    if (c == '>') { inTag = false; continue; }
+                    if (inTag) continue;
+                    if (c >= 32 && c < 127) sb.Append(c);   // только печатная латиница
+                }
+                string s = sb.ToString().Trim();
+                return s.Length == 0 ? ("Player " + sid) : s;
+            }
+
             /// <summary>Телепортируемся к выбранному игроку (свой риг — синхронизируется по сети штатно).</summary>
             private static void TeleportSelfTo(byte sid)
             {
                 try
                 {
                     var np = Find(sid);
-                    if (np == null || !np.HasRig) { MelonLogger.Msg("Teleport: игрок недоступен (вышел?)."); return; }
+                    if (np == null || !np.HasRig) { MelonLogger.Msg("Teleport: player unavailable (left?)."); return; }
                     RigManager target = np.RigRefs.RigManager;
                     RigManager me = BoneLib.Player.RigManager;
                     if (target == null || me == null) return;
@@ -747,7 +702,7 @@ namespace MonsterPanel
                     Vector3 off = myPos - dest; off.y = 0f;
                     off = off.sqrMagnitude > 0.01f ? off.normalized : -target.transform.forward;
                     me.Teleport(dest + off * 0.8f, true);
-                    MelonLogger.Msg($"Teleport: перенёсся к {np.Username} (sid {sid}).");
+                    MelonLogger.Msg($"Teleport: teleported to {SafeName(np.Username, sid)} (sid {sid}).");
                 }
                 catch (Exception e) { MelonLogger.Warning("Teleport self: " + e.Message); }
             }
@@ -758,7 +713,7 @@ namespace MonsterPanel
                 try
                 {
                     var np = Find(sid);
-                    if (np == null || !np.HasRig) { MelonLogger.Msg("Teleport: игрок недоступен (вышел?)."); return; }
+                    if (np == null || !np.HasRig) { MelonLogger.Msg("Teleport: player unavailable (left?)."); return; }
                     RigManager target = np.RigRefs.RigManager;
                     RigManager me = BoneLib.Player.RigManager;
                     if (target == null || me == null) return;
@@ -769,7 +724,7 @@ namespace MonsterPanel
                     fwd.y = 0f;
                     if (fwd.sqrMagnitude < 0.0001f) fwd = Vector3.forward;
                     target.Teleport(dest + fwd.normalized * 1.2f, true);
-                    MelonLogger.Msg($"Teleport: притянул {np.Username} (sid {sid}) — если не прилип, это сетевое владение позицией.");
+                    MelonLogger.Msg($"Teleport: pulled {SafeName(np.Username, sid)} (sid {sid}) - if it didn't stick, that's network position ownership.");
                 }
                 catch (Exception e) { MelonLogger.Warning("Teleport bring: " + e.Message); }
             }
