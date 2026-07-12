@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.13.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.14.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -33,7 +33,7 @@ namespace MonsterPanel
         /// <summary>Tank: тебя нельзя схватить/поднять (движение и удары как обычно).</summary>
         public static bool TankMode { get; private set; }
 
-        /// <summary>Disarm: наводишь руку на игрока + grip/триггер → его оружие вырывает силой из рук.</summary>
+        /// <summary>Disarm: наводишь руку на игрока + кнопка A (одно нажатие) → его оружие вырывает силой из рук.</summary>
         public static bool Disarm { get; private set; }
 
         private const float LaunchSpeed = 28f;
@@ -47,7 +47,6 @@ namespace MonsterPanel
         // Disarm
         private const float DisarmRadius = 1.3f;   // радиус вокруг цели, откуда вырываем предметы
         private const float DisarmSpeed = 22f;     // сила вырывания
-        private static bool _leftDisarmPrev, _rightDisarmPrev;
 
         // Remote Kill
         private const float RkRange = 40f;          // дальность наведения
@@ -100,8 +99,8 @@ namespace MonsterPanel
 
             if (Disarm)
             {
-                DisarmHand(BoneLib.Player.LeftHand?.transform, BoneLib.Player.LeftController, ref _leftDisarmPrev);
-                DisarmHand(BoneLib.Player.RightHand?.transform, BoneLib.Player.RightController, ref _rightDisarmPrev);
+                DisarmHand(BoneLib.Player.LeftHand?.transform, BoneLib.Player.LeftController);
+                DisarmHand(BoneLib.Player.RightHand?.transform, BoneLib.Player.RightController);
             }
         }
 
@@ -171,22 +170,30 @@ namespace MonsterPanel
         // Переиспользуемый буфер для SphereCastNonAlloc — не мусорим массивами каждый кадр.
         private static readonly RaycastHit[] _castBuf = new RaycastHit[32];
 
-        /// <summary>«Толстый» луч (SphereCast) из руки → ближайший игрок (PlayerDamageReceiver), не считая себя.</summary>
+        /// <summary>«Толстый» луч (SphereCast) из руки → ближайший игрок, не считая себя.
+        /// Ключевое: цепляемся за РИГ игрока по любому его коллайдеру (в т.ч. триггер-хитбоксу),
+        /// а PlayerDamageReceiver берём С РИГА — он может висеть не на том коллайдере, куда попал луч.</summary>
         private static PlayerDamageReceiver FindTargetPlayer(Transform hand, out RaycastHit bestHit)
         {
             bestHit = default;
             Vector3 origin = hand.position + hand.forward * 0.3f;
             int count = Physics.SphereCastNonAlloc(origin, RkAimRadius, hand.forward, _castBuf, RkRange,
-                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Collide);   // триггеры-хитбоксы тоже ловим
             PlayerDamageReceiver best = null;
             float bestDist = float.MaxValue;
             for (int i = 0; i < count; i++)
             {
                 RaycastHit h = _castBuf[i];
                 if (h.collider == null) continue;
+
+                var rig = h.collider.GetComponentInParent<RigManager>();
+                if (rig == null) continue;                       // не риг игрока — мимо
+                if (IsOwnRig(rig.transform)) continue;           // не наводимся на себя
+
                 var recv = h.collider.GetComponentInParent<PlayerDamageReceiver>();
+                if (recv == null) recv = rig.GetComponentInChildren<PlayerDamageReceiver>();
                 if (recv == null) continue;
-                if (IsOwnRig(recv.transform)) continue;         // не наводимся на себя
+
                 if (h.distance < bestDist) { bestDist = h.distance; best = recv; bestHit = h; }
             }
             return best;
@@ -493,21 +500,19 @@ namespace MonsterPanel
 
         // ---------------- Disarm ----------------
         //
-        // Наводишь руку на игрока + grip/триггер → вырываем силой все предметы (стволы) рядом
-        // с ним. Это физика, а не урон — чужое бессмертие не мешает. Тела самих игроков (риги)
-        // не трогаем, только отдельные предметы.
-        private static void DisarmHand(Transform hand, BaseController controller, ref bool prev)
+        // Наводишь руку на игрока и жмёшь кнопку A (одно нажатие) → вырываем силой все предметы
+        // (стволы) рядом с ним. Это физика, а не урон — чужое бессмертие не мешает. Тела самих
+        // игроков (риги) не трогаем, только отдельные предметы.
+        private static void DisarmHand(Transform hand, BaseController controller)
         {
-            if (hand == null || controller == null) { prev = false; return; }
-            bool fire = SafeGrip(controller) > RkGripThreshold || SafeTrigger(controller) > RkTriggerThreshold;
+            if (hand == null || controller == null) return;
+            bool aDown;
+            try { aDown = controller.GetAButtonDown(); } catch { aDown = false; }
+            if (!aDown) return;   // GetAButtonDown уже edge-триггер: срабатывает один раз на нажатие
 
-            if (fire && !prev)
-            {
-                var target = FindTargetPlayer(hand, out _);
-                if (target != null) YankItemsFrom(target);
-                else MelonLogger.Msg("Disarm: pressed, but no crosshair/target - aim your hand at a player.");
-            }
-            prev = fire;
+            var target = FindTargetPlayer(hand, out _);
+            if (target != null) YankItemsFrom(target);
+            else MelonLogger.Msg("Disarm: A pressed, no target - point your hand at a player.");
         }
 
         private static readonly Collider[] _overlapBuf = new Collider[64];
