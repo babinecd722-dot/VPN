@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.15.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.16.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -24,8 +24,8 @@ namespace MonsterPanel
         /// <summary>Монстер-урон: ваншот врагов/объектов/игроков + жёсткий отброс.</summary>
         public static bool MonsterDamage { get; private set; }
 
-        /// <summary>Remote Kill: наводишь рукой на игрока (зелёный маркер) + grip/триггер → максимальный урон по сети.</summary>
-        public static bool RemoteKill { get; private set; }
+        /// <summary>Kill Aura: макс. урон всем игрокам рядом (радиус AuraRange), без наведения.</summary>
+        public static bool KillAura { get; private set; }
 
         /// <summary>Бесконечные патроны: запас в инвентаре бесконечный (магазин расходуется штатно).</summary>
         public static bool InfiniteAmmo { get; private set; }
@@ -33,49 +33,38 @@ namespace MonsterPanel
         /// <summary>Tank: тебя нельзя схватить/поднять (движение и удары как обычно).</summary>
         public static bool TankMode { get; private set; }
 
-        /// <summary>Disarm: наводишь руку на игрока + кнопка A (одно нажатие) → его оружие вырывает силой из рук.</summary>
+        /// <summary>Disarm: у всех игроков рядом постоянно вырывает оружие, без наведения.</summary>
         public static bool Disarm { get; private set; }
 
         private const float LaunchSpeed = 28f;
         private const float MaxDamage = 1_000_000f;
+
+        // Aura (Kill / Disarm)
+        private const float AuraRange = 15f;             // «рядом», метры
+        private const float KillTickInterval = 0.25f;    // как часто бьём
+        private const float DisarmTickInterval = 0.5f;   // как часто вырываем стволы
+        private const float DisarmRadius = 1.3f;         // радиус вокруг игрока, откуда вырываем предметы
+        private const float DisarmSpeed = 22f;           // сила вырывания
 
         // Tank Mode
         private const float TankReapplyInterval = 0.5f;
         private static bool _tankApplied;
         private static float _tankTimer;
 
-        // Disarm
-        private const float DisarmRadius = 1.3f;   // радиус вокруг цели, откуда вырываем предметы
-        private const float DisarmSpeed = 22f;     // сила вырывания
-
-        // Remote Kill
-        private const float RkRange = 40f;          // дальность наведения
-        private const float RkGripThreshold = 0.6f; // grip (средний палец)
-        private const float RkTriggerThreshold = 0.7f; // триггер (указательный)
-        private const float RkAimRadius = 0.35f;    // «толщина» второй ступени (SphereCast) — прощает промах
-        private const float RkPersist = 0.4f;       // сколько держим цель после потери луча, сек
-        private static readonly HandState _left = new HandState();
-        private static readonly HandState _right = new HandState();
-
-        /// <summary>Флаг: мы прямо сейчас шлём Remote Kill — бустим урон даже если Monster Damage выкл.</summary>
+        /// <summary>Флаг: сейчас шлём урон Kill Aura — бустим до максимума даже без Monster Damage.</summary>
         private static bool _remoteKillSending;
+
+        /// <summary>LabFusion загружен (кэш) — Kill/Disarm Aura без сети бессмысленны.</summary>
+        private static bool _fusionLoaded;
 
         private const string PlayerHealthType = "Il2CppSLZ.Marrow.Player_Health";
         private const string FusionReceiverPatch = "LabFusion.Patching.PlayerDamageReceiverPatches";
 
         [ThreadStatic] private static bool _reentry;
 
-        /// <summary>Состояние наведения одной руки (маркер, фиксация кнопки, удержание цели против мерцания).</summary>
-        private class HandState
-        {
-            public GameObject Marker;
-            public bool FirePrev;
-            public PlayerDamageReceiver LastTarget;
-            public float LastSeen;
-        }
-
         public override void OnInitializeMelon()
         {
+            _fusionLoaded = Teleporter.FusionLoaded;
             BuildMenu();
             ApplyPatches();
             MelonLogger.Msg("MONSTER Panel loaded.");
@@ -83,271 +72,138 @@ namespace MonsterPanel
 
         public override void OnUpdate()
         {
-            if (RemoteKill)
-            {
-                AimHand(BoneLib.Player.LeftHand?.transform, BoneLib.Player.LeftController, _left);
-                AimHand(BoneLib.Player.RightHand?.transform, BoneLib.Player.RightController, _right);
-            }
-            else
-            {
-                HideMarker(_left.Marker); HideMarker(_right.Marker);
-                _left.FirePrev = _right.FirePrev = false;
-                _left.LastTarget = _right.LastTarget = null;
-            }
-
             TankUpdate();
 
-            if (Disarm)
+            if (_fusionLoaded)
             {
-                DisarmHand(BoneLib.Player.LeftHand?.transform, BoneLib.Player.LeftController);
-                DisarmHand(BoneLib.Player.RightHand?.transform, BoneLib.Player.RightController);
+                if (KillAura) Aura.KillTick();
+                if (Disarm) Aura.DisarmTick();
             }
         }
 
-        // ---------------- Remote Kill ----------------
+        // ---------------- Kill Aura / Disarm Aura (LabFusion) ----------------
+        //
+        // Без наведения и крестиков: идём по списку сетевых игроков NetworkPlayer.Players,
+        // берём тех, кто рядом (радиус AuraRange), и бьём/разоружаем. Код с типами LabFusion
+        // изолирован в классе Aura — JIT-ится только при загруженном Fusion.
 
-        private static void AimHand(Transform hand, BaseController controller, HandState state)
+        /// <summary>Мировая позиция рига (физ-риг → корень).</summary>
+        private static Vector3 RigPos(RigManager rig)
         {
-            if (hand == null || controller == null) { HideMarker(state.Marker); state.FirePrev = false; return; }
-
-            // Кнопка «выстрела»: срабатывает и на grip (средний палец), и на триггер (указательный) —
-            // что нажмёшь, то и сработает. Значения пишем в лог, чтобы точно видеть, какая кнопка идёт.
-            float gripF = SafeGrip(controller);
-            float trigF = SafeTrigger(controller);
-            bool fire = gripF > RkGripThreshold || trigF > RkTriggerThreshold;
-            bool firedNow = fire && !state.FirePrev;
-
-            PlayerDamageReceiver target = FindTargetPlayer(hand, out RaycastHit hit);
-
-            if (target != null)
-            {
-                state.LastTarget = target;
-                state.LastSeen = Time.time;
-            }
-            else if (state.LastTarget != null && Time.time - state.LastSeen < RkPersist)
-            {
-                // Луч соскользнул (игрок движется) — держим прежнюю цель короткое время, чтобы крестик не мерцал.
-                target = state.LastTarget;
-            }
-
-            if (target == null)
-            {
-                HideMarker(state.Marker);
-                // Диагностика: даже без цели показываем, что кнопка нажалась — сразу видно, рабочая ли она.
-                if (firedNow)
-                    MelonLogger.Msg($"Remote Kill: button pressed (grip={gripF:0.00} trig={trigF:0.00}), no target [{DescribeAim(hand)}].");
-                state.FirePrev = fire;
-                return;
-            }
-
-            // Боевой крестик на цели (зелёный = можно убить), всегда развёрнут к лицу.
-            if (state.Marker == null) state.Marker = CreateCrosshair();
-            state.Marker.SetActive(true);
-            state.Marker.transform.position = target.transform.position + Vector3.up * 0.25f;
-            var head = BoneLib.Player.Head;
-            if (head != null)
-            {
-                Vector3 away = state.Marker.transform.position - head.position;
-                if (away.sqrMagnitude > 0.0001f)
-                    state.Marker.transform.rotation = Quaternion.LookRotation(away, Vector3.up);
-                // Масштаб по дистанции — крестик читаем и вблизи, и издалека.
-                float dist = away.magnitude;
-                state.Marker.transform.localScale = Vector3.one * Mathf.Clamp(dist * 0.25f, 0.6f, 4f);
-            }
-
-            if (firedNow)   // срабатывание по нажатию, не по удержанию
-            {
-                MelonLogger.Msg($"Remote Kill: FIRE (grip={gripF:0.00} trig={trigF:0.00}) -> target {target.gameObject.name}.");
-                KillPlayer(target, hand, hit);
-            }
-            state.FirePrev = fire;
+            try { return rig.physicsRig != null ? rig.physicsRig.transform.position : rig.transform.position; }
+            catch { return rig.transform.position; }
         }
 
-        // Читаем оси контроллера без аллокаций (без лямбд — это горячий путь каждый кадр).
-        private static float SafeGrip(BaseController c) { try { return c.GetGripForce(); } catch { return 0f; } }
-        private static float SafeTrigger(BaseController c) { try { return c.GetIndexCurlAxis(); } catch { return 0f; } }
-
-        // Переиспользуемый буфер (256 с запасом: при переполнении буфера коллайдер игрока
-        // мог бы не попасть в выдачу — именно так 32-слотовый буфер ломал наведение).
-        private static readonly RaycastHit[] _castBuf = new RaycastHit[256];
-
-        /// <summary>Наведение из руки → ближайший ЧУЖОЙ игрок. Двухступенчато:
-        /// 1) тонкий луч — точная и проверенная на устройстве схема (логи 2.4.2: цели находились);
-        /// 2) «толстая» сфера — прощает промах по движущейся цели.
-        /// Триггеры ИГНОРИРУЕМ: коллайдеры тел игроков физические (факт из логов 2.4.2), а
-        /// режим Collide забивал буфер огромными триггер-зонами уровня и цель терялась.</summary>
-        private static PlayerDamageReceiver FindTargetPlayer(Transform hand, out RaycastHit bestHit)
+        /// <summary>Одна максимальная атака в ресивер тела (тот же путь, что и Monster Damage:
+        /// game ReceiveAttack + патч LabFusion шлёт урон владельцу; буст гарантируем флагом).</summary>
+        private static void SendAttackTo(PlayerDamageReceiver recv, Vector3 fromPos)
         {
-            Vector3 fwd = hand.forward;
-
-            int count = Physics.RaycastNonAlloc(hand.position + fwd * 0.05f, fwd, _castBuf, RkRange,
-                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
-            PlayerDamageReceiver best = ScanHits(count, out bestHit);
-            if (best != null) return best;
-
-            count = Physics.SphereCastNonAlloc(hand.position + fwd * 0.3f, RkAimRadius, fwd, _castBuf, RkRange,
-                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
-            return ScanHits(count, out bestHit);
-        }
-
-        /// <summary>Ближайший чужой игрок среди попаданий в _castBuf.</summary>
-        private static PlayerDamageReceiver ScanHits(int count, out RaycastHit bestHit)
-        {
-            bestHit = default;
-            PlayerDamageReceiver best = null;
-            float bestDist = float.MaxValue;
-            for (int i = 0; i < count; i++)
-            {
-                RaycastHit h = _castBuf[i];
-                var recv = ReceiverFromCollider(h.collider);
-                if (recv == null) continue;
-                if (h.distance < bestDist) { bestDist = h.distance; best = recv; bestHit = h; }
-            }
-            return best;
-        }
-
-        /// <summary>Ресивер урона чужого игрока по его коллайдеру (null — не игрок или это я сам).</summary>
-        private static PlayerDamageReceiver ReceiverFromCollider(Collider c)
-        {
-            if (c == null) return null;
-            var rig = c.GetComponentInParent<RigManager>();
-            if (rig == null) return null;                    // не риг игрока
-            if (IsOwnRig(rig.transform)) return null;        // не наводимся на себя
-            var recv = c.GetComponentInParent<PlayerDamageReceiver>();
-            if (recv == null) recv = rig.GetComponentInChildren<PlayerDamageReceiver>();
-            return recv;
-        }
-
-        /// <summary>Диагностика наведения — зовётся ТОЛЬКО по неудачному нажатию (не в горячем пути).
-        /// По логу сразу видно: hits=0 → луч не туда/маска; other-rig-hits=0 при наведении на игрока →
-        /// не находится RigManager; иначе — ресивер.</summary>
-        private static string DescribeAim(Transform hand)
-        {
-            Vector3 fwd = hand.forward;
-            int count = Physics.SphereCastNonAlloc(hand.position + fwd * 0.3f, RkAimRadius, fwd, _castBuf, RkRange,
-                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
-            int rigs = 0, own = 0;
-            string firstRig = null;
-            for (int i = 0; i < count; i++)
-            {
-                var c = _castBuf[i].collider;
-                if (c == null) continue;
-                var rig = c.GetComponentInParent<RigManager>();
-                if (rig == null) continue;
-                if (IsOwnRig(rig.transform)) { own++; continue; }
-                rigs++;
-                if (firstRig == null) firstRig = rig.name;
-            }
-            return $"hits={count}, other-rig-hits={rigs}{(firstRig != null ? " (" + firstRig + ")" : "")}, own-rig-hits={own}";
-        }
-
-        /// <summary>
-        /// Бьём по ВСЕМ ресиверам тела цели (голова/грудь/…) максимальным уроном через тот же путь,
-        /// что и рабочий Monster Damage: игровой PlayerDamageReceiver.ReceiveAttack, поверх которого
-        /// сидит патч LabFusion и отправляет урон владельцу по сети. Буст гарантируем флагом.
-        /// </summary>
-        private static void KillPlayer(PlayerDamageReceiver target, Transform hand, RaycastHit hit)
-        {
-            try
-            {
-                _remoteKillSending = true;
-
-                var root = target.transform.root;
-                var receivers = root != null
-                    ? root.GetComponentsInChildren<PlayerDamageReceiver>()
-                    : null;
-
-                int sent = 0;
-                if (receivers != null && receivers.Length > 0)
-                {
-                    foreach (var recv in receivers)
-                    {
-                        if (recv == null || IsOwnRig(recv.transform)) continue;
-                        SendAttack(recv, hand, hit);
-                        sent++;
-                    }
-                }
-                else
-                {
-                    SendAttack(target, hand, hit);
-                    sent = 1;
-                }
-
-                MelonLogger.Msg($"Remote Kill: {sent} attacks sent to {target.transform.root?.name ?? target.gameObject.name}.");
-            }
-            catch (Exception e) { MelonLogger.Warning("Remote Kill: " + e.Message); }
-            finally { _remoteKillSending = false; }
-        }
-
-        /// <summary>Одна максимальная атака в конкретный ресивер тела.</summary>
-        private static void SendAttack(PlayerDamageReceiver recv, Transform hand, RaycastHit hit)
-        {
-            Vector3 dir = (recv.transform.position - hand.position).normalized;
-            if (dir.sqrMagnitude < 0.0001f) dir = hand.forward;
+            if (recv == null) return;
+            Vector3 dir = (recv.transform.position - fromPos).normalized;
+            if (dir.sqrMagnitude < 0.0001f) dir = Vector3.forward;
             var attack = new Attack
             {
                 damage = MaxDamage,
                 attackType = AttackType.Blunt,
                 direction = dir,
-                origin = hand.position,
-                normal = hit.normal.sqrMagnitude > 0.0001f ? hit.normal : -dir,
-                collider = hit.collider,
+                origin = fromPos,
+                normal = -dir,
+                collider = recv.GetComponentInChildren<Collider>(),
             };
-            try { recv.ReceiveAttack(attack); } catch (Exception e) { MelonLogger.Warning("Remote Kill send: " + e.Message); }
+            try { recv.ReceiveAttack(attack); } catch (Exception e) { MelonLogger.Warning("Kill Aura send: " + e.Message); }
         }
 
-        /// <summary>Тактический прицел-крестик: 4 штриха вокруг центра + точка, светящийся зелёный.</summary>
-        private static GameObject CreateCrosshair()
-        {
-            var root = new GameObject("MP_Crosshair");
-            UnityEngine.Object.DontDestroyOnLoad(root);
-            Color c = new Color(0.2f, 1f, 0.35f);   // ярко-зелёный
+        private static readonly Collider[] _overlapBuf = new Collider[64];
+        private static readonly System.Collections.Generic.HashSet<int> _yankSeen = new System.Collections.Generic.HashSet<int>();
 
-            // Штрихи (в локальной плоскости XY, форма читается как боевой прицел с зазором в центре).
-            Bar(root.transform, new Vector3(0f, 0.09f, 0f), new Vector3(0.014f, 0.07f, 0.014f), c); // верх
-            Bar(root.transform, new Vector3(0f, -0.09f, 0f), new Vector3(0.014f, 0.07f, 0.014f), c); // низ
-            Bar(root.transform, new Vector3(0.09f, 0f, 0f), new Vector3(0.07f, 0.014f, 0.014f), c);  // право
-            Bar(root.transform, new Vector3(-0.09f, 0f, 0f), new Vector3(0.07f, 0.014f, 0.014f), c); // лево
-            Bar(root.transform, Vector3.zero, new Vector3(0.022f, 0.022f, 0.022f), c);               // центр-точка
-            return root;
+        /// <summary>Вырываем силой отдельные предметы (стволы) в радиусе точки. Тела ригов не трогаем.</summary>
+        private static void YankItemsAt(Vector3 center)
+        {
+            try
+            {
+                int count = Physics.OverlapSphereNonAlloc(center, DisarmRadius, _overlapBuf,
+                    Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+                _yankSeen.Clear();
+                for (int i = 0; i < count; i++)
+                {
+                    var col = _overlapBuf[i];
+                    if (col == null) continue;
+                    var rb = col.attachedRigidbody;
+                    if (rb == null) continue;
+                    if (rb.transform.root != null && rb.transform.root.GetComponentInParent<RigManager>() != null)
+                        continue;                                   // тело игрока — не трогаем
+                    if (!_yankSeen.Add(rb.GetInstanceID())) continue;
+                    Vector3 dir = rb.position - center; dir.y += 0.4f;
+                    if (dir.sqrMagnitude < 0.0001f) dir = Vector3.up;
+                    try { rb.velocity = dir.normalized * DisarmSpeed; } catch { }
+                }
+            }
+            catch (Exception e) { MelonLogger.Warning("Disarm: " + e.Message); }
         }
 
-        private static Material _markerMat;
-
-        /// <summary>URP-совместимый светящийся материал (без него рантайм-примитивы в URP невидимы/розовые).</summary>
-        private static Material MarkerMaterial()
+        // Весь код с типами LabFusion — здесь (JIT только при загруженном Fusion).
+        private static class Aura
         {
-            if (_markerMat != null) return _markerMat;
-            Color c = new Color(0.2f, 1f, 0.35f);
-            Shader sh = Shader.Find("Universal Render Pipeline/Unlit");
-            if (sh == null) sh = Shader.Find("Universal Render Pipeline/Lit");
-            if (sh == null) sh = Shader.Find("Sprites/Default");
-            if (sh == null) sh = Shader.Find("Unlit/Color");
-            var m = new Material(sh);
-            try { m.color = c; } catch { }
-            try { m.SetColor("_BaseColor", c); } catch { }
-            try { m.SetColor("_Color", c); } catch { }
-            try { m.EnableKeyword("_EMISSION"); m.SetColor("_EmissionColor", c * 2f); } catch { }
-            UnityEngine.Object.DontDestroyOnLoad(m);
-            _markerMat = m;
-            return m;
-        }
+            private static float _killTimer, _disarmTimer;
 
-        private static void Bar(Transform parent, Vector3 localPos, Vector3 scale, Color c)
-        {
-            var g = GameObject.CreatePrimitive(PrimitiveType.Cube);
-            var col = g.GetComponent<Collider>();
-            if (col != null) UnityEngine.Object.Destroy(col);  // не мешает лучу/физике
-            g.transform.SetParent(parent, false);
-            g.transform.localPosition = localPos;
-            g.transform.localScale = scale;
-            var r = g.GetComponent<Renderer>();
-            if (r != null) r.sharedMaterial = MarkerMaterial();  // URP-материал, иначе не видно
-        }
+            /// <summary>Kill Aura: раз в KillTickInterval — макс. урон всем игрокам в радиусе.</summary>
+            public static void KillTick()
+            {
+                _killTimer -= Time.deltaTime;
+                if (_killTimer > 0f) return;
+                _killTimer = KillTickInterval;
 
-        private static void HideMarker(GameObject marker)
-        {
-            if (marker != null && marker.activeSelf) marker.SetActive(false);
+                var meRig = BoneLib.Player.RigManager;
+                if (meRig == null) return;
+                Vector3 me = RigPos(meRig);
+                float r2 = AuraRange * AuraRange;
+
+                try
+                {
+                    _remoteKillSending = true;
+                    int hit = 0;
+                    foreach (var np in NetworkPlayer.Players)
+                    {
+                        if (np == null || np.PlayerID == null || np.PlayerID.IsMe || !np.HasRig) continue;
+                        RigManager rig = np.RigRefs.RigManager;
+                        if (rig == null) continue;
+                        if ((RigPos(rig) - me).sqrMagnitude > r2) continue;
+                        foreach (var recv in rig.GetComponentsInChildren<PlayerDamageReceiver>())
+                            if (recv != null) SendAttackTo(recv, me);
+                        hit++;
+                    }
+                    if (hit > 0) MelonLogger.Msg($"Kill Aura: hit {hit} nearby player(s).");
+                }
+                catch (Exception e) { MelonLogger.Warning("Kill Aura: " + e.Message); }
+                finally { _remoteKillSending = false; }
+            }
+
+            /// <summary>Disarm Aura: раз в DisarmTickInterval — вырываем стволы у всех игроков в радиусе.</summary>
+            public static void DisarmTick()
+            {
+                _disarmTimer -= Time.deltaTime;
+                if (_disarmTimer > 0f) return;
+                _disarmTimer = DisarmTickInterval;
+
+                var meRig = BoneLib.Player.RigManager;
+                if (meRig == null) return;
+                Vector3 me = RigPos(meRig);
+                float r2 = AuraRange * AuraRange;
+
+                try
+                {
+                    foreach (var np in NetworkPlayer.Players)
+                    {
+                        if (np == null || np.PlayerID == null || np.PlayerID.IsMe || !np.HasRig) continue;
+                        RigManager rig = np.RigRefs.RigManager;
+                        if (rig == null) continue;
+                        Vector3 p = RigPos(rig);
+                        if ((p - me).sqrMagnitude > r2) continue;
+                        YankItemsAt(p);
+                    }
+                }
+                catch (Exception e) { MelonLogger.Warning("Disarm Aura: " + e.Message); }
+            }
         }
 
         /// <summary>Принадлежит ли трансформ собственному ригу игрока.</summary>
@@ -366,8 +222,8 @@ namespace MonsterPanel
             page.CreateBool("Invincible", Color.green, Invincible, v => { Invincible = v; Log("Invincible", v); });
             page.CreateBool("Monster Damage", new Color(1f, 0.4f, 0f), MonsterDamage,
                 v => { MonsterDamage = v; Log("Monster Damage", v); });
-            page.CreateBool("Remote Kill", new Color(0.7f, 0.4f, 1f), RemoteKill,
-                v => { RemoteKill = v; Log("Remote Kill", v); });
+            page.CreateBool("Kill Aura", new Color(0.7f, 0.4f, 1f), KillAura,
+                v => { KillAura = v; Log("Kill Aura", v); });
             page.CreateBool("Infinite Ammo", new Color(1f, 0.85f, 0.1f), InfiniteAmmo,
                 v => { InfiniteAmmo = v; Log("Infinite Ammo", v); });
             page.CreateBool("Tank Mode", new Color(0.4f, 0.6f, 0.9f), TankMode,
@@ -538,53 +394,6 @@ namespace MonsterPanel
                     if (g != null && g.enabled != enabled) g.enabled = enabled;
             }
             catch (Exception e) { MelonLogger.Warning("Tank grips: " + e.Message); }
-        }
-
-        // ---------------- Disarm ----------------
-        //
-        // Наводишь руку на игрока и жмёшь кнопку A (одно нажатие) → вырываем силой все предметы
-        // (стволы) рядом с ним. Это физика, а не урон — чужое бессмертие не мешает. Тела самих
-        // игроков (риги) не трогаем, только отдельные предметы.
-        private static void DisarmHand(Transform hand, BaseController controller)
-        {
-            if (hand == null || controller == null) return;
-            bool aDown;
-            try { aDown = controller.GetAButtonDown(); } catch { aDown = false; }
-            if (!aDown) return;   // GetAButtonDown уже edge-триггер: срабатывает один раз на нажатие
-
-            var target = FindTargetPlayer(hand, out _);
-            if (target != null) YankItemsFrom(target);
-            else MelonLogger.Msg($"Disarm: A pressed, no target [{DescribeAim(hand)}].");
-        }
-
-        private static readonly Collider[] _overlapBuf = new Collider[64];
-        private static readonly System.Collections.Generic.HashSet<int> _yankSeen = new System.Collections.Generic.HashSet<int>();
-
-        private static void YankItemsFrom(PlayerDamageReceiver target)
-        {
-            try
-            {
-                Vector3 center = target.transform.position;
-                int count = Physics.OverlapSphereNonAlloc(center, DisarmRadius, _overlapBuf,
-                    Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
-                _yankSeen.Clear();
-                int n = 0;
-                for (int i = 0; i < count; i++)
-                {
-                    var col = _overlapBuf[i];
-                    if (col == null) continue;
-                    var rb = col.attachedRigidbody;
-                    if (rb == null) continue;
-                    if (rb.transform.root != null && rb.transform.root.GetComponentInParent<RigManager>() != null)
-                        continue;                                   // это тело игрока — не трогаем
-                    if (!_yankSeen.Add(rb.GetInstanceID())) continue;   // каждое тело один раз
-                    Vector3 dir = rb.position - center; dir.y += 0.4f;
-                    if (dir.sqrMagnitude < 0.0001f) dir = Vector3.up;
-                    try { rb.velocity = dir.normalized * DisarmSpeed; n++; } catch { }
-                }
-                MelonLogger.Msg($"Disarm: ripped {n} items from {target.gameObject.name}.");
-            }
-            catch (Exception e) { MelonLogger.Warning("Disarm: " + e.Message); }
         }
 
         // ---------------- Свой ник: скрытие и цветные DEV-пресеты (LabFusion) ----------------
