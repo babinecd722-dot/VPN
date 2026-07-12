@@ -51,8 +51,6 @@
 а он понимает rich-text теги `<color=…>`, поэтому доступны цветные имена:
 
 - **MONSTER (red / green / gold / cyan / pink)** — цветное имя `MONSTER`.
-- **MONSTER (rainbow)** — ник `MONSTER` переливается цветами (смена раз в 0.5 с через
-  `SendClientSettings`). Видят все. Крутит только цвет — username/плашку не спамит.
 - **DEV (gold)** — золотой `DEV`.
 - **Hide (empty)** — пустой ник (пробел; «пусто» LabFusion откатывает на username).
 - **Reset to default** — вернуть обычный ник.

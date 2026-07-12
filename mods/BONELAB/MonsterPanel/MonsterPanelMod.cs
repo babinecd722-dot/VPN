@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.25.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.25.1", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -92,7 +92,6 @@ namespace MonsterPanel
                 if (Disarm) Aura.DisarmTick();
                 Guards.Tick();
                 NetLightning.Tick();   // авто-удаление отживших сетевых молний
-                NickHider.RainbowTick();
             }
         }
 
@@ -841,7 +840,6 @@ namespace MonsterPanel
                 p.CreateFunction("MONSTER (gold)",  new Color(1f, 0.82f, 0.12f),(Action)(() => SetNick("<color=#ffd21e>MONSTER</color>")));
                 p.CreateFunction("MONSTER (cyan)",  new Color(0.2f, 0.88f, 1f), (Action)(() => SetNick("<color=#20e0ff>MONSTER</color>")));
                 p.CreateFunction("MONSTER (pink)",  new Color(1f, 0.4f, 0.8f),  (Action)(() => SetNick("<color=#ff40c0>MONSTER</color>")));
-                p.CreateFunction("MONSTER (rainbow)", new Color(1f, 0.5f, 0.9f),(Action)StartRainbow);
                 p.CreateFunction("DEV (gold)",      new Color(1f, 0.82f, 0.12f),(Action)(() => SetNick("<color=#ffd21e>DEV</color>")));
                 p.CreateFunction("Hide (empty)",    new Color(0.6f, 0.6f, 0.6f),(Action)(() => SetNick(" ")));
                 p.CreateFunction("Reset to default",new Color(0.8f, 0.8f, 0.8f),(Action)ResetNick);
@@ -849,55 +847,6 @@ namespace MonsterPanel
 
             /// <summary>Кнопка превью аватара — живёт в самой панели, не в подстранице ника.</summary>
             public static void SetAvatarPreview() => SetAvatarModId(6114112);
-
-            // ---- Rainbow MONSTER: ник переливается цветами ----
-            private static bool _rainbow;
-            private static float _rainbowTimer;
-            private static int _rainbowIdx;
-            private const float RainbowStep = 0.5f;   // смена цвета раз в 0.5 с
-            // Палитра радуги (каждый тег ≤32 символов вместе с "MONSTER").
-            private static readonly string[] _rainbowHex =
-            { "ff2020", "ff8000", "ffe000", "20ff40", "20e0ff", "2060ff", "a040ff", "ff40c0" };
-
-            /// <summary>Включить радужный MONSTER: один раз ставим левый username + плашку, дальше цвет крутит тик.</summary>
-            private static void StartRainbow()
-            {
-                _rainbow = true;
-                _rainbowTimer = 0f;
-                _rainbowIdx = 0;
-                // левый username в списке — как у обычных пресетов (один раз).
-                try
-                {
-                    string fake = RandomUsername();
-                    var md = LabFusion.Player.LocalPlayer.Metadata;
-                    if (md != null)
-                    {
-                        try { md.Username?.SetValue(fake); } catch { }
-                        try { md.AvatarTitle?.SetValue(fake); } catch { }
-                    }
-                    Notify("Identity changed", "tag: MONSTER (rainbow) | list: " + fake);
-                    MelonLogger.Msg("Identity: rainbow MONSTER enabled.");
-                }
-                catch (Exception e) { MelonLogger.Warning("Rainbow start: " + e.Message); }
-            }
-
-            /// <summary>Зовётся из OnUpdate: крутим цвет ника, не трогая username/плашку (без спама).</summary>
-            public static void RainbowTick()
-            {
-                if (!_rainbow) return;
-                _rainbowTimer -= Time.deltaTime;
-                if (_rainbowTimer > 0f) return;
-                _rainbowTimer = RainbowStep;
-                _rainbowIdx = (_rainbowIdx + 1) % _rainbowHex.Length;
-                string tag = "<color=#" + _rainbowHex[_rainbowIdx] + ">MONSTER</color>";
-                try
-                {
-                    LabFusion.Preferences.Client.ClientSettings.Nickname.Value = tag;
-                    LabFusion.Preferences.Client.ClientSettings.NicknameVisibility.Value = LabFusion.Senders.NicknameVisibility.SHOW;
-                    SendSettings();
-                }
-                catch (Exception e) { MelonLogger.Warning("Rainbow tick: " + e.Message); }
-            }
 
             private static readonly System.Random _rng = new System.Random();
             private static readonly string[] _handles =
@@ -934,7 +883,6 @@ namespace MonsterPanel
 
             private static void SetNick(string value)
             {
-                _rainbow = false;   // выбрали обычный пресет — радугу выключаем
                 try
                 {
                     if (value != null && value.Length > 32)   // страховка под лимит имени LabFusion
@@ -964,7 +912,6 @@ namespace MonsterPanel
 
             private static void ResetNick()
             {
-                _rainbow = false;   // радугу выключаем
                 try
                 {
                     LabFusion.Preferences.Client.ClientSettings.Nickname.Value = "";   // пусто → откат на платформенный ник
