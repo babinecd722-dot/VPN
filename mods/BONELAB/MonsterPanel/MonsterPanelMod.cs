@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.19.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.20.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -78,6 +78,7 @@ namespace MonsterPanel
             {
                 if (KillAura) Aura.KillTick();
                 if (Disarm) Aura.DisarmTick();
+                Guards.Tick();
             }
         }
 
@@ -206,6 +207,131 @@ namespace MonsterPanel
             }
         }
 
+        // ---------------- Security Guards (сетевой спавн + эскорт) ----------------
+        //
+        // Спавним 3 сетевых NPC «Security Guard» (видят все), берём владение (ИИ считаем мы),
+        // и держим их в эскорте вокруг тебя. Barcode находим сами по названию крейта.
+        // Всё с типами LabFusion/Marrow-warehouse — здесь (JIT только при вызове).
+        private static class Guards
+        {
+            private const int GuardCount = 3;
+            private const float EscortRadius = 2.2f;
+            private const float TickInterval = 0.5f;
+            private static float _timer;
+            private static bool _active;
+            private static string _barcode;
+            private static readonly System.Collections.Generic.List<BehaviourBaseNav> _navs =
+                new System.Collections.Generic.List<BehaviourBaseNav>();
+            private static readonly System.Collections.Generic.List<GameObject> _bodies =
+                new System.Collections.Generic.List<GameObject>();
+
+            public static void Spawn()
+            {
+                string bc = FindBarcode();
+                if (bc == null) { MelonLogger.Msg("Security Guards: crate 'Security Guard' не найден в реестре."); return; }
+                var me = BoneLib.Player.RigManager;
+                if (me == null) { MelonLogger.Msg("Security Guards: нет рига игрока."); return; }
+                Vector3 c = RigPos(me);
+                for (int i = 0; i < GuardCount; i++)
+                {
+                    Vector3 p = c + Quaternion.Euler(0f, i * (360f / GuardCount), 0f) * (Vector3.forward * EscortRadius);
+                    SpawnOne(bc, p);
+                }
+                _active = true;
+                MelonLogger.Msg($"Security Guards: запрошен спавн x{GuardCount}.");
+            }
+
+            public static void Despawn()
+            {
+                _active = false;
+                foreach (var go in _bodies) { if (go != null) { try { UnityEngine.Object.Destroy(go); } catch { } } }
+                _bodies.Clear();
+                _navs.Clear();
+                MelonLogger.Msg("Security Guards: убраны.");
+            }
+
+            /// <summary>Эскорт: держим охранников на точках вокруг тебя (и это же пацифайд — режим follow, не охота).</summary>
+            public static void Tick()
+            {
+                if (!_active || _navs.Count == 0) return;
+                _timer -= Time.deltaTime;
+                if (_timer > 0f) return;
+                _timer = TickInterval;
+
+                var me = BoneLib.Player.RigManager;
+                if (me == null) return;
+                Vector3 c = RigPos(me);
+                for (int i = 0; i < _navs.Count; i++)
+                {
+                    var nav = _navs[i];
+                    if (nav == null) continue;
+                    Vector3 p = c + Quaternion.Euler(0f, i * (360f / GuardCount), 0f) * (Vector3.forward * EscortRadius);
+                    try { nav.SetHomePosition(p, true, false); } catch { }
+                    try { nav.SetPath(p); } catch { }
+                }
+            }
+
+            private static string FindBarcode()
+            {
+                if (!string.IsNullOrEmpty(_barcode)) return _barcode;
+                try
+                {
+                    var wh = Il2CppSLZ.Marrow.Warehouse.AssetWarehouse.Instance;
+                    if (wh == null) return null;
+                    foreach (var crate in wh.GetCrates())
+                    {
+                        if (crate == null) continue;
+                        string t = crate.Title;
+                        if (!string.IsNullOrEmpty(t) &&
+                            t.IndexOf("Security Guard", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            _barcode = crate.Barcode.ID;
+                            MelonLogger.Msg($"Security Guards: crate '{t}' -> {_barcode}");
+                            return _barcode;
+                        }
+                    }
+                    MelonLogger.Msg("Security Guards: крейт с названием 'Security Guard' не найден.");
+                }
+                catch (Exception e) { MelonLogger.Warning("Guards barcode: " + e.Message); }
+                return null;
+            }
+
+            private static void SpawnOne(string barcode, Vector3 pos)
+            {
+                try
+                {
+                    var spawnable = new Spawnable { crateRef = new Il2CppSLZ.Marrow.Warehouse.SpawnableCrateReference(barcode) };
+                    var info = new LabFusion.RPC.NetworkAssetSpawner.SpawnRequestInfo
+                    {
+                        Spawnable = spawnable,
+                        Position = pos,
+                        Rotation = Quaternion.identity,
+                        SpawnEffect = false,
+                        SpawnCallback = OnSpawned,
+                    };
+                    LabFusion.RPC.NetworkAssetSpawner.Spawn(info);
+                }
+                catch (Exception e) { MelonLogger.Warning("Guards spawn: " + e.Message); }
+            }
+
+            private static void OnSpawned(LabFusion.RPC.NetworkAssetSpawner.SpawnCallbackInfo info)
+            {
+                try
+                {
+                    var go = info.Spawned;
+                    if (go != null)
+                    {
+                        _bodies.Add(go);
+                        var nav = go.GetComponentInChildren<BehaviourBaseNav>();
+                        if (nav != null) _navs.Add(nav);
+                    }
+                    // Владение: спавнер и так владелец заспавненного — отдельный TakeOwnership не нужен.
+                    MelonLogger.Msg($"Security Guards: заспавнен (bodies {_bodies.Count}, navs {_navs.Count}).");
+                }
+                catch (Exception e) { MelonLogger.Warning("Guards onSpawned: " + e.Message); }
+            }
+        }
+
         /// <summary>Принадлежит ли трансформ собственному ригу игрока.</summary>
         private static bool IsOwnRig(Transform t)
         {
@@ -231,15 +357,17 @@ namespace MonsterPanel
             page.CreateBool("Disarm", new Color(0.9f, 0.2f, 0.5f), Disarm,
                 v => { Disarm = v; Log("Disarm", v); });
 
-            // Teleport + ник: только когда загружен LabFusion.
+            // Teleport + ник + телохранители: только когда загружен LabFusion.
             if (Teleporter.FusionLoaded)
             {
+                page.CreateFunction("Spawn 3 Bodyguards", new Color(0.2f, 0.55f, 1f), (Action)Guards.Spawn);
+                page.CreateFunction("Despawn Bodyguards", new Color(0.5f, 0.5f, 0.5f), (Action)Guards.Despawn);
                 NickHider.Install(page);
                 Teleporter.Install(page);
-                MelonLogger.Msg("MONSTER Panel: Teleport + Nickname sections added (LabFusion found).");
+                MelonLogger.Msg("MONSTER Panel: Teleport + Nickname + Bodyguards added (LabFusion found).");
             }
             else
-                MelonLogger.Msg("MONSTER Panel: LabFusion not loaded - Teleport/Nickname hidden.");
+                MelonLogger.Msg("MONSTER Panel: LabFusion not loaded - Teleport/Nickname/Bodyguards hidden.");
         }
 
         private static void Log(string name, bool on) =>
