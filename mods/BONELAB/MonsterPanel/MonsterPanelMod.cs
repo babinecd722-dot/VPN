@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.17.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.18.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -415,7 +415,26 @@ namespace MonsterPanel
                 p.CreateFunction("MONSTER (pink)",  new Color(1f, 0.4f, 0.8f),  (Action)(() => SetNick("<color=#ff40c0>MONSTER</color>")));
                 p.CreateFunction("DEV (gold)",      new Color(1f, 0.82f, 0.12f),(Action)(() => SetNick("<color=#ffd21e>DEV</color>")));
                 p.CreateFunction("Hide (empty)",    new Color(0.6f, 0.6f, 0.6f),(Action)(() => SetNick(" ")));
+                p.CreateFunction("Avatar preview 6114112", new Color(0.7f, 0.5f, 1f), (Action)(() => SetAvatarModId(6114112)));
                 p.CreateFunction("Reset to default",new Color(0.8f, 0.8f, 0.8f),(Action)ResetNick);
+            }
+
+            /// <summary>Подменяем превью аватара в списке игроков (mod.io id → иконка/подпись).</summary>
+            private static void SetAvatarModId(int id)
+            {
+                try
+                {
+                    var md = LabFusion.Player.LocalPlayer.Metadata;
+                    if (md == null || md.AvatarModID == null)
+                    {
+                        MelonLogger.Msg("Avatar: metadata unavailable - join a Fusion lobby and retry.");
+                        return;
+                    }
+                    md.AvatarModID.SetValue(id);
+                    Notify("Avatar preview set", "mod " + id);
+                    MelonLogger.Msg($"Avatar: preview mod id set {id} (synced).");
+                }
+                catch (Exception e) { MelonLogger.Warning("Avatar set: " + e.Message); }
             }
 
             private static void SetNick(string value)
