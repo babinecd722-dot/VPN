@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.18.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.19.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -419,6 +419,21 @@ namespace MonsterPanel
                 p.CreateFunction("Reset to default",new Color(0.8f, 0.8f, 0.8f),(Action)ResetNick);
             }
 
+            private static readonly System.Random _rng = new System.Random();
+            private static readonly string[] _handles =
+            {
+                "Shadow", "Ghost", "Reaper", "Nova", "Viper", "Frost", "Blaze", "Rogue",
+                "Cipher", "Storm", "Raven", "Onyx", "Zero", "Havoc", "Wraith", "Echo",
+                "Talon", "Ember", "Kilo", "Delta", "Fox", "Ryder", "Ace", "Neo",
+            };
+
+            /// <summary>Случайный правдоподобный ник (handle + цифры) для строки Username в списке.</summary>
+            private static string RandomUsername()
+            {
+                string h = _handles[_rng.Next(_handles.Length)];
+                return h + _rng.Next(10, 9999);
+            }
+
             /// <summary>Подменяем превью аватара в списке игроков (mod.io id → иконка/подпись).</summary>
             private static void SetAvatarModId(int id)
             {
@@ -448,18 +463,20 @@ namespace MonsterPanel
                     LabFusion.Preferences.Client.ClientSettings.NicknameVisibility.Value = LabFusion.Senders.NicknameVisibility.SHOW;
                     SendSettings();
 
-                    // 2) Username и имя аватара в списке игроков — тоже метаданные, синхронизируются.
-                    //    Так меняются ОБЕ строки имени в ростере (не только Nickname), и подпись аватара.
+                    // 2) Username в списке игроков — СЛУЧАЙНЫЙ левый ник (не связан с тегом над головой):
+                    //    в ростере будто отдельный игрок, а над головой — выбранный ник. AvatarTitle тоже
+                    //    делаем случайным, чтобы подпись аватара не выдавала настоящий ник.
+                    string fake = RandomUsername();
                     var md = LabFusion.Player.LocalPlayer.Metadata;
                     if (md != null)
                     {
-                        try { md.Username?.SetValue(value); } catch { }
-                        try { md.AvatarTitle?.SetValue(value); } catch { }
+                        try { md.Username?.SetValue(fake); } catch { }
+                        try { md.AvatarTitle?.SetValue(fake); } catch { }
                     }
 
                     string shown = StripTags(value);
-                    Notify("Identity changed", string.IsNullOrWhiteSpace(shown) ? "(empty)" : shown);
-                    MelonLogger.Msg($"Identity: nick + username + avatar-title set '{value}' (synced).");
+                    Notify("Identity changed", $"tag: {(string.IsNullOrWhiteSpace(shown) ? "(empty)" : shown)} | list: {fake}");
+                    MelonLogger.Msg($"Identity: nametag '{value}', list username '{fake}' (random, synced).");
                 }
                 catch (Exception e) { MelonLogger.Warning("Identity set: " + e.Message); }
             }
