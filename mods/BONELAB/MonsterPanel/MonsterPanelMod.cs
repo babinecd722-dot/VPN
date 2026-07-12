@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.12.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.13.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -564,38 +564,71 @@ namespace MonsterPanel
 
             private static void SetNick(string value)
             {
-                var md = Metadata();
-                if (md == null) return;
                 try
                 {
-                    if (value.Length > 32)   // страховка под лимит имени LabFusion
+                    if (value != null && value.Length > 32)   // страховка под лимит имени LabFusion
                         value = value.Substring(0, 32);
-                    md.Nickname.SetValue(value);
-                    // Читаем обратно — подтверждение, что применилось (свой ник над собой ты НЕ видишь,
-                    // его видят только другие игроки; проверять — по второму игроку).
-                    string readback = md.Nickname.GetValueOrEmpty();
-                    MelonLogger.Msg($"Nickname: set '{value}', metadata now '{readback}'. You don't see your own tag - check from another player's view.");
+                    // Применяем ник через настройки LabFusion — он раскидывает его ВЕЗДЕ:
+                    // nametag, меню Fusion, и синхронизирует другим игрокам.
+                    LabFusion.Preferences.Client.ClientSettings.Nickname.Value = value;
+                    LabFusion.Preferences.Client.ClientSettings.NicknameVisibility.Value = LabFusion.Senders.NicknameVisibility.SHOW;
+                    SendSettings();
+
+                    string shown = StripTags(value);
+                    Notify("Nickname changed", string.IsNullOrWhiteSpace(shown) ? "(empty)" : shown);
+                    MelonLogger.Msg($"Nickname: set '{value}' via ClientSettings (synced everywhere).");
                 }
                 catch (Exception e) { MelonLogger.Warning("Nickname set: " + e.Message); }
             }
 
             private static void ResetNick()
             {
-                var md = Metadata();
-                if (md == null) return;
-                try { md.Nickname.Remove(); MelonLogger.Msg("Nickname: reset to default."); }
+                try
+                {
+                    LabFusion.Preferences.Client.ClientSettings.Nickname.Value = "";   // пусто → откат на платформенный ник
+                    SendSettings();
+                    Notify("Nickname reset", "default");
+                    MelonLogger.Msg("Nickname: reset to default.");
+                }
                 catch (Exception e) { MelonLogger.Warning("Nickname reset: " + e.Message); }
             }
 
-            private static LabFusion.Player.PlayerMetadata Metadata()
+            /// <summary>Проталкиваем настройки клиента по сети (метод internal — зовём рефлексией).</summary>
+            private static void SendSettings()
             {
-                var md = LabFusion.Player.LocalPlayer.Metadata;
-                if (md == null || md.Nickname == null)
+                try { AccessTools.Method("LabFusion.Preferences.FusionPreferences:SendClientSettings")?.Invoke(null, null); }
+                catch (Exception e) { MelonLogger.Warning("Nickname send: " + e.Message); }
+            }
+
+            /// <summary>Всплывающая плашка LabFusion — сразу видно, что ник сменился.</summary>
+            private static void Notify(string title, string message)
+            {
+                try
                 {
-                    MelonLogger.Msg("Nickname: metadata unavailable - join a Fusion lobby and retry.");
-                    return null;
+                    var n = new LabFusion.UI.Popups.Notification();
+                    n.Title = title;                 // string → NotificationText (неявное преобразование)
+                    n.Message = message;
+                    n.Type = LabFusion.UI.Popups.NotificationType.SUCCESS;
+                    n.ShowPopup = true;
+                    n.PopupLength = 3f;
+                    LabFusion.UI.Popups.Notifier.Send(n);
                 }
-                return md;
+                catch (Exception e) { MelonLogger.Warning("Nickname notify: " + e.Message); }
+            }
+
+            /// <summary>Срезаем rich-text теги для читаемого текста плашки.</summary>
+            private static string StripTags(string s)
+            {
+                if (string.IsNullOrEmpty(s)) return s;
+                var sb = new System.Text.StringBuilder(s.Length);
+                bool inTag = false;
+                foreach (char c in s)
+                {
+                    if (c == '<') { inTag = true; continue; }
+                    if (c == '>') { inTag = false; continue; }
+                    if (!inTag) sb.Append(c);
+                }
+                return sb.ToString().Trim();
             }
         }
 
