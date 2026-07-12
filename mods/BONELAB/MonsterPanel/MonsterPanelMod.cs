@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.22.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.23.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -147,7 +147,10 @@ namespace MonsterPanel
         private static readonly Collider[] _overlapBuf = new Collider[64];
         private static readonly System.Collections.Generic.HashSet<int> _yankSeen = new System.Collections.Generic.HashSet<int>();
 
-        /// <summary>Вырываем силой отдельные предметы (стволы) в радиусе точки. Тела ригов не трогаем.</summary>
+        /// <summary>Вырываем предметы (стволы) в радиусе точки. Ключ: сперва ЗАБИРАЕМ владение
+        /// сетевой сущностью (NetworkEntity.TakeOwnership) — иначе позицией предмета владеет чужой
+        /// клиент и наш velocity сразу перетирается синхронизацией. Забрав владение, хват срывается
+        /// и швырок «прилипает». Тела ригов не трогаем.</summary>
         private static void YankItemsAt(Vector3 center)
         {
             try
@@ -164,12 +167,31 @@ namespace MonsterPanel
                     if (rb.transform.root != null && rb.transform.root.GetComponentInParent<RigManager>() != null)
                         continue;                                   // тело игрока — не трогаем
                     if (!_yankSeen.Add(rb.GetInstanceID())) continue;
+
+                    TakeItemOwnership(col);                         // забрать владение по сети, иначе швырок бесполезен
+
                     Vector3 dir = rb.position - center; dir.y += 0.4f;
                     if (dir.sqrMagnitude < 0.0001f) dir = Vector3.up;
                     try { rb.velocity = dir.normalized * DisarmSpeed; } catch { }
                 }
             }
             catch (Exception e) { MelonLogger.Warning("Disarm: " + e.Message); }
+        }
+
+        /// <summary>Резолвим предмет → MarrowEntity → NetworkEntity и забираем владение себе.
+        /// Тогда чужой хват срывается и предмет подчиняется нашей физике.</summary>
+        private static void TakeItemOwnership(Collider col)
+        {
+            try
+            {
+                var me = col.GetComponentInParent<Il2CppSLZ.Marrow.Interaction.MarrowEntity>();
+                if (me == null) return;
+                var ne = LabFusion.Entities.IMarrowEntityExtender.Cache.Get(me);
+                if (ne == null) return;                             // не сетевой предмет — просто физика
+                if (ne.IsOwner) return;                             // уже наш
+                LabFusion.Entities.NetworkEntityManager.TakeOwnership(ne);
+            }
+            catch { }                                              // не сетевой/недоступен — не критично
         }
 
         // Весь код с типами LabFusion — здесь (JIT только при загруженном Fusion).
