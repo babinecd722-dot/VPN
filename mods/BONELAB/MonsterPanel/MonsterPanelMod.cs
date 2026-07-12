@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.20.1", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.20.2", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -355,7 +355,9 @@ namespace MonsterPanel
 
         private void BuildMenu()
         {
-            Page page = Page.Root.CreatePage("MONSTER Panel", Color.red);
+            // Большой maxElements — чтобы BoneMenu НЕ разбивал страницу на под-страницы со стрелками.
+            // Пагинация (индекс-страницы) в этой версии BoneMenu крашит GUIPool при листании.
+            Page page = Page.Root.CreatePage("MONSTER Panel", Color.red, 64, true);
             page.CreateBool("Invincible", Color.green, Invincible, v => { Invincible = v; Log("Invincible", v); });
             page.CreateBool("Monster Damage", new Color(1f, 0.4f, 0f), MonsterDamage,
                 v => { MonsterDamage = v; Log("Monster Damage", v); });
@@ -545,7 +547,7 @@ namespace MonsterPanel
         {
             public static void Install(Page root)
             {
-                Page p = root.CreatePage("Nickname", new Color(0.5f, 0.8f, 1f), 16, true);
+                Page p = root.CreatePage("Nickname", new Color(0.5f, 0.8f, 1f), 64, true);   // без пагинации/стрелок
                 // Пресеты MONSTER в цвете (каждый ≤32 символов вместе с тегами).
                 p.CreateFunction("MONSTER (red)",   new Color(1f, 0.2f, 0.2f), (Action)(() => SetNick("<color=#ff2020>MONSTER</color>")));
                 p.CreateFunction("MONSTER (green)", new Color(0.2f, 1f, 0.3f),  (Action)(() => SetNick("<color=#20ff40>MONSTER</color>")));
@@ -698,7 +700,7 @@ namespace MonsterPanel
             /// <summary>Создаёт подстраницу Teleport в корне панели и вешает авто-обновление списка.</summary>
             public static void Install(Page root)
             {
-                _page = root.CreatePage("Teleport", new Color(0.3f, 0.7f, 1f), 16, true);
+                _page = root.CreatePage("Teleport", new Color(0.3f, 0.7f, 1f), 64, true);   // без пагинации/стрелок
                 if (!_hooked)
                 {
                     Menu.OnPageOpened += (Action<Page>)OnPageOpened;
