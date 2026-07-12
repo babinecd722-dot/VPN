@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.11.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.11.1", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -129,8 +129,8 @@ namespace MonsterPanel
 
             // Кнопка «выстрела»: срабатывает и на grip (средний палец), и на триггер (указательный) —
             // что нажмёшь, то и сработает. Значения пишем в лог, чтобы точно видеть, какая кнопка идёт.
-            float gripF = SafeAxis(() => controller.GetGripForce());
-            float trigF = SafeAxis(() => controller.GetIndexCurlAxis());
+            float gripF = SafeGrip(controller);
+            float trigF = SafeTrigger(controller);
             bool fire = gripF > RkGripThreshold || trigF > RkTriggerThreshold;
             bool firedNow = fire && !state.FirePrev;
 
@@ -180,23 +180,25 @@ namespace MonsterPanel
             state.FirePrev = fire;
         }
 
-        /// <summary>Безопасно читаем ось контроллера (0, если метод кинул).</summary>
-        private static float SafeAxis(Func<float> read)
-        {
-            try { return read(); } catch { return 0f; }
-        }
+        // Читаем оси контроллера без аллокаций (без лямбд — это горячий путь каждый кадр).
+        private static float SafeGrip(BaseController c) { try { return c.GetGripForce(); } catch { return 0f; } }
+        private static float SafeTrigger(BaseController c) { try { return c.GetIndexCurlAxis(); } catch { return 0f; } }
+
+        // Переиспользуемый буфер для SphereCastNonAlloc — не мусорим массивами каждый кадр.
+        private static readonly RaycastHit[] _castBuf = new RaycastHit[32];
 
         /// <summary>«Толстый» луч (SphereCast) из руки → ближайший игрок (PlayerDamageReceiver), не считая себя.</summary>
         private static PlayerDamageReceiver FindTargetPlayer(Transform hand, out RaycastHit bestHit)
         {
             bestHit = default;
             Vector3 origin = hand.position + hand.forward * 0.3f;
-            var hits = Physics.SphereCastAll(origin, RkAimRadius, hand.forward, RkRange,
+            int count = Physics.SphereCastNonAlloc(origin, RkAimRadius, hand.forward, _castBuf, RkRange,
                 Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
             PlayerDamageReceiver best = null;
             float bestDist = float.MaxValue;
-            foreach (var h in hits)
+            for (int i = 0; i < count; i++)
             {
+                RaycastHit h = _castBuf[i];
                 if (h.collider == null) continue;
                 var recv = h.collider.GetComponentInParent<PlayerDamageReceiver>();
                 if (recv == null) continue;
@@ -560,9 +562,7 @@ namespace MonsterPanel
         private static void DisarmHand(Transform hand, BaseController controller, ref bool prev)
         {
             if (hand == null || controller == null) { prev = false; return; }
-            float gripF = SafeAxis(() => controller.GetGripForce());
-            float trigF = SafeAxis(() => controller.GetIndexCurlAxis());
-            bool fire = gripF > RkGripThreshold || trigF > RkTriggerThreshold;
+            bool fire = SafeGrip(controller) > RkGripThreshold || SafeTrigger(controller) > RkTriggerThreshold;
 
             if (fire && !prev)
             {
@@ -573,23 +573,27 @@ namespace MonsterPanel
             prev = fire;
         }
 
+        private static readonly Collider[] _overlapBuf = new Collider[64];
+        private static readonly System.Collections.Generic.HashSet<int> _yankSeen = new System.Collections.Generic.HashSet<int>();
+
         private static void YankItemsFrom(PlayerDamageReceiver target)
         {
             try
             {
                 Vector3 center = target.transform.position;
-                var cols = Physics.OverlapSphere(center, DisarmRadius,
+                int count = Physics.OverlapSphereNonAlloc(center, DisarmRadius, _overlapBuf,
                     Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
-                var done = new System.Collections.Generic.HashSet<int>();
+                _yankSeen.Clear();
                 int n = 0;
-                foreach (var col in cols)
+                for (int i = 0; i < count; i++)
                 {
+                    var col = _overlapBuf[i];
                     if (col == null) continue;
                     var rb = col.attachedRigidbody;
                     if (rb == null) continue;
                     if (rb.transform.root != null && rb.transform.root.GetComponentInParent<RigManager>() != null)
                         continue;                                   // это тело игрока — не трогаем
-                    if (!done.Add(rb.GetInstanceID())) continue;    // каждое тело один раз
+                    if (!_yankSeen.Add(rb.GetInstanceID())) continue;   // каждое тело один раз
                     Vector3 dir = rb.position - center; dir.y += 0.4f;
                     if (dir.sqrMagnitude < 0.0001f) dir = Vector3.up;
                     try { rb.velocity = dir.normalized * DisarmSpeed; n++; } catch { }
