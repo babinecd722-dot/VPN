@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.26.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.26.1", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -91,7 +91,7 @@ namespace MonsterPanel
                 if (KillAura) Aura.KillTick();
                 if (Disarm) Aura.DisarmTick();
                 Guards.Tick();
-                Lightning.Tick();   // гасим отжившие болты молнии
+                NetLightning.Tick();   // авто-удаление отживших сетевых молний
             }
         }
 
@@ -205,6 +205,9 @@ namespace MonsterPanel
         private static class Aura
         {
             private static float _killTimer, _disarmTimer, _logTimer;
+            // позиции груди задетых целей — для сетевой молнии (round-robin), переиспользуем список.
+            private static readonly System.Collections.Generic.List<Vector3> _hitPos =
+                new System.Collections.Generic.List<Vector3>();
             /// <summary>Kill Aura: с частотой AuraRate/сек — макс. урон цели(ям).
             /// Режим ALL (AuraGlobal) — по всем; иначе только по AuraTargetSid.
             /// AuraIgnoreDist — без ограничения радиуса.</summary>
@@ -221,7 +224,8 @@ namespace MonsterPanel
                 bool useDist = !AuraIgnoreDist;
                 float r2 = AuraRange * AuraRange;
 
-                bool doLight = Lightning.Ready(1f / rate);   // общий троттл молнии на все цели
+                bool doNet = NetLightning.Ready(1f / rate);   // троттл сетевой молнии (видят все)
+                if (doNet) _hitPos.Clear();
 
                 try
                 {
@@ -237,9 +241,10 @@ namespace MonsterPanel
                         if (useDist && (tp - me).sqrMagnitude > r2) continue;
                         foreach (var recv in rig.GetComponentsInChildren<PlayerDamageReceiver>())
                             if (recv != null) SendAttackTo(recv, me);
-                        if (doLight) Lightning.Strike(tp);   // молния бьёт ровно в игрока
+                        if (doNet) _hitPos.Add(tp);   // копим позиции груди для сетевой молнии
                         hit++;
                     }
+                    if (doNet) NetLightning.StrikeOne(_hitPos);   // один сетевой удар за залп (round-robin)
                     // лог не чаще раза в 2 сек, иначе спам на высокой скорости
                     _logTimer -= 1f / rate;
                     if (hit > 0 && _logTimer <= 0f)
@@ -708,123 +713,122 @@ namespace MonsterPanel
                 if (rb != null) { try { rb.velocity = v; } catch { } }
         }
 
-        // ---------------- Молния (локальный пул, бьёт РОВНО в игрока) ----------------
+        // ---------------- Сетевая молния (видят ВСЕ) ----------------
         //
-        // Сетевую молнию убрал: единственный «lightning» в реестре — это пушка Lightning Blaster,
-        // она падает физическим объектом рядом (не удар), плюс частый спавн/деспавн ловит ошибки
-        // LabFusion (дубли entity id). Поэтому молния локальная (видишь ты), зато точная и без лагов:
-        //  - фикс-пул болтов (никаких Instantiate/Destroy в кадре, без GC);
-        //  - удар = только переставить точки зигзага + включить объект;
-        //  - троттл (LightningInterval) — не каждый тик.
-        private static class Lightning
+        // Спавним настоящий сетевой электро-объект РОВНО в грудь цели через NetworkAssetSpawner,
+        // поэтому эффект видят все (у других мода нет — но Fusion сам синхронит заспавненное).
+        // Позиция — точно по игроку (грудь), а не с offset над головой (раньше падало «рядом»).
+        // Чтобы не лагало и не засоряло лобби: один удар за залп (round-robin), авто-удаление
+        // по таймеру, кап одновременных.
+        private static class NetLightning
         {
-            private const int PoolSize = 14;      // максимум одновременных болтов
-            private const int Segments = 8;       // точек в болте (зигзаг)
-            private const float Life = 0.12f;     // сколько болт виден
-            private const float Height = 7f;      // высота удара сверху
-            private const float LightningInterval = 0.28f;   // как часто бьём молнией (не каждый тик!)
+            private const float NetInterval = 0.45f;  // как часто сетевой удар (сек)
+            private const float Life = 0.7f;          // сколько объект живёт до авто-удаления
+            private const int MaxConcurrent = 6;      // кап одновременных
 
-            private static GameObject[] _pool;
-            private static LineRenderer[] _lines;
-            private static float[] _life;
-            private static int _next;
-            private static bool _init;
+            private static readonly string[] _keywords =
+            { "lightning", "electric", "tesla", "shock", "zeus", "spark", "arc", "bolt", "zap" };
+
+            private static string _barcode;
+            private static bool _searched;
             private static float _timer;
+            private static int _rr;
 
-            /// <summary>Готова ли молния ударить в этом тике (общий троттл на все цели).</summary>
+            private struct Pending { public ushort id; public float despawnAt; }
+            private static readonly System.Collections.Generic.List<Pending> _pending =
+                new System.Collections.Generic.List<Pending>();
+
+            /// <summary>Готов ли сетевой удар (троттл + сервер + найден крейт + не превышен кап).</summary>
             public static bool Ready(float dt)
             {
                 if (!AuraLightning) return false;
+                bool srv = false; try { srv = LabFusion.Network.NetworkInfo.HasServer; } catch { }
+                if (!srv) return false;
+                if (Barcode() == null) return false;
+                if (_pending.Count >= MaxConcurrent) return false;
                 _timer -= dt;
                 if (_timer > 0f) return false;
-                _timer = LightningInterval;
+                _timer = NetInterval;
                 return true;
             }
 
-            private static void Init()
+            private static string Barcode()
             {
-                if (_init) return;
-                _init = true;
+                if (_searched) return _barcode;
                 try
                 {
-                    Shader sh = Shader.Find("Universal Render Pipeline/Particles/Unlit");
-                    if (sh == null) sh = Shader.Find("Sprites/Default");
-                    if (sh == null) sh = Shader.Find("Unlit/Color");
-                    if (sh == null) sh = Shader.Find("Hidden/Internal-Colored");
-                    Material mat = sh != null ? new Material(sh) : null;
-                    if (mat != null) { try { mat.color = new Color(0.7f, 0.9f, 1f); } catch { } }
-
-                    _pool = new GameObject[PoolSize];
-                    _lines = new LineRenderer[PoolSize];
-                    _life = new float[PoolSize];
-                    for (int i = 0; i < PoolSize; i++)
+                    var wh = Il2CppSLZ.Marrow.Warehouse.AssetWarehouse.Instance;
+                    if (wh == null) return null;   // реестр ещё не готов — попробуем позже
+                    _searched = true;
+                    foreach (var crate in wh.GetCrates())
                     {
-                        var go = new GameObject("mp_bolt");
-                        UnityEngine.Object.DontDestroyOnLoad(go);
-                        var lr = go.AddComponent<LineRenderer>();
-                        lr.positionCount = Segments;
-                        lr.widthMultiplier = 0.11f;
-                        lr.numCapVertices = 1;
-                        lr.useWorldSpace = true;
-                        if (mat != null) lr.material = mat;
-                        lr.startColor = new Color(0.85f, 0.95f, 1f);
-                        lr.endColor = new Color(0.4f, 0.7f, 1f);
-
-                        var lgo = new GameObject("mp_boltlight");
-                        lgo.transform.SetParent(go.transform, false);
-                        var lt = lgo.AddComponent<Light>();
-                        lt.type = LightType.Point;
-                        lt.color = new Color(0.6f, 0.85f, 1f);
-                        lt.intensity = 8f;
-                        lt.range = 7f;
-
-                        go.SetActive(false);
-                        _pool[i] = go; _lines[i] = lr; _life[i] = 0f;
+                        if (crate == null) continue;
+                        string t = crate.Title;
+                        if (string.IsNullOrEmpty(t)) continue;
+                        string tl = t.ToLowerInvariant();
+                        foreach (var kw in _keywords)
+                            if (tl.Contains(kw))
+                            {
+                                _barcode = crate.Barcode.ID;
+                                MelonLogger.Msg($"Net Lightning: crate '{t}' -> {_barcode}");
+                                return _barcode;
+                            }
                     }
-                    MelonLogger.Msg($"Lightning: pool ready ({PoolSize}), shader={(sh != null ? sh.name : "none - lights only")}.");
+                    MelonLogger.Msg("Net Lightning: электро-крейт (lightning/electric/...) не найден в реестре.");
                 }
-                catch (Exception e) { MelonLogger.Warning("Lightning init: " + e.Message); }
+                catch (Exception e) { MelonLogger.Warning("Net Lightning barcode: " + e.Message); }
+                return _barcode;
             }
 
-            /// <summary>Ударить молнией РОВНО в точку (грудь игрока). Переиспользуем болт из пула.</summary>
-            public static void Strike(Vector3 target)
+            /// <summary>Один сетевой удар за залп: спавним РОВНО в грудь цели (round-robin).</summary>
+            public static void StrikeOne(System.Collections.Generic.List<Vector3> targets)
+            {
+                if (targets == null || targets.Count == 0 || _barcode == null) return;
+                try
+                {
+                    _rr = (_rr + 1) % targets.Count;
+                    Vector3 pos = targets[_rr];   // ровно грудь игрока (ChestPos), без offset над головой
+                    var spawnable = new Spawnable { crateRef = new Il2CppSLZ.Marrow.Warehouse.SpawnableCrateReference(_barcode) };
+                    var info = new LabFusion.RPC.NetworkAssetSpawner.SpawnRequestInfo
+                    {
+                        Spawnable = spawnable,
+                        Position = pos,
+                        Rotation = Quaternion.identity,
+                        SpawnEffect = false,
+                        SpawnCallback = OnSpawned,
+                    };
+                    LabFusion.RPC.NetworkAssetSpawner.Spawn(info);
+                }
+                catch (Exception e) { MelonLogger.Warning("Net Lightning spawn: " + e.Message); }
+            }
+
+            private static void OnSpawned(LabFusion.RPC.NetworkAssetSpawner.SpawnCallbackInfo info)
             {
                 try
                 {
-                    Init();
-                    if (_pool == null) return;
-                    int i = _next; _next = (_next + 1) % PoolSize;
-                    var go = _pool[i]; if (go == null) return;
-                    var lr = _lines[i];
-                    Vector3 top = target + Vector3.up * Height;
-                    for (int k = 0; k < Segments; k++)
-                    {
-                        float t = k / (float)(Segments - 1);
-                        Vector3 p = Vector3.Lerp(top, target, t);
-                        if (k != 0 && k != Segments - 1)   // концы фиксированы (верх и ровно цель), середина — зигзаг
-                        {
-                            p.x += UnityEngine.Random.Range(-0.32f, 0.32f);
-                            p.z += UnityEngine.Random.Range(-0.32f, 0.32f);
-                        }
-                        lr.SetPosition(k, p);
-                    }
-                    go.transform.position = target;   // точечный свет — ровно в цель
-                    _life[i] = Life;
-                    go.SetActive(true);
+                    var ent = info.Entity;
+                    if (ent == null) return;
+                    _pending.Add(new Pending { id = ent.ID, despawnAt = Time.time + Life });
                 }
-                catch { }
+                catch (Exception e) { MelonLogger.Warning("Net Lightning onSpawn: " + e.Message); }
             }
 
-            /// <summary>Гасим отжившие болты (дёшево — цикл по пулу).</summary>
+            /// <summary>Убираем отжившие сетевые объекты по таймеру (авто-очистка у всех).</summary>
             public static void Tick()
             {
-                if (_pool == null) return;
-                for (int i = 0; i < _pool.Length; i++)
+                if (_pending.Count == 0) return;
+                float now = Time.time;
+                for (int i = _pending.Count - 1; i >= 0; i--)
                 {
-                    var go = _pool[i];
-                    if (go == null || !go.activeSelf) continue;
-                    _life[i] -= Time.deltaTime;
-                    if (_life[i] <= 0f) go.SetActive(false);
+                    if (now < _pending[i].despawnAt) continue;
+                    ushort id = _pending[i].id;
+                    _pending.RemoveAt(i);
+                    try
+                    {
+                        LabFusion.RPC.NetworkAssetSpawner.Despawn(new LabFusion.RPC.NetworkAssetSpawner.DespawnRequestInfo
+                        { EntityID = id, DespawnEffect = true });
+                    }
+                    catch { }
                 }
             }
         }
