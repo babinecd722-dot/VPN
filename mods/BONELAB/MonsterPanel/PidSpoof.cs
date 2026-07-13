@@ -80,7 +80,7 @@ namespace MonsterPanel
             if (string.IsNullOrEmpty(SpoofPlatformId))
                 StartEnsure();
             else
-                ApplyNow();
+                MelonCoroutines.Start(ApplyImmediate(notify: true));
         }
 
         private static void StartEnsure()
@@ -125,7 +125,7 @@ namespace MonsterPanel
                 }
                 else
                 {
-                    ApplyNow();
+                    yield return ApplyImmediate(notify: true);
                 }
             }
 
@@ -295,11 +295,74 @@ namespace MonsterPanel
 
             SpoofPlatformId = pid;
             Save();
-            ApplyNow();
             SyncAuthManagerLocalUserId(created);
             MelonLogger.Msg("Spoofing PID: zero account ready (pid=" + Short(pid) +
                             ", device=" + SpoofDeviceModel + ", original=" + Short(OriginalPlatformId) + ").");
+
+            // Drop provisioning lock FIRST so SetPlatformID hook can force the spoof, then apply now
+            // (no restart needed) and show confirmation.
             _provisioning = false;
+            yield return ApplyImmediate(notify: true, createdUser: created);
+        }
+
+        /// <summary>
+        /// Force LocalPlatformID → spoof PID right now, re-apply a few frames (beat Fusion races),
+        /// optional Fusion popup "PID spoofed".
+        /// </summary>
+        private static IEnumerator ApplyImmediate(bool notify, ProductUserId createdUser = null)
+        {
+            if (!Enabled || string.IsNullOrEmpty(SpoofPlatformId))
+                yield break;
+
+            ApplyNow();
+            if (createdUser != null)
+                SyncAuthManagerLocalUserId(createdUser);
+            else
+            {
+                try
+                {
+                    ProductUserId u = ProductUserId.FromString(SpoofPlatformId);
+                    if (u != null && u.IsValid())
+                        SyncAuthManagerLocalUserId(u);
+                }
+                catch { }
+            }
+
+            // Re-assert over the next frames in case Fusion rewrites identity after CreateUser/login.
+            for (int i = 0; i < 10; i++)
+            {
+                yield return null;
+                if (!Enabled) yield break;
+                ApplyNow();
+            }
+
+            string live = null;
+            try { live = PlayerIDManager.LocalPlatformID; } catch { }
+            bool ok = string.Equals(live, SpoofPlatformId, StringComparison.Ordinal);
+            MelonLogger.Msg(ok
+                ? "Spoofing PID: applied immediately (pid=" + Short(SpoofPlatformId) + ")."
+                : "Spoofing PID: apply mismatch live=" + Short(live) + " spoof=" + Short(SpoofPlatformId));
+
+            if (notify)
+                Notify("PID spoofed", ok ? Short(SpoofPlatformId) : "check Latest.log");
+        }
+
+        private static void Notify(string title, string message)
+        {
+            try
+            {
+                var n = new LabFusion.UI.Popups.Notification();
+                n.Title = title;
+                n.Message = message;
+                n.Type = LabFusion.UI.Popups.NotificationType.SUCCESS;
+                n.ShowPopup = true;
+                n.PopupLength = 3.5f;
+                LabFusion.UI.Popups.Notifier.Send(n);
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Spoofing PID: notify — " + e.Message);
+            }
         }
 
         private static IEnumerator LogoutCurrent(ConnectInterface connect)
