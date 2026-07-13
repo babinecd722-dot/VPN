@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.IO;
 using System.Reflection;
+using System.Text;
 using BoneLib.BoneMenu;
 using Epic.OnlineServices;
 using Epic.OnlineServices.Connect;
@@ -13,23 +14,41 @@ using UnityEngine;
 namespace MonsterPanel
 {
     /// <summary>
-    /// Spoofing PID (Quest / EOS ProductUserId).
+    /// Spoofing PID — Quest / EOS ProductUserId.
     ///
-    /// First enable: silently provisions a fresh EOS DeviceId + CreateUser ("zero" Fusion
-    /// account), stores its Platform ID to disk, and swaps LocalPlatformID to it.
-    /// While enabled: every SetPlatformID call is forced to the saved zero-account ID
-    /// so Fusion never keeps the real account PID.
+    /// Zero-account is a SEPARATE EOS ProductUserId created via Connect.CreateUser
+    /// after DeleteDeviceId + CreateDeviceId (fresh device credential, not the original).
+    /// Original PID is remembered in the config file; LocalPlatformID is forced to the
+    /// zero PID while the toggle is on.
+    ///
+    /// During first provision we temporarily spoof SystemInfo device fingerprint and
+    /// pass a randomized DeviceModel into CreateDeviceId so the new credential isn't
+    /// tied to the real device label. No IP changes.
     /// </summary>
     internal static class PidSpoof
     {
         public static bool Enabled { get; private set; }
         public static string SpoofPlatformId { get; private set; } = "";
         public static string OriginalPlatformId { get; private set; } = "";
+        public static string SpoofDeviceModel { get; private set; } = "";
 
         private static bool _hooked;
+        private static bool _deviceHooksInstalled;
         private static bool _provisioning;
         private static bool _ensureStarted;
+        private static bool _fingerprintActive;
         private static HarmonyLib.Harmony _harmony;
+
+        private static string _fakeDeviceModel = "";
+        private static string _fakeDeviceName = "";
+        private static string _fakeDeviceUid = "";
+        private static string _fakeOs = "";
+
+        private static readonly string[] QuestModels =
+        {
+            "Quest 2", "Quest 3", "Quest 3S", "Meta Quest 2", "Meta Quest 3",
+            "Oculus Quest 2", "Pacific", "Seacliff", "Eureka",
+        };
 
         private const string FileName = "pid_spoof.cfg";
         private const float ConnectWaitSeconds = 90f;
@@ -38,7 +57,8 @@ namespace MonsterPanel
         {
             _harmony = harmony;
             Load();
-            InstallHook();
+            InstallPidHook();
+            InstallDeviceHooks();
             if (Enabled)
                 StartEnsure();
         }
@@ -58,7 +78,7 @@ namespace MonsterPanel
                 return;
 
             if (string.IsNullOrEmpty(SpoofPlatformId))
-                StartEnsure(); // first enable → silent EOS CreateUser
+                StartEnsure();
             else
                 ApplyNow();
         }
@@ -72,7 +92,6 @@ namespace MonsterPanel
 
         private static IEnumerator EnsureRoutine()
         {
-            // Wait until EOS Connect is up (Fusion logged into Epic Online Services).
             float waited = 0f;
             while (GetConnect() == null && waited < ConnectWaitSeconds)
             {
@@ -82,12 +101,11 @@ namespace MonsterPanel
 
             if (GetConnect() == null)
             {
-                MelonLogger.Warning("Spoofing PID: EOS Connect not ready — enable Spoofing PID after Fusion EOS login.");
+                MelonLogger.Warning("Spoofing PID: EOS Connect not ready — turn it on after Fusion EOS login.");
                 _ensureStarted = false;
                 yield break;
             }
 
-            // Capture whatever Fusion currently thinks is us (real account), once.
             TryRememberOriginal(PlayerIDManager.LocalPlatformID);
 
             if (Enabled && string.IsNullOrEmpty(SpoofPlatformId))
@@ -96,12 +114,11 @@ namespace MonsterPanel
             }
             else if (Enabled && !string.IsNullOrEmpty(SpoofPlatformId))
             {
-                // Device binding lost (e.g. app data wipe) → Connect user ≠ saved spoof.
-                // Re-provision a fresh zero account and overwrite the file.
                 string live = GetLoggedInProductUserId();
-                if (!string.IsNullOrEmpty(live) && !string.Equals(live, SpoofPlatformId, StringComparison.Ordinal))
+                if (!string.IsNullOrEmpty(live) &&
+                    !string.Equals(live, SpoofPlatformId, StringComparison.Ordinal))
                 {
-                    MelonLogger.Msg("Spoofing PID: saved PID not bound to this device — provisioning new zero account.");
+                    MelonLogger.Msg("Spoofing PID: saved PID not bound on this device — provisioning new zero account.");
                     SpoofPlatformId = "";
                     Save();
                     yield return ProvisionZeroAccount();
@@ -116,9 +133,11 @@ namespace MonsterPanel
         }
 
         /// <summary>
-        /// Silent EOS zero-account provision (Quest DeviceId path):
-        /// Logout → DeleteDeviceId → CreateDeviceId → Login(DeviceidAccessToken) →
-        /// CreateUser(ContinuanceToken) → save ProductUserId → SetPlatformID.
+        /// Silent provision of a SEPARATE EOS zero account:
+        /// Logout → DeleteDeviceId (drop original device credential) →
+        /// CreateDeviceId (fresh credential + spoofed DeviceModel/SystemInfo) →
+        /// Login(DeviceidAccessToken) → CreateUser → save new ProductUserId.
+        /// Original ProductUserId stays in config as original= (separate identity).
         /// </summary>
         private static IEnumerator ProvisionZeroAccount()
         {
@@ -134,21 +153,23 @@ namespace MonsterPanel
             }
 
             TryRememberOriginal(PlayerIDManager.LocalPlatformID);
+            BeginFingerprintSpoof();
 
-            // 1) Logout current Connect session if any (ignore failures).
+            // 1) Logout current Connect session (best-effort).
             yield return LogoutCurrent(connect);
 
-            // 2) Delete existing device id so Login returns InvalidUser + ContinuanceToken.
+            // 2) Delete existing EOS device credential so Login returns InvalidUser + ContinuanceToken.
             {
                 bool done = false;
                 try
                 {
                     var del = new DeleteDeviceIdOptions();
-                    connect.DeleteDeviceId(ref del, null, (ref DeleteDeviceIdCallbackInfo info) => { done = true; });
+                    connect.DeleteDeviceId(ref del, null, (ref DeleteDeviceIdCallbackInfo _) => { done = true; });
                 }
                 catch (Exception e)
                 {
                     MelonLogger.Warning("Spoofing PID: DeleteDeviceId — " + e.Message);
+                    EndFingerprintSpoof();
                     _provisioning = false;
                     yield break;
                 }
@@ -156,26 +177,26 @@ namespace MonsterPanel
                 while (!done && t < 15f) { t += Time.unscaledDeltaTime; yield return null; }
             }
 
-            // 3) CreateDeviceId (Success or DuplicateNotAllowed are both fine).
+            // 3) CreateDeviceId with spoofed DeviceModel (new device credential, separate from original).
             bool deviceOk = false;
             {
                 bool done = false;
+                string model = string.IsNullOrEmpty(_fakeDeviceModel) ? "Meta Quest 3" : _fakeDeviceModel;
                 try
                 {
-                    var create = new CreateDeviceIdOptions
-                    {
-                        DeviceModel = string.IsNullOrEmpty(SystemInfo.deviceModel) ? "Quest" : SystemInfo.deviceModel,
-                    };
+                    var create = new CreateDeviceIdOptions { DeviceModel = model };
                     connect.CreateDeviceId(ref create, null, (ref CreateDeviceIdCallbackInfo info) =>
                     {
                         deviceOk = info.ResultCode == Result.Success || info.ResultCode == Result.DuplicateNotAllowed;
-                        if (!deviceOk) MelonLogger.Warning("Spoofing PID: CreateDeviceId → " + info.ResultCode);
+                        if (!deviceOk)
+                            MelonLogger.Warning("Spoofing PID: CreateDeviceId → " + info.ResultCode);
                         done = true;
                     });
                 }
                 catch (Exception e)
                 {
                     MelonLogger.Warning("Spoofing PID: CreateDeviceId — " + e.Message);
+                    EndFingerprintSpoof();
                     _provisioning = false;
                     yield break;
                 }
@@ -184,12 +205,17 @@ namespace MonsterPanel
                 if (!deviceOk)
                 {
                     MelonLogger.Warning("Spoofing PID: CreateDeviceId failed.");
+                    EndFingerprintSpoof();
                     _provisioning = false;
                     yield break;
                 }
+                SpoofDeviceModel = model;
             }
 
-            // 4) Login with DeviceidAccessToken (Quest EOS path). Expect InvalidUser → CreateUser.
+            // Fingerprint spoof only needed around CreateDeviceId — release before Login/CreateUser.
+            EndFingerprintSpoof();
+
+            // 4) Login → InvalidUser → CreateUser (new ProductUserId, separate from original).
             ContinuanceToken continuance = null;
             ProductUserId created = null;
             {
@@ -271,7 +297,8 @@ namespace MonsterPanel
             Save();
             ApplyNow();
             SyncAuthManagerLocalUserId(created);
-            MelonLogger.Msg("Spoofing PID: zero account ready (" + Short(pid) + ").");
+            MelonLogger.Msg("Spoofing PID: zero account ready (pid=" + Short(pid) +
+                            ", device=" + SpoofDeviceModel + ", original=" + Short(OriginalPlatformId) + ").");
             _provisioning = false;
         }
 
@@ -302,18 +329,100 @@ namespace MonsterPanel
         private static void ApplyNow()
         {
             if (!Enabled || string.IsNullOrEmpty(SpoofPlatformId)) return;
+            try { PlayerIDManager.SetPlatformID(SpoofPlatformId); }
+            catch (Exception e) { MelonLogger.Warning("Spoofing PID: ApplyNow — " + e.Message); }
+        }
+
+        // ---------------- Device fingerprint spoof (provision window only) ----------------
+
+        private static void BeginFingerprintSpoof()
+        {
+            GenerateFingerprint();
+            _fingerprintActive = true;
+            MelonLogger.Msg("Spoofing PID: device fingerprint spoof active (" + _fakeDeviceModel + ").");
+        }
+
+        private static void EndFingerprintSpoof()
+        {
+            _fingerprintActive = false;
+        }
+
+        private static void GenerateFingerprint()
+        {
+            // Stable-looking but random Quest-side identity for this provision.
+            string model = QuestModels[UnityEngine.Random.Range(0, QuestModels.Length)];
+            string uid = RandomHex(16);
+            _fakeDeviceModel = model;
+            _fakeDeviceName = model + "-" + uid.Substring(0, 4);
+            _fakeDeviceUid = uid;
+            _fakeOs = "Android OS 12 / API-32 (arm64-v8a)";
+        }
+
+        private static string RandomHex(int bytes)
+        {
+            var sb = new StringBuilder(bytes * 2);
+            for (int i = 0; i < bytes; i++)
+                sb.Append(UnityEngine.Random.Range(0, 256).ToString("x2"));
+            return sb.ToString();
+        }
+
+        private static void InstallDeviceHooks()
+        {
+            if (_deviceHooksInstalled || _harmony == null) return;
             try
             {
-                // Goes through our Harmony prefix (provisioning flag off → forced to SpoofPlatformId).
-                PlayerIDManager.SetPlatformID(SpoofPlatformId);
+                Type t = typeof(SystemInfo);
+                PatchGetter(t, "deviceModel", nameof(DeviceModelPrefix));
+                PatchGetter(t, "deviceName", nameof(DeviceNamePrefix));
+                PatchGetter(t, "deviceUniqueIdentifier", nameof(DeviceUidPrefix));
+                PatchGetter(t, "operatingSystem", nameof(OperatingSystemPrefix));
+                _deviceHooksInstalled = true;
             }
             catch (Exception e)
             {
-                MelonLogger.Warning("Spoofing PID: ApplyNow — " + e.Message);
+                MelonLogger.Warning("Spoofing PID: device hooks — " + e.Message);
             }
         }
 
-        private static void InstallHook()
+        private static void PatchGetter(Type type, string prop, string prefixName)
+        {
+            MethodInfo getter = AccessTools.PropertyGetter(type, prop);
+            if (getter == null) return;
+            _harmony.Patch(getter, prefix: new HarmonyMethod(typeof(PidSpoof), prefixName));
+        }
+
+        // Prefixes only rewrite while _fingerprintActive — otherwise fall through to real values.
+        private static bool DeviceModelPrefix(ref string __result)
+        {
+            if (!_fingerprintActive || string.IsNullOrEmpty(_fakeDeviceModel)) return true;
+            __result = _fakeDeviceModel;
+            return false;
+        }
+
+        private static bool DeviceNamePrefix(ref string __result)
+        {
+            if (!_fingerprintActive || string.IsNullOrEmpty(_fakeDeviceName)) return true;
+            __result = _fakeDeviceName;
+            return false;
+        }
+
+        private static bool DeviceUidPrefix(ref string __result)
+        {
+            if (!_fingerprintActive || string.IsNullOrEmpty(_fakeDeviceUid)) return true;
+            __result = _fakeDeviceUid;
+            return false;
+        }
+
+        private static bool OperatingSystemPrefix(ref string __result)
+        {
+            if (!_fingerprintActive || string.IsNullOrEmpty(_fakeOs)) return true;
+            __result = _fakeOs;
+            return false;
+        }
+
+        // ---------------- PID hook ----------------
+
+        private static void InstallPidHook()
         {
             if (_hooked || _harmony == null) return;
             try
@@ -330,11 +439,10 @@ namespace MonsterPanel
             }
             catch (Exception e)
             {
-                MelonLogger.Warning("Spoofing PID: hook failed — " + e.Message);
+                MelonLogger.Warning("Spoofing PID: PID hook failed — " + e.Message);
             }
         }
 
-        /// <summary>Harmony prefix: remember real PID, force spoof PID while enabled.</summary>
         private static void SetPlatformIDPrefix(ref string platformID)
         {
             if (_provisioning) return;
@@ -378,8 +486,7 @@ namespace MonsterPanel
             {
                 ConnectInterface connect = GetConnect();
                 if (connect == null) return null;
-                int count = connect.GetLoggedInUsersCount();
-                if (count <= 0) return null;
+                if (connect.GetLoggedInUsersCount() <= 0) return null;
                 ProductUserId user = connect.GetLoggedInUserByIndex(0);
                 if (user == null || !user.IsValid()) return null;
                 return user.ToString();
@@ -387,13 +494,11 @@ namespace MonsterPanel
             catch { return null; }
         }
 
-        /// <summary>Keep Fusion's EOSAuthManager.LocalUserId aligned with the spoofed PUID when possible.</summary>
         private static void SyncAuthManagerLocalUserId(ProductUserId user)
         {
             if (user == null || !user.IsValid()) return;
             try
             {
-                // EpicGamesNetworkLayer instance → private _authManager → LocalUserId setter
                 Type layerType = AccessTools.TypeByName("LabFusion.Network.EpicGames.EpicGamesNetworkLayer");
                 Type netInfo = AccessTools.TypeByName("LabFusion.Network.NetworkInfo");
                 if (layerType == null || netInfo == null) return;
@@ -401,21 +506,19 @@ namespace MonsterPanel
                 object layer = AccessTools.Property(netInfo, "CurrentNetworkLayer")?.GetValue(null);
                 if (layer == null || !layerType.IsInstanceOfType(layer)) return;
 
-                FieldInfo authField = AccessTools.Field(layerType, "_authManager");
-                object auth = authField?.GetValue(layer);
+                object auth = AccessTools.Field(layerType, "_authManager")?.GetValue(layer);
                 if (auth == null) return;
 
                 PropertyInfo local = AccessTools.Property(auth.GetType(), "LocalUserId");
                 if (local != null && local.CanWrite)
                     local.SetValue(auth, user);
                 else
-                {
-                    FieldInfo bak = AccessTools.Field(auth.GetType(), "<LocalUserId>k__BackingField");
-                    bak?.SetValue(auth, user);
-                }
+                    AccessTools.Field(auth.GetType(), "<LocalUserId>k__BackingField")?.SetValue(auth, user);
             }
-            catch { /* best-effort */ }
+            catch { }
         }
+
+        // ---------------- Persist ----------------
 
         private static string ConfigPath()
         {
@@ -452,6 +555,9 @@ namespace MonsterPanel
                         case "original":
                             OriginalPlatformId = val ?? "";
                             break;
+                        case "device":
+                            SpoofDeviceModel = val ?? "";
+                            break;
                     }
                 }
                 if (Enabled)
@@ -467,12 +573,14 @@ namespace MonsterPanel
         {
             try
             {
-                string path = ConfigPath();
-                File.WriteAllText(path,
+                File.WriteAllText(ConfigPath(),
                     "# MONSTER Panel — Spoofing PID (EOS ProductUserId)\n" +
+                    "# spoof = zero-account PID (separate CreateUser identity)\n" +
+                    "# original = real PID remembered before provision\n" +
                     "enabled=" + (Enabled ? "1" : "0") + "\n" +
                     "spoof=" + (SpoofPlatformId ?? "") + "\n" +
-                    "original=" + (OriginalPlatformId ?? "") + "\n");
+                    "original=" + (OriginalPlatformId ?? "") + "\n" +
+                    "device=" + (SpoofDeviceModel ?? "") + "\n");
             }
             catch (Exception e)
             {
