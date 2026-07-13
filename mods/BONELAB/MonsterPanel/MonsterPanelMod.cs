@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.27.0", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.27.1", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -85,10 +85,10 @@ namespace MonsterPanel
         public override void OnUpdate()
         {
             TankUpdate();
-            Freedom.Tick();   // снимаем чужие констрейны с тебя и предметов рядом (всегда, без UI)
 
             if (_fusionLoaded)
             {
+                Freedom.Tick();   // снимаем ЧУЖИЕ констрейны с тебя и предметов рядом (свои не трогаем)
                 if (KillAura) Aura.KillTick();
                 if (Disarm) Aura.DisarmTick();
                 Guards.Tick();
@@ -876,9 +876,11 @@ namespace MonsterPanel
         // Constrainer скрепляет предметы, вешая на них компонент ConstraintTracker (+ Unity joint).
         // Кто-то приконстрейнил твоё оружие → ты не мог им двигать. Мы периодически находим
         // ConstraintTracker'ы на тебе и на предметах рядом и зовём DeleteConstraint() — штатное
-        // снятие скрепа (LabFusion патчит этот путь, снятие синхронится). Так любые скреплённые
-        // предметы можно свободно брать и использовать, будто скрепов нет. Бьём точечно по
-        // ConstraintTracker (а не сносим все Unity-джойнты), чтобы не ломать двери/петли уровня.
+        // снятие скрепа (LabFusion патчит этот путь, снятие синхронится).
+        // ВАЖНО: снимаем ТОЛЬКО ЧУЖИЕ скрепы. Владельца берём из NetworkConstraint.Cache →
+        // NetworkEntity.OwnerID: если OwnerID.IsMe (или владельца не определить) — НЕ трогаем,
+        // чтобы твои собственные скрепы держались. Бьём точечно по ConstraintTracker, а не
+        // сносим все Unity-джойнты, чтобы не ломать двери/петли уровня.
         private static class Freedom
         {
             private const float Interval = 0.35f;   // как часто чистим
@@ -926,8 +928,17 @@ namespace MonsterPanel
             private static void FreeOne(Il2CppSLZ.Marrow.ConstraintTracker ct)
             {
                 if (ct == null) return;
-                if (!_seen.Add(ct.GetInstanceID())) return;   // в этом тике уже сняли
-                try { ct.DeleteConstraint(); }
+                if (!_seen.Add(ct.GetInstanceID())) return;   // в этом тике уже обработали
+                try
+                {
+                    // Владелец скрепа: только ЧУЖИЕ снимаем. Свои и «не определить» — не трогаем.
+                    var ne = LabFusion.Marrow.Extenders.NetworkConstraint.Cache.Get(ct);
+                    if (ne == null) return;                              // не сетевой/не в кэше → считаем своим
+                    var owner = ne.OwnerID;
+                    if (owner == null || owner.IsMe) return;             // мой скреп — оставляем
+                }
+                catch { return; }                                       // не смогли определить владельца → не трогаем
+                try { ct.DeleteConstraint(); }                          // чужой — снимаем
                 catch { }
             }
         }
