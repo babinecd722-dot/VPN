@@ -7,19 +7,15 @@ using UnityEngine;
 namespace MonsterPanel
 {
     /// <summary>
-    /// ADMIN NICKNAME — typewriter + color shimmer nametag that reads like an
-    /// internal SLZ/Marrow staff handle. Network sync is throttled so the lobby
-    /// never stutters from ClientSettings spam.
-    ///
-    /// Visible phrase: "MARROW ARCHITECT" (16 chars). Short TMP color prefix
-    /// `<#rgb>…</color>` keeps the full painted string ≤ 32 (Fusion limit).
+    /// ADMIN NICKNAME — typewriter + color shimmer. Phrase: "DEV. OF BONELAB"
+    /// (15 chars). With TMP `<#rgb>…</color>` = 29 ≤ Fusion's 32-char limit.
+    /// Network sync throttled to avoid lobby hitching.
     /// </summary>
     internal static class AdminNick
     {
         public static bool Enabled { get; private set; }
 
-        // Official-looking staff title — uncommon enough to sell the bit.
-        private const string Phrase = "MARROW ARCHITECT";
+        private const string Phrase = "DEV. OF BONELAB";
 
         // Short hex colors (TMP `<#rgb>`). Gold → cyan → white → amber.
         private static readonly string[] Palette =
@@ -30,21 +26,21 @@ namespace MonsterPanel
             "f80", // amber
         };
 
-        private const float LetterInterval = 0.11f;   // typewriter cadence (local)
-        private const float HoldFull = 1.6f;           // pause on completed phrase
-        private const float ColorInterval = 0.45f;     // shimmer step
-        private const float NetMinInterval = 0.4f;     // never sync faster than this
+        private const float LetterInterval = 0.11f;
+        private const float HoldFull = 1.8f;
+        private const float ColorInterval = 0.45f;
+        private const float NetMinInterval = 0.4f;
         private const int FusionNickLimit = 32;
 
-        private static int _len;                       // revealed letter count
-        private static bool _shrinking;                // reverse typewriter
+        private static int _len;
+        private static bool _shrinking;
         private static float _letterTimer;
         private static float _holdTimer;
         private static int _colorIdx;
         private static float _colorTimer;
         private static string _lastSent = "";
         private static float _netCooldown;
-        private static string _savedNick;               // restore on disable
+        private static string _savedNick;
         private static bool _haveSaved;
 
         public static void Install(Page root)
@@ -69,11 +65,9 @@ namespace MonsterPanel
             {
                 _colorTimer = ColorInterval;
                 _colorIdx = (_colorIdx + 1) % Palette.Length;
-                // Color change alone may push a sync (throttled).
                 PushIfDue(force: false);
             }
 
-            // Hold on full phrase, then reverse / rebuild.
             if (!_shrinking && _len >= Phrase.Length)
             {
                 if (_holdTimer > 0f)
@@ -133,12 +127,11 @@ namespace MonsterPanel
                 _savedNick = "";
             }
 
-            // Roster username: static staff-looking handle (not animated — no spam).
             try
             {
                 var md = LabFusion.Player.LocalPlayer.Metadata;
-                md?.Username?.SetValue("marrow.architect");
-                md?.AvatarTitle?.SetValue("MARROW");
+                md?.Username?.SetValue("dev.bonelab");
+                md?.AvatarTitle?.SetValue("DEV. OF BONELAB");
             }
             catch { }
 
@@ -146,7 +139,7 @@ namespace MonsterPanel
                 LabFusion.Senders.NicknameVisibility.SHOW;
 
             PushIfDue(force: true);
-            MelonLogger.Msg("ADMIN NICKNAME: ON");
+            MelonLogger.Msg("ADMIN NICKNAME: ON (DEV. OF BONELAB)");
         }
 
         private static void Disable()
@@ -192,15 +185,10 @@ namespace MonsterPanel
             return Phrase.Substring(0, _len);
         }
 
-        /// <summary>
-        /// Wrap plain text in a short TMP color tag. Empty → single space (hidden-ish).
-        /// Budget: 6 (`<#rgb>`) + text + 8 (`</color>`) ≤ 32 → text ≤ 18.
-        /// </summary>
         private static string Paint(string plain)
         {
             if (string.IsNullOrEmpty(plain)) return " ";
             string hex = Palette[_colorIdx % Palette.Length];
-            // If somehow over budget, drop color and send plain.
             int budget = FusionNickLimit - (6 + 8); // <#rgb> + </color>
             if (plain.Length > budget)
                 return plain.Length <= FusionNickLimit ? plain : plain.Substring(0, FusionNickLimit);

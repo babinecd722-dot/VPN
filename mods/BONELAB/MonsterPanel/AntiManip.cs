@@ -8,18 +8,18 @@ using UnityEngine;
 namespace MonsterPanel
 {
     /// <summary>
-    /// Silent stock shield: Dev Manipulator / GravityManipulatorJob cannot lock or
-    /// soft-pull the local player's physics rig. No menu entry, no UI strings.
+    /// Silent stock shield: others' Dev Manipulator cannot lock / soft-pull YOUR
+    /// physics body. YOUR Dev Manipulator against others is unaffected.
     ///
-    /// Mechanism (local client): the synced gun runs GravityManipulatorJob on every
-    /// peer; FixedUpdate applies forces / ConfigurableJoints to nearby Rigidbodies.
-    /// We strip our own RBs from its working set and block LockRigidbody on us.
+    /// Rule: only strip / block when the *victim* rigidbody is under the local
+    /// physicsRig. Never touch joints just because connectedBody is on your gun
+    /// (that would break your own locks on other players).
     /// </summary>
     internal static class AntiManip
     {
         private static bool _installed;
         private static float _tickTimer;
-        private const float TickInterval = 0.75f; // rare backup only — Harmony does the realtime work
+        private const float TickInterval = 0.75f;
 
         public static void Install(HarmonyLib.Harmony harmony)
         {
@@ -40,19 +40,13 @@ namespace MonsterPanel
             Try(harmony, pull, "OnFarHandHoverUpdate", nameof(FarHoverPrefix), new[] { typeof(Hand) });
         }
 
-        /// <summary>
-        /// Rare backup: if a job somehow still holds a lock on us, release it.
-        /// Realtime immunity is Harmony FixedUpdate/LockRigidbody — this must stay rare
-        /// (FindObjectsOfType is expensive on Quest).
-        /// </summary>
         public static void Tick()
         {
             _tickTimer -= Time.deltaTime;
             if (_tickTimer > 0f) return;
             _tickTimer = TickInterval;
 
-            var rig = BoneLib.Player.RigManager;
-            if (rig == null) return;
+            if (BoneLib.Player.RigManager == null) return;
 
             try
             {
@@ -62,7 +56,7 @@ namespace MonsterPanel
                 {
                     var job = jobs[i];
                     if (job == null) continue;
-                    StripJob(job, rig);
+                    StripForeignLocksOnSelf(job);
                 }
             }
             catch { }
@@ -86,73 +80,63 @@ namespace MonsterPanel
             }
         }
 
-        // ---- Patches ----
+        // ---- Patches (victim-only: never blocks locking someone else) ----
 
         private static bool LockRigidbodyPrefix(Rigidbody rigidbody) =>
-            !IsOwnRb(rigidbody);
+            !IsOwnBodyRb(rigidbody);
 
         private static bool ConfigureJointPrefix(Rigidbody rigidbody) =>
-            !IsOwnRb(rigidbody);
+            !IsOwnBodyRb(rigidbody);
 
         private static void FixedUpdatePrefix(GravityManipulatorJob __instance)
         {
-            var rig = BoneLib.Player.RigManager;
-            if (rig == null || __instance == null) return;
-            StripJob(__instance, rig);
+            if (__instance == null) return;
+            StripForeignLocksOnSelf(__instance);
         }
 
         private static void GetClosestPostfix(ref Rigidbody __result)
         {
-            if (IsOwnRb(__result)) __result = null;
+            // Don't pick YOUR body as the lock target — others stay valid.
+            if (IsOwnBodyRb(__result)) __result = null;
         }
 
         private static bool PullPrefix(ForcePullGrip __instance, Hand hand)
         {
-            if (__instance == null) return true;
-            try
-            {
-                // Force-pull on a grip that lives on our body → cancel.
-                if (IsOwnTransform(__instance.transform))
-                {
-                    try { __instance.CancelPull(hand); } catch { }
-                    return false;
-                }
-            }
-            catch { }
-            return true;
+            if (!IsOwnBodyForcePull(__instance)) return true;
+            try { __instance.CancelPull(hand); } catch { }
+            return false;
         }
 
         private static bool FarHoverPrefix(ForcePullGrip __instance, Hand hand) =>
-            __instance == null || !IsOwnTransform(__instance.transform);
+            !IsOwnBodyForcePull(__instance);
 
-        // ---- Helpers ----
+        // ---- Strip only effects whose victim is the local body ----
 
-        private static void StripJob(GravityManipulatorJob job, RigManager rig)
+        private static void StripForeignLocksOnSelf(GravityManipulatorJob job)
         {
+            // Hard lock on our body → release. Lock on someone else → leave alone.
             try
             {
-                // Hard lock on our body → release.
                 Rigidbody locked = null;
                 try { locked = job.m_LockedRigidbody; } catch { }
-                if (IsOwnRb(locked))
+                if (IsOwnBodyRb(locked))
                 {
                     try { job.ReleaseLockedRigidbody(); } catch { }
                 }
             }
             catch { }
 
-            // Soft field: drop our RBs from the working set so HoverRigidbodies
-            // / keep-field forces never touch the local player.
+            // Soft field: remove only OUR body RBs from the working set.
+            // Other players' RBs stay so YOUR gun can still lift them.
             try
             {
                 var set = job.m_RigidbodyHashSet;
                 if (set != null && set.Count > 0)
                 {
-                    Rigidbody[] buf = null;
                     try
                     {
                         int n = set.Count;
-                        buf = new Rigidbody[n];
+                        var buf = new Rigidbody[n];
                         int i = 0;
                         foreach (var rb in set)
                         {
@@ -162,11 +146,9 @@ namespace MonsterPanel
                         for (int k = 0; k < i; k++)
                         {
                             var rb = buf[k];
-                            if (IsOwnRb(rb))
-                            {
-                                try { set.Remove(rb); } catch { }
-                                try { job.m_RigidbodyColliderDictionary?.Remove(rb); } catch { }
-                            }
+                            if (!IsOwnBodyRb(rb)) continue;
+                            try { set.Remove(rb); } catch { }
+                            try { job.m_RigidbodyColliderDictionary?.Remove(rb); } catch { }
                         }
                     }
                     catch { }
@@ -174,46 +156,92 @@ namespace MonsterPanel
             }
             catch { }
 
-            // Helper joints that yank child bones toward the orb.
+            // Helper joints: destroy only when the VICTIM rb is our body.
+            // Do NOT check connectedBody — when YOU lock someone else, connectedBody
+            // is often your manipulator anchor under your rig.
             try
             {
                 var helpers = job._helperJoints;
                 var helperRbs = job._helperRigidbodies;
-                if (helpers != null)
+                if (helpers == null) return;
+
+                for (int i = helpers.Count - 1; i >= 0; i--)
                 {
-                    for (int i = helpers.Count - 1; i >= 0; i--)
+                    ConfigurableJoint j = null;
+                    try { j = helpers[i]; } catch { continue; }
+                    if (j == null) continue;
+
+                    bool victimOurs = false;
+                    try
                     {
-                        ConfigurableJoint j = null;
-                        try { j = helpers[i]; } catch { continue; }
-                        if (j == null) continue;
-                        bool ours = IsOwnRb(j.GetComponent<Rigidbody>()) || IsOwnRb(j.connectedBody);
-                        if (!ours) continue;
-                        try { UnityEngine.Object.Destroy(j); } catch { }
-                        try { helpers.RemoveAt(i); } catch { }
-                        try
-                        {
-                            if (helperRbs != null && i < helperRbs.Count)
-                                helperRbs.RemoveAt(i);
-                        }
+                        if (helperRbs != null && i < helperRbs.Count)
+                            victimOurs = IsOwnBodyRb(helperRbs[i]);
+                    }
+                    catch { }
+                    if (!victimOurs)
+                    {
+                        try { victimOurs = IsOwnBodyRb(j.GetComponent<Rigidbody>()); }
                         catch { }
                     }
+                    if (!victimOurs) continue;
+
+                    try { UnityEngine.Object.Destroy(j); } catch { }
+                    try { helpers.RemoveAt(i); } catch { }
+                    try
+                    {
+                        if (helperRbs != null && i < helperRbs.Count)
+                            helperRbs.RemoveAt(i);
+                    }
+                    catch { }
                 }
             }
             catch { }
         }
 
-        private static bool IsOwnRb(Rigidbody rb)
+        /// <summary>
+        /// Local player avatar / physics body only — never the Dev Manipulator gun
+        /// and never a held world prop under the hand.
+        /// </summary>
+        private static bool IsOwnBodyRb(Rigidbody rb)
         {
             if (rb == null) return false;
-            return IsOwnTransform(rb.transform);
-        }
-
-        private static bool IsOwnTransform(Transform t)
-        {
-            if (t == null) return false;
             var rig = BoneLib.Player.RigManager;
             if (rig == null) return false;
-            try { return t.IsChildOf(rig.transform); }
+
+            try
+            {
+                // Own gun must never count as "body" or we break self-use.
+                if (rb.GetComponentInParent<DevManipulatorGun>() != null) return false;
+                if (rb.GetComponentInParent<GravityManipulatorJob>() != null) return false;
+
+                var pr = rig.physicsRig;
+                if (pr == null || !rb.transform.IsChildOf(pr.transform)) return false;
+
+                // Clear body marker.
+                if (rb.GetComponentInParent<AvatarGrip>() != null) return true;
+
+                // Held prop under a hand — not body; leave manipulable.
+                if (rb.GetComponentInParent<Hand>() != null &&
+                    rb.GetComponentInParent<InteractableHost>() != null)
+                    return false;
+
+                // Physics-rig bone / marrow body.
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static bool IsOwnBodyForcePull(ForcePullGrip pull)
+        {
+            if (pull == null) return false;
+            try
+            {
+                if (pull.GetComponentInParent<DevManipulatorGun>() != null) return false;
+                if (pull.GetComponentInParent<AvatarGrip>() == null) return false;
+                var rig = BoneLib.Player.RigManager;
+                if (rig == null) return false;
+                return pull.transform.IsChildOf(rig.transform);
+            }
             catch { return false; }
         }
     }
