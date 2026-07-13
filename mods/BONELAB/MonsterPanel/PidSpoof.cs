@@ -36,8 +36,16 @@ namespace MonsterPanel
         private static bool _deviceHooksInstalled;
         private static bool _provisioning;
         private static bool _ensureStarted;
+        private static bool _cancel;
         private static bool _fingerprintActive;
         private static HarmonyLib.Harmony _harmony;
+
+        private static Type _eosInterfacesType;
+        private static PropertyInfo _connectProp;
+        private static bool _eosLookupDone;
+
+        private static readonly MethodInfo[] _deviceGetters = new MethodInfo[4];
+        private static readonly HarmonyMethod[] _devicePrefixes = new HarmonyMethod[4];
 
         private static string _fakeDeviceModel = "";
         private static string _fakeDeviceName = "";
@@ -51,14 +59,15 @@ namespace MonsterPanel
         };
 
         private const string FileName = "pid_spoof.cfg";
-        private const float ConnectWaitSeconds = 90f;
+        private const float ConnectWaitSeconds = 60f;
 
         public static void Init(HarmonyLib.Harmony harmony)
         {
             _harmony = harmony;
             Load();
+            CacheEosConnect();
             InstallPidHook();
-            InstallDeviceHooks();
+            // Device SystemInfo hooks are installed ONLY during CreateDeviceId — not at boot.
             if (Enabled)
                 StartEnsure();
         }
@@ -75,8 +84,13 @@ namespace MonsterPanel
             MelonLogger.Msg(on ? "Spoofing PID: ON" : "Spoofing PID: OFF");
 
             if (!on)
+            {
+                _cancel = true;
+                EndFingerprintSpoof();
                 return;
+            }
 
+            _cancel = false;
             if (string.IsNullOrEmpty(SpoofPlatformId))
                 StartEnsure();
             else
@@ -87,32 +101,56 @@ namespace MonsterPanel
         {
             if (_ensureStarted) return;
             _ensureStarted = true;
+            _cancel = false;
             MelonCoroutines.Start(EnsureRoutine());
         }
 
         private static IEnumerator EnsureRoutine()
         {
+            MelonLogger.Msg("Spoofing PID: waiting for EOS Connect…");
             float waited = 0f;
-            while (GetConnect() == null && waited < ConnectWaitSeconds)
+            float nextLog = 5f;
+            ConnectInterface connect = GetConnect();
+            while (connect == null && waited < ConnectWaitSeconds)
             {
+                if (_cancel || !Enabled)
+                {
+                    MelonLogger.Msg("Spoofing PID: wait cancelled.");
+                    _ensureStarted = false;
+                    yield break;
+                }
                 waited += Time.unscaledDeltaTime;
+                if (waited >= nextLog)
+                {
+                    MelonLogger.Msg("Spoofing PID: still waiting for EOS Connect (" + (int)waited + "s) — log into Fusion EOS.");
+                    nextLog += 5f;
+                }
                 yield return null;
+                connect = GetConnect();
             }
 
-            if (GetConnect() == null)
+            if (connect == null)
             {
-                MelonLogger.Warning("Spoofing PID: EOS Connect not ready — turn it on after Fusion EOS login.");
+                MelonLogger.Warning("Spoofing PID: EOS Connect not ready — log into Fusion (Epic Online Services) and retry.");
+                NotifyError("PID spoof failed", "Fusion EOS not logged in");
                 _ensureStarted = false;
                 yield break;
             }
 
+            MelonLogger.Msg("Spoofing PID: EOS Connect ready.");
             TryRememberOriginal(PlayerIDManager.LocalPlatformID);
 
-            if (Enabled && string.IsNullOrEmpty(SpoofPlatformId))
+            if (_cancel || !Enabled)
+            {
+                _ensureStarted = false;
+                yield break;
+            }
+
+            if (string.IsNullOrEmpty(SpoofPlatformId))
             {
                 yield return ProvisionZeroAccount();
             }
-            else if (Enabled && !string.IsNullOrEmpty(SpoofPlatformId))
+            else
             {
                 string live = GetLoggedInProductUserId();
                 if (!string.IsNullOrEmpty(live) &&
@@ -153,12 +191,19 @@ namespace MonsterPanel
             }
 
             TryRememberOriginal(PlayerIDManager.LocalPlatformID);
+            if (_cancel || !Enabled)
+            {
+                _provisioning = false;
+                yield break;
+            }
+
+            MelonLogger.Msg("Spoofing PID: provisioning zero account…");
             BeginFingerprintSpoof();
 
-            // 1) Logout current Connect session (best-effort).
-            yield return LogoutCurrent(connect);
+            // Skip Connect.Logout — it tears down the live Fusion session and feels like a freeze.
+            // DeleteDeviceId alone is enough to force InvalidUser → CreateUser on next Login.
 
-            // 2) Delete existing EOS device credential so Login returns InvalidUser + ContinuanceToken.
+            // 1) Delete existing EOS device credential so Login returns InvalidUser + ContinuanceToken.
             {
                 bool done = false;
                 try
@@ -177,7 +222,7 @@ namespace MonsterPanel
                 while (!done && t < 15f) { t += Time.unscaledDeltaTime; yield return null; }
             }
 
-            // 3) CreateDeviceId with spoofed DeviceModel (new device credential, separate from original).
+            // 2) CreateDeviceId with spoofed DeviceModel (new device credential, separate from original).
             bool deviceOk = false;
             {
                 bool done = false;
@@ -215,7 +260,7 @@ namespace MonsterPanel
             // Fingerprint spoof only needed around CreateDeviceId — release before Login/CreateUser.
             EndFingerprintSpoof();
 
-            // 4) Login → InvalidUser → CreateUser (new ProductUserId, separate from original).
+            // 3) Login → InvalidUser → CreateUser (new ProductUserId, separate from original).
             ContinuanceToken continuance = null;
             ProductUserId created = null;
             {
@@ -328,11 +373,11 @@ namespace MonsterPanel
                 catch { }
             }
 
-            // Re-assert over the next frames in case Fusion rewrites identity after CreateUser/login.
-            for (int i = 0; i < 10; i++)
+            // Re-assert a few frames in case Fusion rewrites identity after CreateUser/login.
+            for (int i = 0; i < 5; i++)
             {
                 yield return null;
-                if (!Enabled) yield break;
+                if (!Enabled || _cancel) yield break;
                 ApplyNow();
             }
 
@@ -363,6 +408,21 @@ namespace MonsterPanel
             {
                 MelonLogger.Warning("Spoofing PID: notify — " + e.Message);
             }
+        }
+
+        private static void NotifyError(string title, string message)
+        {
+            try
+            {
+                var n = new LabFusion.UI.Popups.Notification();
+                n.Title = title;
+                n.Message = message;
+                n.Type = LabFusion.UI.Popups.NotificationType.ERROR;
+                n.ShowPopup = true;
+                n.PopupLength = 4f;
+                LabFusion.UI.Popups.Notifier.Send(n);
+            }
+            catch { }
         }
 
         private static IEnumerator LogoutCurrent(ConnectInterface connect)
@@ -401,6 +461,7 @@ namespace MonsterPanel
         private static void BeginFingerprintSpoof()
         {
             GenerateFingerprint();
+            InstallDeviceHooks(); // patch only for this window
             _fingerprintActive = true;
             MelonLogger.Msg("Spoofing PID: device fingerprint spoof active (" + _fakeDeviceModel + ").");
         }
@@ -408,11 +469,11 @@ namespace MonsterPanel
         private static void EndFingerprintSpoof()
         {
             _fingerprintActive = false;
+            UninstallDeviceHooks(); // remove SystemInfo patches — no ongoing overhead
         }
 
         private static void GenerateFingerprint()
         {
-            // Stable-looking but random Quest-side identity for this provision.
             string model = QuestModels[UnityEngine.Random.Range(0, QuestModels.Length)];
             string uid = RandomHex(16);
             _fakeDeviceModel = model;
@@ -435,10 +496,17 @@ namespace MonsterPanel
             try
             {
                 Type t = typeof(SystemInfo);
-                PatchGetter(t, "deviceModel", nameof(DeviceModelPrefix));
-                PatchGetter(t, "deviceName", nameof(DeviceNamePrefix));
-                PatchGetter(t, "deviceUniqueIdentifier", nameof(DeviceUidPrefix));
-                PatchGetter(t, "operatingSystem", nameof(OperatingSystemPrefix));
+                string[] props = { "deviceModel", "deviceName", "deviceUniqueIdentifier", "operatingSystem" };
+                string[] prefixes = { nameof(DeviceModelPrefix), nameof(DeviceNamePrefix), nameof(DeviceUidPrefix), nameof(OperatingSystemPrefix) };
+                for (int i = 0; i < props.Length; i++)
+                {
+                    MethodInfo getter = AccessTools.PropertyGetter(t, props[i]);
+                    if (getter == null) continue;
+                    var hm = new HarmonyMethod(typeof(PidSpoof), prefixes[i]);
+                    _harmony.Patch(getter, prefix: hm);
+                    _deviceGetters[i] = getter;
+                    _devicePrefixes[i] = hm;
+                }
                 _deviceHooksInstalled = true;
             }
             catch (Exception e)
@@ -447,14 +515,26 @@ namespace MonsterPanel
             }
         }
 
-        private static void PatchGetter(Type type, string prop, string prefixName)
+        private static void UninstallDeviceHooks()
         {
-            MethodInfo getter = AccessTools.PropertyGetter(type, prop);
-            if (getter == null) return;
-            _harmony.Patch(getter, prefix: new HarmonyMethod(typeof(PidSpoof), prefixName));
+            if (!_deviceHooksInstalled || _harmony == null) return;
+            try
+            {
+                for (int i = 0; i < _deviceGetters.Length; i++)
+                {
+                    if (_deviceGetters[i] == null) continue;
+                    _harmony.Unpatch(_deviceGetters[i], HarmonyPatchType.Prefix);
+                    _deviceGetters[i] = null;
+                    _devicePrefixes[i] = null;
+                }
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Spoofing PID: device unhook — " + e.Message);
+            }
+            _deviceHooksInstalled = false;
         }
 
-        // Prefixes only rewrite while _fingerprintActive — otherwise fall through to real values.
         private static bool DeviceModelPrefix(ref string __result)
         {
             if (!_fingerprintActive || string.IsNullOrEmpty(_fakeDeviceModel)) return true;
@@ -531,14 +611,32 @@ namespace MonsterPanel
             Save();
         }
 
+        private static void CacheEosConnect()
+        {
+            if (_eosLookupDone) return;
+            _eosLookupDone = true;
+            try
+            {
+                _eosInterfacesType = AccessTools.TypeByName("LabFusion.Network.EpicGames.EOSInterfaces");
+                if (_eosInterfacesType != null)
+                    _connectProp = AccessTools.Property(_eosInterfacesType, "Connect");
+                MelonLogger.Msg(_connectProp != null
+                    ? "Spoofing PID: EOSInterfaces.Connect cached."
+                    : "Spoofing PID: EOSInterfaces.Connect not found (EOS layer missing?).");
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Spoofing PID: EOS cache — " + e.Message);
+            }
+        }
+
         private static ConnectInterface GetConnect()
         {
             try
             {
-                Type t = AccessTools.TypeByName("LabFusion.Network.EpicGames.EOSInterfaces");
-                if (t == null) return null;
-                PropertyInfo p = AccessTools.Property(t, "Connect");
-                return p?.GetValue(null) as ConnectInterface;
+                if (!_eosLookupDone) CacheEosConnect();
+                if (_connectProp == null) return null;
+                return _connectProp.GetValue(null) as ConnectInterface;
             }
             catch { return null; }
         }
