@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.27.1", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.28.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -77,6 +77,8 @@ namespace MonsterPanel
         public override void OnInitializeMelon()
         {
             _fusionLoaded = Teleporter.FusionLoaded;
+            if (_fusionLoaded)
+                PidSpoof.Init(HarmonyInstance); // Spoofing PID: hook SetPlatformID + restore saved state
             BuildMenu();
             ApplyPatches();
             MelonLogger.Msg("MONSTER Panel loaded.");
@@ -582,19 +584,20 @@ namespace MonsterPanel
             page.CreateBool("Disarm", new Color(0.9f, 0.2f, 0.5f), Disarm,
                 v => { Disarm = v; Log("Disarm", v); });
 
-            // Teleport + ник + телохранители: только когда загружен LabFusion.
+            // Teleport + ник + телохранители + Spoofing PID: только когда загружен LabFusion.
             if (Teleporter.FusionLoaded)
             {
+                PidSpoof.InstallMenu(page);
                 page.CreateFunction("Spawn 3 Bodyguards", new Color(0.2f, 0.55f, 1f), (Action)Guards.Spawn);
                 page.CreateFunction("Despawn Bodyguards", new Color(0.5f, 0.5f, 0.5f), (Action)Guards.Despawn);
                 page.CreateFunction("Avatar preview 6114112", new Color(0.7f, 0.5f, 1f), (Action)NickHider.SetAvatarPreview);
                 KillAuraMenu.Install(page);
                 NickHider.Install(page);
                 Teleporter.Install(page);
-                MelonLogger.Msg("MONSTER Panel: Kill Aura + Teleport + Nickname + Bodyguards added (LabFusion found).");
+                MelonLogger.Msg("MONSTER Panel: Kill Aura + Teleport + Nickname + Bodyguards + Spoofing PID added (LabFusion found).");
             }
             else
-                MelonLogger.Msg("MONSTER Panel: LabFusion not loaded - Teleport/Nickname/Bodyguards hidden.");
+                MelonLogger.Msg("MONSTER Panel: LabFusion not loaded - Teleport/Nickname/Bodyguards/Spoofing PID hidden.");
         }
 
         private static void Log(string name, bool on) =>
