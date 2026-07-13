@@ -11,7 +11,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.26.1", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.27.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -85,6 +85,7 @@ namespace MonsterPanel
         public override void OnUpdate()
         {
             TankUpdate();
+            Freedom.Tick();   // снимаем чужие констрейны с тебя и предметов рядом (всегда, без UI)
 
             if (_fusionLoaded)
             {
@@ -868,6 +869,67 @@ namespace MonsterPanel
                     if (g != null && g.enabled != enabled) g.enabled = enabled;
             }
             catch (Exception e) { MelonLogger.Warning("Tank grips: " + e.Message); }
+        }
+
+        // ---------------- Anti-Constrainer (всегда, без UI) ----------------
+        //
+        // Constrainer скрепляет предметы, вешая на них компонент ConstraintTracker (+ Unity joint).
+        // Кто-то приконстрейнил твоё оружие → ты не мог им двигать. Мы периодически находим
+        // ConstraintTracker'ы на тебе и на предметах рядом и зовём DeleteConstraint() — штатное
+        // снятие скрепа (LabFusion патчит этот путь, снятие синхронится). Так любые скреплённые
+        // предметы можно свободно брать и использовать, будто скрепов нет. Бьём точечно по
+        // ConstraintTracker (а не сносим все Unity-джойнты), чтобы не ломать двери/петли уровня.
+        private static class Freedom
+        {
+            private const float Interval = 0.35f;   // как часто чистим
+            private const float Radius = 3.5f;      // предметы «в досягаемости» вокруг тебя
+            private static float _timer;
+            private static readonly Collider[] _buf = new Collider[128];
+            private static readonly System.Collections.Generic.HashSet<int> _seen =
+                new System.Collections.Generic.HashSet<int>();
+
+            public static void Tick()
+            {
+                _timer -= Time.deltaTime;
+                if (_timer > 0f) return;
+                _timer = Interval;
+
+                var rig = BoneLib.Player.RigManager;
+                if (rig == null) return;
+                _seen.Clear();
+
+                // 1) констрейны прямо на твоём риге (если приконстрейнили тело/руки).
+                try
+                {
+                    foreach (var ct in rig.GetComponentsInChildren<Il2CppSLZ.Marrow.ConstraintTracker>(true))
+                        FreeOne(ct);
+                }
+                catch { }
+
+                // 2) констрейны на предметах вокруг (держишь в руках / рядом, чтобы взять).
+                try
+                {
+                    Vector3 c = RigPos(rig);
+                    int n = Physics.OverlapSphereNonAlloc(c, Radius, _buf,
+                        Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+                    for (int i = 0; i < n; i++)
+                    {
+                        var col = _buf[i];
+                        if (col == null) continue;
+                        var ct = col.GetComponentInParent<Il2CppSLZ.Marrow.ConstraintTracker>();
+                        FreeOne(ct);
+                    }
+                }
+                catch { }
+            }
+
+            private static void FreeOne(Il2CppSLZ.Marrow.ConstraintTracker ct)
+            {
+                if (ct == null) return;
+                if (!_seen.Add(ct.GetInstanceID())) return;   // в этом тике уже сняли
+                try { ct.DeleteConstraint(); }
+                catch { }
+            }
         }
 
         // ---------------- Свой ник: скрытие и цветные DEV-пресеты (LabFusion) ----------------
