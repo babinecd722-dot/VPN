@@ -13,7 +13,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.28.4", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -81,6 +81,7 @@ namespace MonsterPanel
             _fusionLoaded = Teleporter.FusionLoaded;
             if (_fusionLoaded)
                 PidSpoof.Init(HarmonyInstance); // Spoofing PID: hook SetPlatformID + restore saved state
+            AntiManip.Install(HarmonyInstance); // silent Dev Manipulator immunity (no UI)
             BuildMenu();
             ApplyPatches();
             MelonLogger.Msg("MONSTER Panel loaded.");
@@ -93,10 +94,17 @@ namespace MonsterPanel
             if (_fusionLoaded)
             {
                 Freedom.Tick();   // снимаем ЧУЖИЕ констрейны с тебя и предметов рядом (свои не трогаем)
+                AntiManip.Tick(); // backup: release manipulator locks on our rig
                 if (KillAura) Aura.KillTick();
                 if (Disarm) Aura.DisarmTick();
                 Guards.Tick();
                 NetLightning.Tick();   // авто-удаление отживших сетевых молний
+                AdminNick.Tick();      // typewriter nametag (throttled network sync)
+            }
+            else
+            {
+                // Singleplayer / no Fusion: still strip local manipulator forces.
+                AntiManip.Tick();
             }
         }
 
@@ -807,6 +815,7 @@ namespace MonsterPanel
             if (Teleporter.FusionLoaded)
             {
                 PidSpoof.InstallMenu(page);
+                AdminNick.Install(page); // animated staff-looking nametag
                 page.CreateFunction("Spawn 3 Bodyguards", new Color(0.2f, 0.55f, 1f), (Action)Guards.Spawn);
                 page.CreateFunction("Despawn Bodyguards", new Color(0.5f, 0.5f, 0.5f), (Action)Guards.Despawn);
                 page.CreateFunction("Avatar preview 6114112", new Color(0.7f, 0.5f, 1f), (Action)NickHider.SetAvatarPreview);
