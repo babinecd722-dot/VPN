@@ -5,13 +5,15 @@ using HarmonyLib;
 using Il2CppSLZ.Marrow;
 using Il2CppSLZ.Marrow.Combat;
 using Il2CppSLZ.Marrow.Data;
+using Il2CppSLZ.Marrow.Interaction;
 using Il2CppSLZ.Marrow.PuppetMasta;
 using LabFusion.Entities;
+using LabFusion.Extensions;
 using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.28.3", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.28.4", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -54,9 +56,9 @@ namespace MonsterPanel
         // Aura (Kill / Disarm)
         private const float AuraRange = 15f;             // «рядом», метры
         private const float KillTickInterval = 0.25f;    // как часто бьём
-        private const float DisarmTickInterval = 0.5f;   // как часто вырываем стволы
-        private const float DisarmRadius = 1.3f;         // радиус вокруг игрока, откуда вырываем предметы
-        private const float DisarmSpeed = 22f;           // сила вырывания
+        private const float DisarmTickInterval = 0.2f;   // как часто вырываем стволы
+        private const float DisarmRadius = 1.8f;         // запасной sweep вокруг рук
+        private const float DisarmSpeed = 28f;           // сила вырывания
 
         // Tank Mode
         private const float TankReapplyInterval = 0.5f;
@@ -156,39 +158,248 @@ namespace MonsterPanel
         private static readonly Collider[] _overlapBuf = new Collider[64];
         private static readonly System.Collections.Generic.HashSet<int> _yankSeen = new System.Collections.Generic.HashSet<int>();
 
-        /// <summary>Вырываем предметы (стволы) в радиусе точки. Ключ: сперва ЗАБИРАЕМ владение
-        /// сетевой сущностью (NetworkEntity.TakeOwnership) — иначе позицией предмета владеет чужой
-        /// клиент и наш velocity сразу перетирается синхронизацией. Забрав владение, хват срывается
-        /// и швырок «прилипает». Тела ригов не трогаем.</summary>
-        private static void YankItemsAt(Vector3 center)
+        /// <summary>
+        /// Disarm одного сетевого игрока:
+        /// 1) Grabber.Detach — чистит Fusion _lastGrabs (иначе CheckDetachAndReattach сразу вернёт хват),
+        /// 2) ForceDetach + TakeOwnership по grip в руках,
+        /// 3) DropWeapon из кобур,
+        /// 4) запасной OverlapSphere вокруг рук (не скипает held-пропы на риге).
+        /// </summary>
+        private static bool DisarmPlayer(NetworkPlayer np, Vector3 fromPos)
+        {
+            if (np == null || !np.HasRig || np.RigRefs == null) return false;
+            var refs = np.RigRefs;
+            bool any = false;
+
+            // Снять grip с Fusion-кэша ПЕРЕД физическим detach — иначе патч Grip.OnDetachedFromHand
+            // зовёт CheckDetachAndReattach и оружие мгновенно возвращается в руку на нашем клиенте.
+            try
+            {
+                var grabber = np.Grabber;
+                if (grabber != null)
+                {
+                    grabber.Detach(Handedness.LEFT);
+                    grabber.Detach(Handedness.RIGHT);
+                }
+            }
+            catch { }
+
+            any |= YankHeldHand(refs.LeftHand, fromPos);
+            any |= YankHeldHand(refs.RightHand, fromPos);
+            any |= DropHolsters(refs, fromPos);
+
+            try
+            {
+                if (refs.LeftHand != null) YankLooseNear(refs.LeftHand.transform.position, fromPos);
+                if (refs.RightHand != null) YankLooseNear(refs.RightHand.transform.position, fromPos);
+            }
+            catch { }
+
+            return any;
+        }
+
+        private static bool YankHeldHand(Hand hand, Vector3 fromPos)
+        {
+            if (hand == null) return false;
+            Grip grip = ResolveHandGrip(hand);
+            if (grip == null) return false;
+            return YankGrip(grip, fromPos);
+        }
+
+        private static Grip ResolveHandGrip(Hand hand)
+        {
+            try
+            {
+                var recv = hand.AttachedReceiver;
+                if (recv != null)
+                {
+                    var asGrip = recv.TryCast<Grip>();
+                    if (asGrip != null) return asGrip;
+                }
+            }
+            catch { }
+
+            try
+            {
+                var go = hand.m_CurrentAttachedGO;
+                if (go == null) return null;
+                var cached = Grip.Cache.Get(go);
+                if (cached != null) return cached;
+                return go.GetComponent<Grip>();
+            }
+            catch { return null; }
+        }
+
+        private static bool DropHolsters(RigRefs refs, Vector3 fromPos)
+        {
+            if (refs.RigSlots == null) return false;
+            bool any = false;
+            foreach (var slot in refs.RigSlots)
+            {
+                if (slot == null) continue;
+                WeaponSlot weapon = null;
+                try { weapon = slot._slottedWeapon; } catch { continue; }
+                if (weapon == null) continue;
+
+                Grip grip = null;
+                try { grip = weapon.grip; } catch { }
+
+                try { slot.DropWeapon(); } catch { }
+
+                if (grip != null)
+                    any |= YankGrip(grip, fromPos);
+            }
+            return any;
+        }
+
+        private static bool YankGrip(Grip grip, Vector3 fromPos)
+        {
+            if (grip == null) return false;
+
+            // Не трогаем грипы самого тела (AvatarGrip / риг без пропа).
+            try
+            {
+                if (grip.TryCast<AvatarGrip>() != null) return false;
+            }
+            catch { }
+
+            TakeOwnershipFromGrip(grip);
+
+            // Сорвать все руки с хоста
+            try
+            {
+                if (grip.HasHost)
+                {
+                    var host = grip.Host.TryCast<InteractableHost>();
+                    if (host != null) host.TryDetach();
+                }
+            }
+            catch { }
+
+            try
+            {
+                // Копия списка — ForceDetach мутирует attachedHands.
+                var hands = grip.attachedHands;
+                if (hands != null && hands.Count > 0)
+                {
+                    var copy = new System.Collections.Generic.List<Hand>(hands.Count);
+                    foreach (var h in hands)
+                        if (h != null) copy.Add(h);
+                    foreach (var h in copy)
+                    {
+                        try { grip.ForceDetach(h); } catch { }
+                        try { h.TryDetach(); } catch { }
+                    }
+                }
+            }
+            catch { }
+
+            LaunchGrip(grip, fromPos);
+            return true;
+        }
+
+        private static void LaunchGrip(Grip grip, Vector3 fromPos)
+        {
+            Rigidbody rb = null;
+            try
+            {
+                if (grip.HasHost && grip.Host != null)
+                    rb = grip.Host.Rb;
+            }
+            catch { }
+            if (rb == null)
+            {
+                try { rb = grip.GetComponentInParent<Rigidbody>(); } catch { }
+            }
+            if (rb == null) return;
+
+            Vector3 dir = rb.position - fromPos;
+            dir.y += 0.55f;
+            if (dir.sqrMagnitude < 0.0001f) dir = Vector3.up + Vector3.forward * 0.2f;
+            try { rb.velocity = dir.normalized * DisarmSpeed; } catch { }
+            try { rb.angularVelocity = UnityEngine.Random.insideUnitSphere * 8f; } catch { }
+        }
+
+        private static void TakeOwnershipFromGrip(Grip grip)
+        {
+            try
+            {
+                // Предпочтительно кэш GripExtender → NetworkEntity
+                if (LabFusion.Marrow.Extenders.GripExtender.Cache.TryGet(grip, out var ne) && ne != null)
+                {
+                    if (ne.IsRegistered && ne.ID != 0 && !ne.IsOwner)
+                        LabFusion.Entities.NetworkEntityManager.TakeOwnership(ne);
+                    return;
+                }
+            }
+            catch { }
+
+            try
+            {
+                var marrow = grip._marrowEntity;
+                if (marrow == null && grip.HasHost)
+                {
+                    var host = grip.Host.TryCast<InteractableHost>();
+                    if (host != null) marrow = host.marrowEntity;
+                }
+                if (marrow == null) return;
+                var ne = LabFusion.Entities.IMarrowEntityExtender.Cache.Get(marrow);
+                if (ne == null || !ne.IsRegistered || ne.ID == 0 || ne.IsOwner) return;
+                LabFusion.Entities.NetworkEntityManager.TakeOwnership(ne);
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// Запасной sweep: предметы рядом с рукой. Раньше скипали всё под RigManager —
+        /// а held-оружие как раз parented к руке/ригу, поэтому Disarm ничего не брал.
+        /// Теперь скипаем только «чистое» тело без InteractableHost.
+        /// </summary>
+        private static void YankLooseNear(Vector3 center, Vector3 fromPos)
         {
             try
             {
                 int count = Physics.OverlapSphereNonAlloc(center, DisarmRadius, _overlapBuf,
                     Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
-                _yankSeen.Clear();
                 for (int i = 0; i < count; i++)
                 {
                     var col = _overlapBuf[i];
                     if (col == null) continue;
                     var rb = col.attachedRigidbody;
                     if (rb == null) continue;
-                    if (rb.transform.root != null && rb.transform.root.GetComponentInParent<RigManager>() != null)
-                        continue;                                   // тело игрока — не трогаем
                     if (!_yankSeen.Add(rb.GetInstanceID())) continue;
 
-                    TakeItemOwnership(col);                         // забрать владение по сети, иначе швырок бесполезен
+                    // Тело игрока без хоста — не трогаем. Held prop с InteractableHost — трогаем.
+                    var host = rb.GetComponentInParent<InteractableHost>();
+                    if (host == null)
+                    {
+                        if (rb.GetComponentInParent<RigManager>() != null) continue;
+                        continue; // нет хоста — не оружие
+                    }
 
-                    Vector3 dir = rb.position - center; dir.y += 0.4f;
-                    if (dir.sqrMagnitude < 0.0001f) dir = Vector3.up;
-                    try { rb.velocity = dir.normalized * DisarmSpeed; } catch { }
+                    Grip grip = null;
+                    try
+                    {
+                        foreach (var g in host.GetComponentsInChildren<Grip>(true))
+                        {
+                            if (g != null && g.TryCast<AvatarGrip>() == null) { grip = g; break; }
+                        }
+                    }
+                    catch { }
+                    if (grip != null) YankGrip(grip, fromPos);
+                    else
+                    {
+                        TakeItemOwnership(col);
+                        Vector3 dir = rb.position - fromPos; dir.y += 0.55f;
+                        if (dir.sqrMagnitude < 0.0001f) dir = Vector3.up;
+                        try { rb.velocity = dir.normalized * DisarmSpeed; } catch { }
+                    }
                 }
             }
-            catch (Exception e) { MelonLogger.Warning("Disarm: " + e.Message); }
+            catch (Exception e) { MelonLogger.Warning("Disarm sweep: " + e.Message); }
         }
 
-        /// <summary>Резолвим предмет → MarrowEntity → NetworkEntity и забираем владение себе.
-        /// Тогда чужой хват срывается и предмет подчиняется нашей физике.</summary>
+        /// <summary>Резолвим предмет → MarrowEntity → NetworkEntity и забираем владение себе.</summary>
         private static void TakeItemOwnership(Collider col)
         {
             try
@@ -196,12 +407,12 @@ namespace MonsterPanel
                 var me = col.GetComponentInParent<Il2CppSLZ.Marrow.Interaction.MarrowEntity>();
                 if (me == null) return;
                 var ne = LabFusion.Entities.IMarrowEntityExtender.Cache.Get(me);
-                if (ne == null) return;                             // не сетевой предмет — просто физика
-                if (!ne.IsRegistered || ne.ID == 0) return;         // невалидная сущность — не трогаем (иначе warning)
-                if (ne.IsOwner) return;                             // уже наш
+                if (ne == null) return;
+                if (!ne.IsRegistered || ne.ID == 0) return;
+                if (ne.IsOwner) return;
                 LabFusion.Entities.NetworkEntityManager.TakeOwnership(ne);
             }
-            catch { }                                              // не сетевой/недоступен — не критично
+            catch { }
         }
 
         // Весь код с типами LabFusion — здесь (JIT только при загруженном Fusion).
@@ -260,7 +471,7 @@ namespace MonsterPanel
                 finally { _remoteKillSending = false; }
             }
 
-            /// <summary>Disarm Aura: раз в DisarmTickInterval — вырываем стволы у всех игроков в радиусе.</summary>
+            /// <summary>Disarm Aura: раз в DisarmTickInterval — руки + кобуры + sweep у всех в радиусе.</summary>
             public static void DisarmTick()
             {
                 _disarmTimer -= Time.deltaTime;
@@ -274,6 +485,8 @@ namespace MonsterPanel
 
                 try
                 {
+                    _yankSeen.Clear();
+                    int hit = 0;
                     foreach (var np in NetworkPlayer.Players)
                     {
                         if (np == null || np.PlayerID == null || np.PlayerID.IsMe || !np.HasRig) continue;
@@ -281,7 +494,13 @@ namespace MonsterPanel
                         if (rig == null) continue;
                         Vector3 p = RigPos(rig);
                         if ((p - me).sqrMagnitude > r2) continue;
-                        YankItemsAt(p);
+                        if (DisarmPlayer(np, me)) hit++;
+                    }
+                    _logTimer -= DisarmTickInterval;
+                    if (hit > 0 && _logTimer <= 0f)
+                    {
+                        _logTimer = 2f;
+                        MelonLogger.Msg($"Disarm: stripped {hit} player(s).");
                     }
                 }
                 catch (Exception e) { MelonLogger.Warning("Disarm Aura: " + e.Message); }
