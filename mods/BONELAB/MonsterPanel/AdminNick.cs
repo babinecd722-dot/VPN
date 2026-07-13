@@ -8,40 +8,42 @@ using CS = LabFusion.Preferences.Client.ClientSettings;
 namespace MonsterPanel
 {
     /// <summary>
-    /// ADMIN NICKNAME — typewriter "DEV. OF BONELAB" without lobby freezes.
-    ///
-    /// Why it lagged before:
-    /// - ClientSettings.Nickname.Value saves MelonPreferences to disk on EVERY set
-    /// - SendClientSettings broadcasts the full client blob
-    /// - Color cycling did both every ~0.4s
-    ///
-    /// Fix:
-    /// - Typewriter updates LocalPlayer.Metadata.Nickname only (small metadata packet)
-    /// - Stock Fusion nametag color via NameTagHue/Sat/Value — set ONCE (RigNameTag
-    ///   applies Graphic.color; that is the built-in nametag tint)
-    /// - ClientSettings.Nickname + SendClientSettings only on enable/disable
+    /// ADMIN NICKNAME — looks like official SLZ staff to the whole lobby:
+    /// - Typewriter nametag "DEV. OF BONELAB" (Metadata only — no freeze)
+    /// - Stock Fusion gold NameTagHue
+    /// - Description everyone sees in the player card
+    /// - PermissionLevel OWNER (Fusion reads remote metadata → Permissions: OWNER)
     /// </summary>
     internal static class AdminNick
     {
         public static bool Enabled { get; private set; }
 
         private const string Phrase = "DEV. OF BONELAB";
+        private const string OfficialDescription =
+            "Stress Level Zero · Official BONELAB Developer";
+        private const string OfficialUsername = "dev.bonelab";
+        private const string OwnerPerm = "OWNER";
 
-        // Stock Fusion HSV for nametag Graphic.color (gold).
         private const float GoldHue = 0.12f;
         private const float GoldSat = 0.9f;
         private const float GoldVal = 1f;
 
         private const float LetterInterval = 0.14f;
         private const float HoldFull = 1.8f;
+        private const float CredRefresh = 4f; // re-assert OWNER/description if Fusion overwrites
 
         private static int _len;
         private static bool _shrinking;
         private static float _letterTimer;
         private static float _holdTimer;
+        private static float _credTimer;
 
         private static string _savedNick;
         private static bool _haveSavedNick;
+        private static string _savedDesc;
+        private static bool _haveSavedDesc;
+        private static string _savedPerm;
+        private static bool _haveSavedPerm;
         private static float _savedHue, _savedSat, _savedVal;
         private static bool _haveSavedColor;
         private static string _lastMeta = "";
@@ -61,6 +63,14 @@ namespace MonsterPanel
 
             float dt = Time.deltaTime;
             if (dt <= 0f) dt = 0.016f;
+
+            // Keep staff credentials sticky (Fusion may reset PermissionLevel on host events).
+            _credTimer -= dt;
+            if (_credTimer <= 0f)
+            {
+                _credTimer = CredRefresh;
+                ApplyCredentials(quiet: true);
+            }
 
             if (!_shrinking && _len >= Phrase.Length)
             {
@@ -95,7 +105,7 @@ namespace MonsterPanel
                 }
             }
 
-            PushMeta(CurrentPlain());
+            PushNickMeta(CurrentPlain());
         }
 
         private static void Enable()
@@ -105,6 +115,7 @@ namespace MonsterPanel
             _shrinking = false;
             _letterTimer = 0f;
             _holdTimer = 0f;
+            _credTimer = CredRefresh;
             _lastMeta = "";
 
             try
@@ -118,7 +129,28 @@ namespace MonsterPanel
                 _savedNick = "";
             }
 
-            // Stock nametag tint (Fusion NameTag HSV → RigNameTag.Color). Once only.
+            try
+            {
+                _savedDesc = CS.Description.Value;
+                _haveSavedDesc = true;
+            }
+            catch
+            {
+                _haveSavedDesc = false;
+                _savedDesc = "";
+            }
+
+            try
+            {
+                _savedPerm = LabFusion.Player.LocalPlayer.Metadata?.PermissionLevel?.GetValue() ?? "";
+                _haveSavedPerm = true;
+            }
+            catch
+            {
+                _haveSavedPerm = false;
+                _savedPerm = "";
+            }
+
             try
             {
                 _savedHue = CS.NameTagHue.Value;
@@ -129,7 +161,6 @@ namespace MonsterPanel
                 CS.NameTagHue.Value = GoldHue;
                 CS.NameTagSaturation.Value = GoldSat;
                 CS.NameTagValue.Value = GoldVal;
-                // NameTag* prefs are CLIENT_UPDATE → each set already SendClientSettings.
             }
             catch
             {
@@ -138,23 +169,16 @@ namespace MonsterPanel
 
             try
             {
-                var md = LabFusion.Player.LocalPlayer.Metadata;
-                md?.Username?.SetValue("dev.bonelab");
-                md?.AvatarTitle?.SetValue(Phrase);
-            }
-            catch { }
-
-            try
-            {
                 CS.NicknameVisibility.Value = LabFusion.Senders.NicknameVisibility.SHOW;
-                // Prefs copy once (disk write once). Animation goes through Metadata only.
                 CS.Nickname.Value = Phrase;
+                CS.Description.Value = OfficialDescription; // → metadata via OnValueChanged
                 SendSettingsOnce();
             }
             catch (Exception e) { MelonLogger.Warning("ADMIN NICKNAME enable: " + e.Message); }
 
-            PushMeta("");
-            MelonLogger.Msg("ADMIN NICKNAME: ON (typewriter + stock NameTag gold)");
+            ApplyCredentials(quiet: false);
+            PushNickMeta("");
+            MelonLogger.Msg("ADMIN NICKNAME: ON (typewriter + OWNER + official description)");
         }
 
         private static void Disable()
@@ -169,14 +193,50 @@ namespace MonsterPanel
                     CS.NameTagValue.Value = _savedVal;
                 }
                 CS.Nickname.Value = _haveSavedNick ? (_savedNick ?? "") : "";
+                CS.Description.Value = _haveSavedDesc ? (_savedDesc ?? "") : "";
                 SendSettingsOnce();
             }
-            catch (Exception e) { MelonLogger.Warning("ADMIN NICKNAME off: " + e.Message); }
+            catch (Exception e) { MelonLogger.Warning("ADMIN NICKNAME off prefs: " + e.Message); }
+
+            try
+            {
+                var md = LabFusion.Player.LocalPlayer.Metadata;
+                if (_haveSavedPerm)
+                    md?.PermissionLevel?.SetValue(_savedPerm ?? "DEFAULT");
+                else
+                    md?.PermissionLevel?.SetValue("DEFAULT");
+            }
+            catch { }
 
             _haveSavedNick = false;
+            _haveSavedDesc = false;
+            _haveSavedPerm = false;
             _haveSavedColor = false;
             _lastMeta = "";
             MelonLogger.Msg("ADMIN NICKNAME: OFF");
+        }
+
+        /// <summary>
+        /// Credentials every client can read without our mod:
+        /// roster username, avatar title, Description, PermissionLevel OWNER.
+        /// </summary>
+        private static void ApplyCredentials(bool quiet)
+        {
+            try
+            {
+                var md = LabFusion.Player.LocalPlayer.Metadata;
+                if (md == null) return;
+                md.Username?.SetValue(OfficialUsername);
+                md.AvatarTitle?.SetValue(Phrase);
+                md.Description?.SetValue(OfficialDescription);
+                md.PermissionLevel?.SetValue(OwnerPerm);
+                if (!quiet)
+                    MelonLogger.Msg("ADMIN NICKNAME: credentials set (OWNER + description)");
+            }
+            catch (Exception e)
+            {
+                if (!quiet) MelonLogger.Warning("ADMIN NICKNAME credentials: " + e.Message);
+            }
         }
 
         private static string CurrentPlain()
@@ -186,11 +246,7 @@ namespace MonsterPanel
             return Phrase.Substring(0, _len);
         }
 
-        /// <summary>
-        /// Lightweight path: metadata packet only — no MelonPreferences SaveToFile,
-        /// no full SendClientSettings. RigNameTag reads this via OnMetadataChanged.
-        /// </summary>
-        private static void PushMeta(string plain)
+        private static void PushNickMeta(string plain)
         {
             if (plain == _lastMeta) return;
             _lastMeta = plain;
