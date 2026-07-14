@@ -13,7 +13,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.3", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.4", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -47,7 +47,7 @@ namespace MonsterPanel
         /// <summary>Tank: тебя нельзя схватить/поднять (движение и удары как обычно).</summary>
         public static bool TankMode { get; private set; }
 
-        /// <summary>Disarm: у всех игроков рядом постоянно вырывает оружие, без наведения.</summary>
+        /// <summary>Disarm: у всех рядом вырывает оружие; своё при этом забрать нельзя.</summary>
         public static bool Disarm { get; private set; }
 
         private const float LaunchSpeed = 28f;
@@ -423,6 +423,134 @@ namespace MonsterPanel
             catch { }
         }
 
+        // ---------------- Disarm: защита своего оружия ----------------
+        //
+        // Пока Disarm ON — чужие не могут забрать твой лоадаут тем же путём, которым
+        // ты снимаешь их: TakeOwnership обратно + Grabber.Detach / ForceDetach / SendObjectDetach
+        // на чужие руки. Свои руки и кобуры не трогаем (не дропаем своё).
+
+        private static void GuardOwnLoadout()
+        {
+            try
+            {
+                Hand localL = BoneLib.Player.LeftHand;
+                Hand localR = BoneLib.Player.RightHand;
+
+                GuardOwnHeld(localL, localL, localR);
+                GuardOwnHeld(localR, localL, localR);
+
+                var rig = BoneLib.Player.RigManager;
+                if (rig == null) return;
+                var refs = new RigRefs(rig);
+                GuardOwnHolsters(refs, localL, localR);
+            }
+            catch (Exception e) { MelonLogger.Warning("Disarm guard: " + e.Message); }
+        }
+
+        private static void GuardOwnHeld(Hand hand, Hand localL, Hand localR)
+        {
+            if (hand == null) return;
+            Grip grip = ResolveHandGrip(hand);
+            if (grip == null) return;
+            try { if (grip.TryCast<AvatarGrip>() != null) return; } catch { }
+
+            TakeOwnershipFromGrip(grip);
+            StripForeignHandsFromGrip(grip, localL, localR);
+        }
+
+        private static void GuardOwnHolsters(RigRefs refs, Hand localL, Hand localR)
+        {
+            if (refs == null || refs.RigSlots == null) return;
+            foreach (var slot in refs.RigSlots)
+            {
+                if (slot == null) continue;
+                WeaponSlot weapon = null;
+                try { weapon = slot._slottedWeapon; } catch { continue; }
+                if (weapon == null) continue;
+
+                Grip grip = null;
+                try { grip = weapon.grip; } catch { }
+                if (grip == null) continue;
+
+                TakeOwnershipFromGrip(grip);
+                StripForeignHandsFromGrip(grip, localL, localR);
+            }
+        }
+
+        /// <summary>
+        /// Срывает с грипа все руки, кроме локальных L/R.
+        /// Зеркало DisarmPlayer: сначала Fusion Grabber.Detach у владельца руки, потом ForceDetach,
+        /// плюс SendObjectDetach чтобы отцепление ушло в сеть.
+        /// </summary>
+        private static void StripForeignHandsFromGrip(Grip grip, Hand localL, Hand localR)
+        {
+            if (grip == null) return;
+
+            System.Collections.Generic.List<Hand> copy = null;
+            try
+            {
+                var hands = grip.attachedHands;
+                if (hands == null || hands.Count == 0) return;
+                copy = new System.Collections.Generic.List<Hand>(hands.Count);
+                foreach (var h in hands)
+                    if (h != null) copy.Add(h);
+            }
+            catch { return; }
+            if (copy == null || copy.Count == 0) return;
+
+            foreach (var h in copy)
+            {
+                if (h == null) continue;
+                if (h == localL || h == localR) continue;
+                if (IsLocalPlayerHand(h)) continue;
+
+                // Fusion-кэш хвата у чужого NetworkPlayer — иначе CheckDetachAndReattach вернёт ствол им.
+                try
+                {
+                    foreach (var np in NetworkPlayer.Players)
+                    {
+                        if (np == null || np.PlayerID == null || np.PlayerID.IsMe || !np.HasRig) continue;
+                        var r = np.RigRefs;
+                        if (r == null) continue;
+                        bool theirs = h == r.LeftHand || h == r.RightHand;
+                        if (!theirs) continue;
+                        try
+                        {
+                            Handedness hd;
+                            try { hd = h.handedness; }
+                            catch { hd = (h == r.LeftHand) ? Handedness.LEFT : Handedness.RIGHT; }
+                            np.Grabber?.Detach(hd);
+                        }
+                        catch { }
+                        break;
+                    }
+                }
+                catch { }
+
+                try { LabFusion.Grabbables.GrabHelper.SendObjectDetach(h); } catch { }
+                try { grip.ForceDetach(h); } catch { }
+                try { h.TryDetach(); } catch { }
+            }
+        }
+
+        private static bool IsLocalPlayerHand(Hand hand)
+        {
+            if (hand == null) return false;
+            try
+            {
+                if (hand == BoneLib.Player.LeftHand || hand == BoneLib.Player.RightHand) return true;
+            }
+            catch { }
+            try
+            {
+                var rig = BoneLib.Player.RigManager;
+                if (rig != null && hand.transform != null && hand.transform.IsChildOf(rig.transform))
+                    return true;
+            }
+            catch { }
+            return false;
+        }
+
         // Весь код с типами LabFusion — здесь (JIT только при загруженном Fusion).
         private static class Aura
         {
@@ -479,7 +607,7 @@ namespace MonsterPanel
                 finally { _remoteKillSending = false; }
             }
 
-            /// <summary>Disarm Aura: раз в DisarmTickInterval — руки + кобуры + sweep у всех в радиусе.</summary>
+            /// <summary>Disarm Aura: раз в DisarmTickInterval — чужие стволы + защита своего лоадаута.</summary>
             public static void DisarmTick()
             {
                 _disarmTimer -= Time.deltaTime;
@@ -490,6 +618,9 @@ namespace MonsterPanel
                 if (meRig == null) return;
                 Vector3 me = RigPos(meRig);
                 float r2 = AuraRange * AuraRange;
+
+                // Сначала страхуем свой лоадаут (ownership + срыв чужих рук), потом бьём чужих.
+                GuardOwnLoadout();
 
                 try
                 {
