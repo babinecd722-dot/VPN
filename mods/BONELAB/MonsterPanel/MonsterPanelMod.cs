@@ -18,7 +18,7 @@ using UnityEngine;
 using UnityEngine.AI;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.7", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.8", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -754,11 +754,12 @@ namespace MonsterPanel
         private static class Guards
         {
             private const int GuardCount = 3;
-            private const float EscortRadius = 2.4f;
-            private const float TickInterval = 0.2f;
-            private const float WakeWindow = 8f;
+            private const float EscortRadius = 3.2f;
+            private const float TickInterval = 0.35f;
+            private const float WakeWindow = 3f;       // short — heavy ActivateGuard spam knocks them over
             private const float AgroRange = 40f;
-            private const int FriendlyTeam = 9001;
+            private const float ArmDelay = 2.5f;       // brief stabilize, then glue SLZ AKM
+            private const float ResnapBelow = 1.25f;   // if this far below player, yank back up
 
             private static float _timer;
             private static bool _active;
@@ -767,6 +768,7 @@ namespace MonsterPanel
             private static bool _weaponLookupDone;
             private static bool _dumped;
             private static bool _patchesInstalled;
+            private static int _ownerTeam = 0;
 
             private struct Guard
             {
@@ -781,6 +783,9 @@ namespace MonsterPanel
                 public ushort weaponEntityId;
                 public bool armed;
                 public bool armRequested;
+                public float spawnedAt;
+                public bool blockedCols;
+                public bool ignoredPlayerCols;
             }
 
             private static readonly System.Collections.Generic.List<Guard> _guards =
@@ -842,13 +847,32 @@ namespace MonsterPanel
                 _active = true;
 
                 Vector3 c = RigPos(me);
+                Vector3 fwd = Vector3.forward;
+                Vector3 right = Vector3.right;
+                try
+                {
+                    var t = me.transform;
+                    fwd = t.forward; fwd.y = 0f;
+                    if (fwd.sqrMagnitude < 0.01f) fwd = Vector3.forward;
+                    fwd.Normalize();
+                    right = Vector3.Cross(Vector3.up, fwd).normalized;
+                }
+                catch { }
+
+                // Front / left / right — avoid behind-player / under-floor circle points.
+                Vector3[] offsets =
+                {
+                    fwd * EscortRadius + right * (-EscortRadius * 0.85f),
+                    fwd * EscortRadius + right * (EscortRadius * 0.85f),
+                    fwd * (EscortRadius + 1.1f),
+                };
+
                 for (int i = 0; i < GuardCount; i++)
                 {
-                    Vector3 p = c + Quaternion.Euler(0f, i * (360f / GuardCount), 0f) * (Vector3.forward * EscortRadius);
-                    p = SnapToGround(p);
+                    Vector3 p = PlaceOnNavMesh(c + offsets[i % offsets.Length], c);
                     SpawnOne(bc, p);
                 }
-                MelonLogger.Msg($"Security Guards: spawn requested x{GuardCount} (friendly to you, weapons if available).");
+                MelonLogger.Msg($"Security Guards: spawn requested x{GuardCount} (same team as you, stabilize then arm).");
             }
 
             public static void Despawn()
@@ -906,15 +930,35 @@ namespace MonsterPanel
             public static void Tick()
             {
                 if (!_active) return;
+
+                var me = BoneLib.Player.RigManager;
+                if (me == null) return;
+                var myProxy = GetProxy(me);
+
+                // Cache owner team every frame (allegiance = SAME team as you).
+                try
+                {
+                    if (myProxy != null)
+                        _ownerTeam = myProxy.teamNumber;
+                }
+                catch { }
+
+                // Protect owner EVERY frame — 0.2–0.35s throttle was too slow, they punched between ticks.
+                for (int i = 0; i < _guards.Count; i++)
+                {
+                    var g = _guards[i];
+                    if (g.body == null || g.nav == null) continue;
+                    ApplyAllegiance(ref g, myProxy);
+                    ProtectOwner(ref g, myProxy);
+                    _guards[i] = g;
+                }
+
                 _timer -= Time.deltaTime;
                 if (_timer > 0f) return;
                 _timer = TickInterval;
 
-                var me = BoneLib.Player.RigManager;
-                if (me == null) return;
                 Vector3 c = RigPos(me);
                 float now = Time.time;
-                var myProxy = GetProxy(me);
                 var enemy = FindNearestEnemyProxy(c);
 
                 for (int i = _guards.Count - 1; i >= 0; i--)
@@ -929,22 +973,45 @@ namespace MonsterPanel
 
                     EnsureOwnership(g);
 
-                    if (!g.ready || now < g.wakeUntil)
+                    // Only heavy-activate until ready — repeating Active/Resurrect knocks them down.
+                    if (!g.ready)
                     {
                         ActivateGuard(ref g);
                         g.ready = IsGuardReady(g);
+                        if (g.ready && !g.blockedCols)
+                        {
+                            try { g.nav?.BlockCollisions(2f); g.blockedCols = true; } catch { }
+                        }
+                    }
+                    else if (now < g.wakeUntil)
+                    {
+                        Stabilize(ref g);
+                        ResnapIfBuried(ref g, c);
+                    }
+                    else
+                    {
+                        Stabilize(ref g);
+                        ResnapIfBuried(ref g, c);
                     }
 
-                    ApplyAllegiance(ref g);
+                    IgnorePlayerCollisions(ref g, me);
+                    ApplyAllegiance(ref g, myProxy);
                     ProtectOwner(ref g, myProxy);
 
-                    bool fighting = enemy != null && DirectHostility(ref g, enemy);
+                    bool fighting = false;
+                    if (enemy != null)
+                    {
+                        // Only force agro when not currently locked on you.
+                        fighting = DirectHostility(ref g, enemy, myProxy);
+                    }
+
                     if (!fighting)
                         Escort(ref g, i, c);
                     else
                         UpdateHomeOnly(ref g, i, c);
 
-                    if (g.ready && !g.armed && !g.armRequested)
+                    // Arm only after they stand stably — FixedJoint guns tip them over.
+                    if (g.ready && !g.armed && !g.armRequested && (now - g.spawnedAt) >= ArmDelay)
                         RequestWeapon(ref g);
 
                     _guards[i] = g;
@@ -984,14 +1051,35 @@ namespace MonsterPanel
                 return best;
             }
 
-            private static void ApplyAllegiance(ref Guard g)
+            /// <summary>
+            /// Same team as local player so vanilla sensor agro skips you.
+            /// Other players are usually also that team — we still force SetAgro on them.
+            /// </summary>
+            private static void ApplyAllegiance(ref Guard g, TriggerRefProxy myProxy)
             {
                 if (g.nav == null) return;
-                try { g.nav.SetTeam(FriendlyTeam); } catch { }
+                int team = _ownerTeam;
+                try
+                {
+                    if (myProxy != null) team = myProxy.teamNumber;
+                }
+                catch { }
+
+                try { g.nav.SetTeam(team); } catch { }
                 try
                 {
                     if (g.nav.sensors != null && g.nav.sensors.selfTrp != null)
-                        g.nav.sensors.selfTrp.teamNumber = FriendlyTeam;
+                        g.nav.sensors.selfTrp.teamNumber = team;
+                }
+                catch { }
+
+                try
+                {
+                    foreach (var brain in g.body.GetComponentsInChildren<AIBrain>(true))
+                    {
+                        if (brain == null) continue;
+                        try { brain.SpawnGroupIgnore(true); } catch { }
+                    }
                 }
                 catch { }
             }
@@ -1017,21 +1105,32 @@ namespace MonsterPanel
 
                 try
                 {
-                    if (g.nav.mentalState == BehaviourBaseNav.MentalState.Agroed ||
-                        g.nav.mentalState == BehaviourBaseNav.MentalState.Engaged)
+                    // If locked onto you — drop agro immediately.
+                    var sens = g.nav.sensors;
+                    bool onMe = sens != null && sens.target == myProxy;
+                    if (onMe || IsLocalPlayerProxy(sens != null ? sens.target : null))
                     {
-                        var sens = g.nav.sensors;
-                        if (sens != null && sens.target == myProxy)
-                            g.nav.SwitchMentalState(BehaviourBaseNav.MentalState.Roam);
+                        try { sens.target = null; } catch { }
+                        try { g.nav.SwitchMentalState(BehaviourBaseNav.MentalState.Roam); } catch { }
                     }
                 }
                 catch { }
             }
 
-            private static bool DirectHostility(ref Guard g, TriggerRefProxy enemy)
+            private static bool DirectHostility(ref Guard g, TriggerRefProxy enemy, TriggerRefProxy myProxy)
             {
                 if (g.nav == null || enemy == null) return false;
                 if (IsLocalPlayerProxy(enemy)) return false;
+                if (myProxy != null && enemy == myProxy) return false;
+
+                // Don't overwrite if somehow still targeting owner.
+                try
+                {
+                    if (g.nav.sensors != null && g.nav.sensors.target == myProxy)
+                        return false;
+                }
+                catch { }
+
                 try
                 {
                     g.nav.AddThreat(enemy, 100f);
@@ -1042,26 +1141,161 @@ namespace MonsterPanel
                 catch { return false; }
             }
 
+            private static void Stabilize(ref Guard g)
+            {
+                if (g.nav == null) return;
+                try
+                {
+                    var loco = g.nav.locoState;
+                    if (loco == BehaviourBaseNav.LocoState.Fallen ||
+                        loco == BehaviourBaseNav.LocoState.InAir)
+                    {
+                        try { g.nav.SwitchLocoState(BehaviourBaseNav.LocoState.GetUp, 0f, true); } catch { }
+                    }
+                }
+                catch { }
+
+                // Keep muscle drives alive without re-running full ActivateGuard.
+                try
+                {
+                    var pm = g.puppet;
+                    if (pm == null) return;
+                    if (pm.muscleSpring <= 0f && pm._defaultMuscleSpring > 0f)
+                        pm.muscleSpring = pm._defaultMuscleSpring;
+                    if (pm.muscleWeight < 0.5f)
+                        pm.muscleWeight = pm._defaultMuscleWeight > 0f ? pm._defaultMuscleWeight : 1f;
+                }
+                catch { }
+            }
+
+            private static void ResnapIfBuried(ref Guard g, Vector3 playerPos)
+            {
+                if (g.body == null) return;
+                try
+                {
+                    Vector3 p = g.body.transform.position;
+                    if (p.y > playerPos.y - ResnapBelow) return;
+                    Vector3 fixedPos = PlaceOnNavMesh(
+                        new Vector3(p.x, playerPos.y, p.z), playerPos);
+                    TeleportGuard(ref g, fixedPos);
+                }
+                catch { }
+            }
+
+            private static void TeleportGuard(ref Guard g, Vector3 pos)
+            {
+                if (g.body == null) return;
+                try
+                {
+                    g.body.transform.position = pos;
+                    if (g.agent != null && g.agent.enabled)
+                    {
+                        try { g.agent.Warp(pos); } catch { }
+                    }
+                    try
+                    {
+                        var marrow = MarrowEntity.Cache.Get(g.body);
+                        if (marrow != null)
+                            marrow.Teleport(pos, g.body.transform.rotation);
+                    }
+                    catch { }
+                    try { g.nav?.BlockCollisions(1.25f); } catch { }
+                }
+                catch { }
+            }
+
+            private static void IgnorePlayerCollisions(ref Guard g, RigManager me)
+            {
+                if (g.ignoredPlayerCols || g.body == null || me == null) return;
+                try
+                {
+                    var mine = me.GetComponentsInChildren<Collider>(true);
+                    var theirs = g.body.GetComponentsInChildren<Collider>(true);
+                    for (int i = 0; i < mine.Length; i++)
+                    {
+                        if (mine[i] == null || !mine[i].enabled) continue;
+                        for (int j = 0; j < theirs.Length; j++)
+                        {
+                            if (theirs[j] == null || !theirs[j].enabled) continue;
+                            try { Physics.IgnoreCollision(mine[i], theirs[j], true); } catch { }
+                        }
+                    }
+                    g.ignoredPlayerCols = true;
+                }
+                catch { }
+            }
+
             private static void UpdateHomeOnly(ref Guard g, int index, Vector3 center)
             {
                 if (g.nav == null) return;
-                Vector3 home = center + Quaternion.Euler(0f, index * (360f / Mathf.Max(1, _guards.Count)), 0f)
-                                  * (Vector3.forward * EscortRadius);
-                home = SnapToGround(home);
+                Vector3 home = EscortPoint(center, index);
                 try { g.nav.SetHomeIsPost(false); } catch { }
                 try { g.nav.SetHomePosition(home, true, true); } catch { }
+            }
+
+            private static Vector3 EscortPoint(Vector3 center, int index)
+            {
+                Vector3 fwd = Vector3.forward;
+                Vector3 right = Vector3.right;
+                try
+                {
+                    var me = BoneLib.Player.RigManager;
+                    if (me != null)
+                    {
+                        fwd = me.transform.forward; fwd.y = 0f;
+                        if (fwd.sqrMagnitude < 0.01f) fwd = Vector3.forward;
+                        fwd.Normalize();
+                        right = Vector3.Cross(Vector3.up, fwd).normalized;
+                    }
+                }
+                catch { }
+
+                Vector3[] offsets =
+                {
+                    fwd * EscortRadius + right * (-EscortRadius * 0.85f),
+                    fwd * EscortRadius + right * (EscortRadius * 0.85f),
+                    fwd * (EscortRadius + 1.1f),
+                };
+                return PlaceOnNavMesh(center + offsets[index % offsets.Length], center);
             }
 
             private static void Escort(ref Guard g, int index, Vector3 center)
             {
                 if (g.nav == null) return;
-                Vector3 home = center + Quaternion.Euler(0f, index * (360f / Mathf.Max(1, _guards.Count)), 0f)
-                                  * (Vector3.forward * EscortRadius);
-                home = SnapToGround(home);
+                Vector3 home = EscortPoint(center, index);
                 try { g.nav.freezeWhileResting = false; } catch { }
                 try { g.nav.SetHomeIsPost(false); } catch { }
                 try { g.nav.SetHomePosition(home, true, true); } catch { }
-                try { g.nav.SetPath(home); } catch { }
+
+                // Don't hard-SetPath every tick while getting up — causes stumble loops.
+                bool gettingUp = false;
+                try
+                {
+                    var loco = g.nav.locoState;
+                    gettingUp = loco == BehaviourBaseNav.LocoState.Fallen
+                                || loco == BehaviourBaseNav.LocoState.GetUp
+                                || loco == BehaviourBaseNav.LocoState.InAir;
+                }
+                catch { }
+
+                if (!gettingUp)
+                {
+                    try { g.nav.SetPath(home); } catch { }
+                    if (g.agent != null)
+                    {
+                        try
+                        {
+                            if (!g.agent.enabled) g.agent.enabled = true;
+                            if (g.agent.isOnNavMesh)
+                            {
+                                g.agent.isStopped = false;
+                                g.agent.SetDestination(home);
+                            }
+                        }
+                        catch { }
+                    }
+                }
+
                 try
                 {
                     if (g.nav.mentalState == BehaviourBaseNav.MentalState.Rest)
@@ -1071,32 +1305,22 @@ namespace MonsterPanel
                 {
                     try { g.nav.SwitchMentalState(BehaviourBaseNav.MentalState.Roam); } catch { }
                 }
-
-                if (g.agent != null)
-                {
-                    try
-                    {
-                        if (!g.agent.enabled) g.agent.enabled = true;
-                        if (g.agent.isOnNavMesh && g.agent.isStopped) g.agent.isStopped = false;
-                        if (g.agent.isOnNavMesh)
-                            g.agent.SetDestination(home);
-                    }
-                    catch { }
-                }
             }
 
             private static void RequestWeapon(ref Guard g)
             {
+                MelonLogger.Msg($"Security Guards: arm check id={g.entityId} armed={g.armed} req={g.armRequested}");
                 string wbc = FindWeaponBarcode();
                 if (wbc == null || g.body == null)
                 {
+                    MelonLogger.Warning("Security Guards: no AKM/Rifle barcode — guards stay unarmed.");
                     g.armRequested = true;
                     return;
                 }
 
                 g.armRequested = true;
                 int bodyId = g.body.GetInstanceID();
-                Vector3 handPos = g.body.transform.position + Vector3.up * 1.1f;
+                Vector3 handPos = g.body.transform.position + Vector3.up * 1.1f + g.body.transform.right * 0.25f;
                 try
                 {
                     var hand = FindRightHand(g);
@@ -1108,7 +1332,7 @@ namespace MonsterPanel
                 {
                     var spawnable = new Spawnable
                     {
-                        crateRef = new Il2CppSLZ.Marrow.Warehouse.SpawnableCrateReference(wbc)
+                        crateRef = new SpawnableCrateReference(wbc)
                     };
                     var info = new LabFusion.RPC.NetworkAssetSpawner.SpawnRequestInfo
                     {
@@ -1120,7 +1344,7 @@ namespace MonsterPanel
                         SpawnCallback = infoCb => OnWeaponSpawned(infoCb, bodyId),
                     };
                     LabFusion.RPC.NetworkAssetSpawner.Spawn(info);
-                    MelonLogger.Msg($"Security Guards: requesting weapon for body={bodyId}.");
+                    MelonLogger.Msg($"Security Guards: spawning AKM/Rifle '{wbc}' for body={bodyId}.");
                 }
                 catch (Exception e)
                 {
@@ -1336,11 +1560,16 @@ namespace MonsterPanel
                         entityId = id,
                         wakeUntil = Time.time + WakeWindow,
                         ready = false,
+                        spawnedAt = Time.time,
                     };
                     CacheParts(ref g);
                     ActivateGuard(ref g);
-                    ApplyAllegiance(ref g);
+                    ApplyAllegiance(ref g, GetProxy(BoneLib.Player.RigManager));
                     g.ready = IsGuardReady(g);
+                    if (g.ready)
+                    {
+                        try { g.nav?.BlockCollisions(2f); g.blockedCols = true; } catch { }
+                    }
                     _guards.Add(g);
 
                     MelonCoroutines.Start(WakeRoutine(id, go));
@@ -1413,9 +1642,9 @@ namespace MonsterPanel
                         }
 
                         ActivateGuard(ref g);
-                        ApplyAllegiance(ref g);
+                        ApplyAllegiance(ref g, GetProxy(BoneLib.Player.RigManager));
                         g.ready = IsGuardReady(g);
-                        if (g.ready && !g.armed && !g.armRequested)
+                        if (g.ready && !g.armed && !g.armRequested && (Time.time - g.spawnedAt) >= ArmDelay)
                             RequestWeapon(ref g);
                         _guards[i] = g;
                         if (g.ready && wi >= 4)
@@ -1679,16 +1908,37 @@ namespace MonsterPanel
                 catch { }
             }
 
-            private static Vector3 SnapToGround(Vector3 pos)
+            private static Vector3 PlaceOnNavMesh(Vector3 desired, Vector3 fallbackPlayer)
             {
+                // Prefer NavMesh sample, then ground ray from high above.
                 try
                 {
-                    if (Physics.Raycast(pos + Vector3.up * 3f, Vector3.down, out var hit, 10f,
+                    Vector3 probe = desired;
+                    if (NavMesh.SamplePosition(probe, out var navHit, 4f, NavMesh.AllAreas))
+                        probe = navHit.position;
+                    else if (NavMesh.SamplePosition(fallbackPlayer + Vector3.up * 0.2f, out navHit, 6f, NavMesh.AllAreas))
+                        probe = navHit.position + (desired - fallbackPlayer);
+
+                    if (Physics.Raycast(probe + Vector3.up * 6f, Vector3.down, out var hit, 14f,
                             Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
-                        return hit.point + Vector3.up * 0.05f;
+                    {
+                        // Reject hits far below the player (ceilings/underside geo).
+                        if (hit.point.y >= fallbackPlayer.y - 2.5f)
+                            return hit.point + Vector3.up * 0.08f;
+                    }
+
+                    if (NavMesh.SamplePosition(probe, out navHit, 4f, NavMesh.AllAreas))
+                        return navHit.position + Vector3.up * 0.08f;
                 }
                 catch { }
-                return pos;
+
+                // Last resort: player height ring.
+                return new Vector3(desired.x, fallbackPlayer.y, desired.z);
+            }
+
+            private static Vector3 SnapToGround(Vector3 pos)
+            {
+                return PlaceOnNavMesh(pos, pos);
             }
 
             private static string FindBarcode()
@@ -1706,8 +1956,6 @@ namespace MonsterPanel
                     foreach (var crate in wh.GetCrates())
                     {
                         if (crate == null) continue;
-                        // CRITICAL (Quest log): title "Security Guard" can match an AvatarCrate.
-                        // Avatar spawn = only Avatar+Poolee, no PuppetMaster/MarrowEntity → lifeless.
                         if (crate.TryCast<AvatarCrate>() != null) continue;
                         if (crate.TryCast<SpawnableCrate>() == null) continue;
 
@@ -1767,6 +2015,7 @@ namespace MonsterPanel
                 return null;
             }
 
+            /// <summary>Prefer SLZ AKM (Rifle). Falls back to other SLZ rifles.</summary>
             private static string FindWeaponBarcode()
             {
                 if (_weaponLookupDone) return _weaponBarcode;
@@ -1774,54 +2023,106 @@ namespace MonsterPanel
                 try
                 {
                     var wh = AssetWarehouse.Instance;
-                    if (wh == null) return null;
-
-                    string[] prefer =
+                    if (wh == null)
                     {
-                        "Pistol", "Handgun", "Hand Gun", "M1911", "1911", "Glock", "Revolver",
-                        "Semi-Auto", "Semi Auto"
-                    };
-                    string[] fallback = { "SMG", "Rifle", "Carbine", "Shotgun", "Machine Pistol" };
-                    string[] avoid =
-                    {
-                        "Spawn", "Utility", "Dev Tool", "DevTool", "Gravity", "Nimbus",
-                        "Constrainer", "Balloon", "Board", "Avatar", "Gun Gun"
-                    };
-
-                    string Pick(string[] keys)
-                    {
-                        foreach (var key in keys)
-                        {
-                            foreach (var crate in wh.GetCrates())
-                            {
-                                if (crate == null) continue;
-                                if (crate.TryCast<AvatarCrate>() != null) continue;
-                                if (crate.TryCast<SpawnableCrate>() == null) continue;
-                                string t = crate.Title;
-                                if (string.IsNullOrEmpty(t)) continue;
-                                if (t.IndexOf(key, StringComparison.OrdinalIgnoreCase) < 0) continue;
-                                bool bad = false;
-                                foreach (var a in avoid)
-                                {
-                                    if (t.IndexOf(a, StringComparison.OrdinalIgnoreCase) >= 0)
-                                    { bad = true; break; }
-                                }
-                                if (bad) continue;
-                                return crate.Barcode.ID + "\n" + t;
-                            }
-                        }
+                        MelonLogger.Warning("Security Guards: weapon search — AssetWarehouse null.");
                         return null;
                     }
 
-                    string picked = Pick(prefer) ?? Pick(fallback);
-                    if (picked != null)
+                    // Exact-ish barcode guesses used by BONELAB content.
+                    string[] hardIds =
                     {
-                        int nl = picked.IndexOf('\n');
-                        _weaponBarcode = picked.Substring(0, nl);
-                        MelonLogger.Msg($"Security Guards: weapon crate '{picked.Substring(nl + 1)}' -> {_weaponBarcode}");
+                        "SLZ.BONELAB.Content.Spawnable.AKM",
+                        "SLZ.BONELAB.Content.SpawnableGroup.AKM",
+                        "SLZ.BONELAB.Content.Spawnable.RifleAKM",
+                    };
+                    foreach (var hid in hardIds)
+                    {
+                        try
+                        {
+                            var cref = new SpawnableCrateReference(hid);
+                            if (cref != null && cref.Crate != null)
+                            {
+                                _weaponBarcode = hid;
+                                MelonLogger.Msg($"Security Guards: weapon hard-id OK '{hid}'.");
+                                return _weaponBarcode;
+                            }
+                        }
+                        catch { }
+                    }
+
+                    string bestId = null;
+                    string bestTitle = null;
+                    int bestScore = -1;
+
+                    foreach (var crate in wh.GetCrates())
+                    {
+                        if (crate == null) continue;
+                        if (crate.TryCast<AvatarCrate>() != null) continue;
+                        if (crate.TryCast<SpawnableCrate>() == null) continue;
+
+                        string t = crate.Title ?? "";
+                        string id = "";
+                        try { id = crate.Barcode != null ? crate.Barcode.ID : ""; } catch { }
+                        if (string.IsNullOrEmpty(t) && string.IsNullOrEmpty(id)) continue;
+
+                        // Skip junk.
+                        string[] avoid =
+                        {
+                            "Spawn Gun", "Utility", "Dev Tool", "DevTool", "Gravity", "Nimbus",
+                            "Constrainer", "Balloon", "Board", "Avatar", "NPC", "Gun Gun", "Melee"
+                        };
+                        bool bad = false;
+                        foreach (var a in avoid)
+                        {
+                            if (t.IndexOf(a, StringComparison.OrdinalIgnoreCase) >= 0) { bad = true; break; }
+                        }
+                        if (bad) continue;
+
+                        int score = 0;
+                        bool akm = t.IndexOf("AKM", StringComparison.OrdinalIgnoreCase) >= 0
+                                   || id.IndexOf("AKM", StringComparison.OrdinalIgnoreCase) >= 0;
+                        bool rifle = t.IndexOf("Rifle", StringComparison.OrdinalIgnoreCase) >= 0
+                                     || id.IndexOf("Rifle", StringComparison.OrdinalIgnoreCase) >= 0;
+                        if (akm) score += 200;
+                        else if (rifle) score += 80;
+                        else continue;
+
+                        // Prefer SLZ / internal pallet.
+                        try
+                        {
+                            var pallet = crate.Pallet;
+                            if (pallet != null)
+                            {
+                                if (pallet.Internal) score += 40;
+                                string author = pallet.Author ?? "";
+                                if (author.IndexOf("Stress Level Zero", StringComparison.OrdinalIgnoreCase) >= 0
+                                    || author.Equals("SLZ", StringComparison.OrdinalIgnoreCase)
+                                    || author.IndexOf("SLZ", StringComparison.OrdinalIgnoreCase) >= 0)
+                                    score += 50;
+                            }
+                        }
+                        catch { }
+
+                        if (id.IndexOf("SLZ.BONELAB.Content", StringComparison.OrdinalIgnoreCase) >= 0)
+                            score += 30;
+
+                        MelonLogger.Msg($"Security Guards: weapon candidate '{t}' score={score} -> {id}");
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            bestId = id;
+                            bestTitle = t;
+                        }
+                    }
+
+                    if (bestId != null)
+                    {
+                        _weaponBarcode = bestId;
+                        MelonLogger.Msg($"Security Guards: weapon using '{bestTitle}' score={bestScore} -> {_weaponBarcode}");
                     }
                     else
-                        MelonLogger.Msg("Security Guards: no suitable weapon crate found (guards stay unarmed).");
+                        MelonLogger.Msg("Security Guards: no AKM/Rifle SpawnableCrate found.");
                 }
                 catch (Exception e) { MelonLogger.Warning("Guards weapon barcode: " + e.Message); }
                 return _weaponBarcode;
