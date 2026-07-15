@@ -18,7 +18,7 @@ using UnityEngine;
 using UnityEngine.AI;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.9", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.10", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -755,17 +755,19 @@ namespace MonsterPanel
         {
             private const int GuardCount = 3;
             private const float EscortRadius = 3.2f;
-            private const float TickInterval = 0.45f;
+            private const float TickInterval = 0.5f;
             private const float WakeWindow = 2f;
             private const float AgroRange = 40f;
-            private const float ArmDelay = 4f;         // after spawn — past settle, then glue AKM
-            private const float SettleTime = 3.5f;     // no SetPath/agro while they plant feet
+            private const float ArmDelay = 1.5f;       // Tick-driven (MelonCoroutines do NOT resume on Quest)
+            private const float SettleTime = 5f;       // no SetPath/agro while they plant feet
             private const float ResnapBelow = 1.25f;
+            private const float HeartbeatEvery = 2f;
 
             // Official SLZ BONELAB AKM (BONELAB barcode lists / BoneLib).
             private const string AkmBarcode = "c1534c5a-a6b5-4177-beb8-04d947756e41";
 
             private static float _timer;
+            private static float _heartbeat;
             private static bool _active;
             private static string _barcode;
             private static string _weaponBarcode;
@@ -773,6 +775,10 @@ namespace MonsterPanel
             private static bool _dumped;
             private static bool _patchesInstalled;
             private static int _ownerTeam = 0;
+
+            // Weapon spawn callbacks must be method-groups on Quest — lambdas often never fire.
+            private static readonly System.Collections.Generic.Queue<int> _pendingArmBodyIds =
+                new System.Collections.Generic.Queue<int>();
 
             private struct Guard
             {
@@ -797,6 +803,12 @@ namespace MonsterPanel
 
             private static readonly System.Collections.Generic.List<Guard> _guards =
                 new System.Collections.Generic.List<Guard>();
+
+            private static bool BodyAlive(GameObject go)
+            {
+                // Il2Cpp Unity fake-null safe check.
+                try { return go != null && go; } catch { return go != null; }
+            }
 
             public static void Install(HarmonyLib.Harmony harmony)
             {
@@ -854,6 +866,8 @@ namespace MonsterPanel
                 _active = true;
                 _weaponLookupDone = false;
                 _weaponBarcode = null;
+                _heartbeat = 0f; // log hb immediately on first TryArmSquad
+                _timer = 0f;
 
                 // Resolve AKM up-front so the log always shows whether the crate exists.
                 string akm = FindWeaponBarcode();
@@ -886,83 +900,67 @@ namespace MonsterPanel
                     Vector3 p = PlaceOnNavMesh(c + offsets[i % offsets.Length], c);
                     SpawnOne(bc, p);
                 }
-                MelonCoroutines.Start(ArmSquadRoutine());
+                // NOTE: MelonCoroutines IEnumerator does NOT resume on Quest LemonLoader —
+                // arming is driven from Tick.TryArmSquad every frame instead.
                 MelonLogger.Msg(
-                    $"Security Guards: spawn requested x{GuardCount} (settle {SettleTime:0.#}s, arm at {ArmDelay:0.#}s).");
+                    $"Security Guards: spawn requested x{GuardCount} (settle {SettleTime:0.#}s, Tick-arm at {ArmDelay:0.#}s).");
             }
 
             /// <summary>
-            /// Dedicated arm path — Tick alone never logged "arm check" on Quest 2.29.8.
-            /// Retries a few times so late-ready guards still get a gun.
+            /// Quest-safe arming: MelonCoroutines never continued past the first yield in 2.29.9.
+            /// Called every frame from Tick.
             /// </summary>
-            private static IEnumerator ArmSquadRoutine()
+            private static void TryArmSquad()
             {
-                MelonLogger.Msg($"Security Guards: ArmSquad waiting {ArmDelay:0.#}s…");
-                float waited = 0f;
-                while (waited < ArmDelay)
+                if (!_active) return;
+                float now = Time.time;
+
+                _heartbeat -= Time.deltaTime;
+                if (_heartbeat <= 0f)
                 {
-                    if (!_active) yield break;
-                    waited += Time.deltaTime;
-                    yield return null;
+                    _heartbeat = HeartbeatEvery;
+                    int readyN = 0, armedN = 0, reqN = 0;
+                    for (int i = 0; i < _guards.Count; i++)
+                    {
+                        var g = _guards[i];
+                        if (!BodyAlive(g.body)) continue;
+                        if (g.ready) readyN++;
+                        if (g.armed) armedN++;
+                        if (g.armRequested) reqN++;
+                    }
+                    MelonLogger.Msg(
+                        $"Security Guards: hb squad={_guards.Count} ready={readyN} armed={armedN} req={reqN}");
                 }
 
-                string wbc = FindWeaponBarcode();
-                MelonLogger.Msg(wbc != null
-                    ? $"Security Guards: ArmSquad barcode -> {wbc}"
-                    : "Security Guards: ArmSquad barcode MISSING — will still retry lookup.");
-
-                for (int pass = 0; pass < 6; pass++)
+                for (int i = 0; i < _guards.Count; i++)
                 {
-                    if (!_active) yield break;
-
-                    int armed = 0, requested = 0, skipped = 0;
-                    for (int i = 0; i < _guards.Count; i++)
+                    var g = _guards[i];
+                    try
                     {
-                        var g = _guards[i];
-                        try
+                        if (!BodyAlive(g.body)) continue;
+
+                        CacheParts(ref g);
+                        if (!g.ready)
                         {
-                            if (g.body == null) { skipped++; continue; }
-                            CacheParts(ref g);
-                            if (!g.ready)
-                            {
-                                ActivateGuard(ref g, full: !g.activatedOnce);
-                                g.ready = IsGuardReady(g);
-                            }
-                            if (g.armed) { armed++; _guards[i] = g; continue; }
-                            if (!g.ready) { skipped++; _guards[i] = g; continue; }
-                            if (!g.armRequested)
-                            {
-                                RequestWeapon(ref g);
-                                requested++;
-                            }
-                            else
-                                requested++;
-                            _guards[i] = g;
+                            // Soft ready: have puppet+nav after first activate.
+                            g.ready = IsGuardReady(g);
+                            if (!g.ready && g.puppet != null && g.nav != null)
+                                g.ready = true; // still try to arm even if mode flickers
                         }
-                        catch (Exception e)
+
+                        float age = now - g.spawnedAt;
+                        if (!g.armed && !g.armRequested && age >= ArmDelay)
                         {
-                            MelonLogger.Warning($"Security Guards: ArmSquad pass={pass} i={i}: {e.Message}");
+                            MelonLogger.Msg(
+                                $"Security Guards: Tick-arm id={g.entityId} age={age:0.0}s ready={g.ready}");
+                            RequestWeapon(ref g);
                         }
+
+                        _guards[i] = g;
                     }
-
-                    MelonLogger.Msg(
-                        $"Security Guards: ArmSquad pass={pass + 1} armed={armed} req={requested} skip={skipped} squad={_guards.Count}");
-
-                    if (_guards.Count == 0) yield break;
-                    bool allDone = true;
-                    for (int i = 0; i < _guards.Count; i++)
+                    catch (Exception e)
                     {
-                        var g = _guards[i];
-                        if (g.body != null && !g.armed) { allDone = false; break; }
-                    }
-                    if (allDone) yield break;
-
-                    float gap = 0f;
-                    while (gap < 1.0f)
-                    {
-                        if (!_active) yield break;
-                        gap += Time.deltaTime;
-                        yield return null;
+                        MelonLogger.Warning($"Security Guards: TryArm i={i}: {e.Message}");
                     }
                 }
             }
@@ -970,6 +968,7 @@ namespace MonsterPanel
             public static void Despawn()
             {
                 _active = false;
+                _pendingArmBodyIds.Clear();
                 for (int i = 0; i < _guards.Count; i++)
                 {
                     var g = _guards[i];
@@ -985,12 +984,12 @@ namespace MonsterPanel
                                     DespawnEffect = false,
                                 });
                         }
-                        else if (g.body != null)
+                        else if (BodyAlive(g.body))
                             UnityEngine.Object.Destroy(g.body);
                     }
                     catch
                     {
-                        try { if (g.body != null) UnityEngine.Object.Destroy(g.body); } catch { }
+                        try { if (BodyAlive(g.body)) UnityEngine.Object.Destroy(g.body); } catch { }
                     }
                 }
                 _guards.Clear();
@@ -1022,6 +1021,12 @@ namespace MonsterPanel
             public static void Tick()
             {
                 if (!_active) return;
+
+                // Arm FIRST every frame — never gated on RigManager / throttle / escort.
+                // (2.29.9 MelonCoroutines died after first yield; Tick backup never logged arm check.)
+                try { TryArmSquad(); }
+                catch (Exception e) { MelonLogger.Warning("Guards TryArm: " + e.Message); }
+
                 try
                 {
                     var me = BoneLib.Player.RigManager;
@@ -1038,11 +1043,15 @@ namespace MonsterPanel
                     // Per-frame protect (no Harmony on Quest).
                     for (int i = 0; i < _guards.Count; i++)
                     {
-                        var g = _guards[i];
-                        if (g.body == null || g.nav == null) continue;
-                        ApplyAllegiance(ref g, myProxy);
-                        ProtectOwner(ref g, myProxy);
-                        _guards[i] = g;
+                        try
+                        {
+                            var g = _guards[i];
+                            if (!BodyAlive(g.body) || g.nav == null) continue;
+                            ApplyAllegiance(ref g, myProxy);
+                            ProtectOwner(ref g, myProxy);
+                            _guards[i] = g;
+                        }
+                        catch { }
                     }
 
                     _timer -= Time.deltaTime;
@@ -1056,77 +1065,79 @@ namespace MonsterPanel
                     for (int i = _guards.Count - 1; i >= 0; i--)
                     {
                         var g = _guards[i];
-                        if (g.body == null)
-                        {
-                            DespawnWeapon(g);
-                            _guards.RemoveAt(i);
-                            continue;
-                        }
-
-                        EnsureOwnership(g);
-
-                        if (!g.ready)
-                        {
-                            ActivateGuard(ref g, full: !g.activatedOnce);
-                            g.ready = IsGuardReady(g);
-                            if (g.ready && !g.blockedCols)
-                            {
-                                try { g.nav?.BlockCollisions(4f); g.blockedCols = true; } catch { }
-                            }
-                        }
-                        else
-                        {
-                            Stabilize(ref g);
-                            ResnapIfBuried(ref g, c);
-                        }
-
-                        IgnorePlayerCollisions(ref g, me);
-                        ApplyAllegiance(ref g, myProxy);
-                        ProtectOwner(ref g, myProxy);
-
-                        bool settling = (now - g.spawnedAt) < SettleTime;
-                        if (!settling)
-                        {
-                            g.settleDone = true;
-                            bool fighting = false;
-                            try
-                            {
-                                fighting = enemy != null && DirectHostility(ref g, enemy, myProxy);
-                            }
-                            catch (Exception e)
-                            {
-                                MelonLogger.Warning("Guards agro: " + e.Message);
-                            }
-                            try
-                            {
-                                if (!fighting)
-                                    Escort(ref g, i, c);
-                                else
-                                    UpdateHomeOnly(ref g, i, c);
-                            }
-                            catch (Exception e)
-                            {
-                                MelonLogger.Warning("Guards escort: " + e.Message);
-                            }
-                        }
-                        else
-                        {
-                            // Plant feet: home only, no SetPath.
-                            try { UpdateHomeOnly(ref g, i, c); } catch { }
-                        }
-
-                        // Backup arm path (primary is ArmSquadRoutine).
                         try
                         {
-                            if (g.ready && !g.armed && !g.armRequested && (now - g.spawnedAt) >= ArmDelay)
-                                RequestWeapon(ref g);
+                            if (!BodyAlive(g.body))
+                            {
+                                DespawnWeapon(g);
+                                _guards.RemoveAt(i);
+                                continue;
+                            }
+
+                            EnsureOwnership(g);
+                            CacheParts(ref g);
+
+                            if (!g.ready || !g.activatedOnce)
+                            {
+                                ActivateGuard(ref g, full: !g.activatedOnce);
+                                g.ready = IsGuardReady(g) || (g.puppet != null && g.nav != null);
+                                if (g.ready && !g.blockedCols)
+                                {
+                                    try { g.nav?.BlockCollisions(5f); g.blockedCols = true; } catch { }
+                                }
+                            }
+                            else
+                            {
+                                Stabilize(ref g);
+                                ResnapIfBuried(ref g, c);
+                            }
+
+                            IgnorePlayerCollisions(ref g, me);
+                            ApplyAllegiance(ref g, myProxy);
+                            ProtectOwner(ref g, myProxy);
+
+                            bool settling = (now - g.spawnedAt) < SettleTime;
+                            if (settling)
+                            {
+                                // Plant feet: home only, agent stopped, no SetPath.
+                                try
+                                {
+                                    if (g.agent != null) g.agent.isStopped = true;
+                                }
+                                catch { }
+                                try { UpdateHomeOnly(ref g, i, c); } catch { }
+                            }
+                            else
+                            {
+                                g.settleDone = true;
+                                bool fighting = false;
+                                try
+                                {
+                                    fighting = enemy != null && DirectHostility(ref g, enemy, myProxy);
+                                }
+                                catch (Exception e)
+                                {
+                                    MelonLogger.Warning("Guards agro: " + e.Message);
+                                }
+                                try
+                                {
+                                    if (!fighting)
+                                        Escort(ref g, i, c);
+                                    else
+                                        UpdateHomeOnly(ref g, i, c);
+                                }
+                                catch (Exception e)
+                                {
+                                    MelonLogger.Warning("Guards escort: " + e.Message);
+                                }
+                            }
+
+                            _guards[i] = g;
                         }
                         catch (Exception e)
                         {
-                            MelonLogger.Warning("Guards arm tick: " + e.Message);
+                            MelonLogger.Warning($"Guards Tick i={i}: {e.Message}");
                         }
-
-                        _guards[i] = g;
                     }
 
                     if (_guards.Count == 0) _active = false;
@@ -1431,7 +1442,7 @@ namespace MonsterPanel
             {
                 MelonLogger.Msg($"Security Guards: arm check id={g.entityId} armed={g.armed} req={g.armRequested}");
                 string wbc = FindWeaponBarcode();
-                if (wbc == null || g.body == null)
+                if (wbc == null || !BodyAlive(g.body))
                 {
                     MelonLogger.Warning("Security Guards: no AKM/Rifle barcode — guards stay unarmed.");
                     g.armRequested = true;
@@ -1454,6 +1465,8 @@ namespace MonsterPanel
                     {
                         crateRef = new SpawnableCrateReference(wbc)
                     };
+                    // Queue body id BEFORE spawn — callback must be a method group (no lambda capture on Quest).
+                    _pendingArmBodyIds.Enqueue(bodyId);
                     var info = new LabFusion.RPC.NetworkAssetSpawner.SpawnRequestInfo
                     {
                         Spawnable = spawnable,
@@ -1461,7 +1474,7 @@ namespace MonsterPanel
                         Rotation = g.body.transform.rotation,
                         SpawnEffect = false,
                         SpawnSource = LabFusion.Entities.EntitySource.Player,
-                        SpawnCallback = infoCb => OnWeaponSpawned(infoCb, bodyId),
+                        SpawnCallback = OnWeaponSpawnedQueued,
                     };
                     LabFusion.RPC.NetworkAssetSpawner.Spawn(info);
                     MelonLogger.Msg($"Security Guards: spawning AKM/Rifle '{wbc}' for body={bodyId}.");
@@ -1470,7 +1483,21 @@ namespace MonsterPanel
                 {
                     MelonLogger.Warning("Guards arm: " + e.Message);
                     g.armRequested = false;
+                    try { if (_pendingArmBodyIds.Count > 0) _pendingArmBodyIds.Dequeue(); } catch { }
                 }
+            }
+
+            private static void OnWeaponSpawnedQueued(LabFusion.RPC.NetworkAssetSpawner.SpawnCallbackInfo info)
+            {
+                int bodyId = 0;
+                try
+                {
+                    if (_pendingArmBodyIds.Count > 0)
+                        bodyId = _pendingArmBodyIds.Dequeue();
+                }
+                catch { }
+                MelonLogger.Msg($"Security Guards: weapon callback bodyId={bodyId} go={(info.Spawned != null)}");
+                OnWeaponSpawned(info, bodyId);
             }
 
             private static void OnWeaponSpawned(LabFusion.RPC.NetworkAssetSpawner.SpawnCallbackInfo info, int bodyId)
@@ -1710,14 +1737,14 @@ namespace MonsterPanel
                     CacheParts(ref g);
                     ActivateGuard(ref g, full: true);
                     ApplyAllegiance(ref g, GetProxy(BoneLib.Player.RigManager));
-                    g.ready = IsGuardReady(g);
+                    g.ready = IsGuardReady(g) || (g.puppet != null && g.nav != null);
                     if (g.ready)
                     {
-                        try { g.nav?.BlockCollisions(4f); g.blockedCols = true; } catch { }
+                        try { g.nav?.BlockCollisions(5f); g.blockedCols = true; } catch { }
                     }
                     _guards.Add(g);
 
-                    MelonCoroutines.Start(WakeRoutine(id, go));
+                    // No MelonCoroutines — they do not resume on Quest. Tick handles wake/arm.
 
                     if (g.puppet == null)
                     {
@@ -1734,74 +1761,7 @@ namespace MonsterPanel
                 catch (Exception e) { MelonLogger.Warning("Guards onSpawned: " + e.Message); }
             }
 
-            private static IEnumerator WakeRoutine(ushort entityId, GameObject go)
-            {
-                int[] waits = { 1, 2, 4, 8, 15, 30, 45, 60, 90, 120, 180 };
-                int wi = 0;
-                int frame = 0;
-                bool loggedMissing = false;
-                while (wi < waits.Length)
-                {
-                    yield return null;
-                    frame++;
-                    if (frame < waits[wi]) continue;
-                    wi++;
-
-                    if (!_active || go == null) yield break;
-
-                    for (int i = 0; i < _guards.Count; i++)
-                    {
-                        var g = _guards[i];
-                        if (g.body != go && (entityId == 0 || g.entityId != entityId)) continue;
-
-                        // Resolve entity id late.
-                        if (g.entityId == 0)
-                        {
-                            try
-                            {
-                                var marrow = MarrowEntity.Cache.Get(go);
-                                if (marrow != null && IMarrowEntityExtender.Cache.TryGet(marrow, out var ne) && ne != null)
-                                {
-                                    g.entityId = ne.ID;
-                                    ClaimOwnership(ne);
-                                }
-                            }
-                            catch { }
-                        }
-
-                        EnsureOwnership(g);
-                        CacheParts(ref g);
-                        if (g.puppet == null)
-                        {
-                            if (!loggedMissing && wi >= 4)
-                            {
-                                loggedMissing = true;
-                                DumpComponents(go);
-                                MelonLogger.Warning(
-                                    "Security Guards: still no PuppetMaster after wait — likely wrong crate (Avatar). " +
-                                    "Clearing barcode cache; next spawn will re-scan SpawnableCrates only.");
-                                _barcode = null;
-                            }
-                            _guards[i] = g;
-                            break;
-                        }
-
-                        // Heavy activate once; after that only stabilize (SwitchModes spam = ragdoll).
-                        if (!g.ready || !g.activatedOnce)
-                            ActivateGuard(ref g, full: true);
-                        else
-                            Stabilize(ref g);
-
-                        ApplyAllegiance(ref g, GetProxy(BoneLib.Player.RigManager));
-                        g.ready = IsGuardReady(g);
-                        // Arming is owned by ArmSquadRoutine — don't race it here.
-                        _guards[i] = g;
-                        if (g.ready && wi >= 4)
-                            MelonLogger.Msg($"Security Guards: id={g.entityId} fully awake (frame {frame}).");
-                        break;
-                    }
-                }
-            }
+            // WakeRoutine removed — MelonCoroutines IEnumerator never continued on Quest (2.29.9 log).
 
             private static void ClaimOwnership(NetworkEntity ent)
             {
@@ -1969,17 +1929,11 @@ namespace MonsterPanel
                         try { nav.deactivated = false; } catch { }
                         try { nav.freezeWhileResting = false; } catch { }
 
+                        // Minimal wake — full Resurrect/ResetAnimator/Standing spam ragdolls Quest NPCs.
                         try { nav.OnEntityUncull(); } catch { }
-                        try { nav.Resurrect(); } catch { }
-                        try { nav.OnReactivate(0); } catch { }
                         try { nav.Activate(); } catch { }
-                        try { nav.Initiate(); } catch { }
                         try { nav.EnableNav(); } catch { }
-                        try { nav.AnimAwake(); } catch { }
-                        try { nav.ResetAnimator(); } catch { }
-                        try { nav.SwitchLocoState(BehaviourBaseNav.LocoState.Standing, 0f, true); } catch { }
                         try { nav.SwitchMentalState(BehaviourBaseNav.MentalState.Roam); } catch { }
-                        // Keep collision block — do NOT zero _blockCollisionsUntil.
                     }
                     else
                     {
@@ -1990,9 +1944,7 @@ namespace MonsterPanel
                             {
                                 b.enabled = true;
                                 b.deactivated = false;
-                                b.Resurrect();
                                 b.Activate();
-                                b.Initiate();
                             }
                             catch { }
                         }
