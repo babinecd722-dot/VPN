@@ -9,6 +9,7 @@ using Il2CppSLZ.Marrow.Combat;
 using Il2CppSLZ.Marrow.Data;
 using Il2CppSLZ.Marrow.Interaction;
 using Il2CppSLZ.Marrow.PuppetMasta;
+using Il2CppSLZ.Marrow.Warehouse;
 using LabFusion.Entities;
 using LabFusion.Extensions;
 using LabFusion.Marrow.Extenders;
@@ -17,7 +18,7 @@ using UnityEngine;
 using UnityEngine.AI;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.6", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.7", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -787,48 +788,12 @@ namespace MonsterPanel
 
             public static void Install(HarmonyLib.Harmony harmony)
             {
-                if (_patchesInstalled || harmony == null) return;
-                try
-                {
-                    harmony.Patch(
-                        AccessTools.Method(typeof(BehaviourBaseNav), nameof(BehaviourBaseNav.SetAgro)),
-                        prefix: new HarmonyMethod(typeof(Guards), nameof(AgroPrefix_Nav)));
-                    harmony.Patch(
-                        AccessTools.Method(typeof(BehaviourBaseNav), nameof(BehaviourBaseNav.SetEngaged)),
-                        prefix: new HarmonyMethod(typeof(Guards), nameof(AgroPrefix_Nav)));
-                    harmony.Patch(
-                        AccessTools.Method(typeof(BehaviourBaseNav), nameof(BehaviourBaseNav.AddThreat),
-                            new[] { typeof(TriggerRefProxy), typeof(float) }),
-                        prefix: new HarmonyMethod(typeof(Guards), nameof(ThreatPrefix_Nav)));
-                    _patchesInstalled = true;
-                    MelonLogger.Msg("Security Guards: friendly-fire patches installed.");
-                }
-                catch (Exception e) { MelonLogger.Warning("Guards patches: " + e.Message); }
-            }
-
-            private static bool AgroPrefix_Nav(BehaviourBaseNav __instance, TriggerRefProxy trp) =>
-                !ShouldBlockAgro(__instance, trp);
-
-            private static bool ThreatPrefix_Nav(BehaviourBaseNav __instance, TriggerRefProxy trp, float __1) =>
-                !ShouldBlockAgro(__instance, trp);
-
-            private static bool ShouldBlockAgro(BehaviourBaseNav nav, TriggerRefProxy trp)
-            {
-                if (!_active || nav == null || trp == null) return false;
-                if (!IsOurGuard(nav)) return false;
-                return IsLocalPlayerProxy(trp);
-            }
-
-            private static bool IsOurGuard(BehaviourBaseNav nav)
-            {
-                if (nav == null) return false;
-                for (int i = 0; i < _guards.Count; i++)
-                {
-                    var g = _guards[i];
-                    if (g.nav == nav) return true;
-                    if (g.body != null && nav.transform.IsChildOf(g.body.transform)) return true;
-                }
-                return false;
+                if (_patchesInstalled) return;
+                // Quest/LemonLoader frequently fails IL compile when patching Il2Cpp AI methods
+                // ("Guards patches: IL Compile Error"). Friendly behaviour is enforced in Tick
+                // via ProtectOwner / DirectHostility instead — no Harmony required.
+                _patchesInstalled = true;
+                MelonLogger.Msg("Security Guards: friendly mode via tick (no Harmony agro patches).");
             }
 
             private static bool IsLocalPlayerProxy(TriggerRefProxy trp)
@@ -1350,6 +1315,21 @@ namespace MonsterPanel
                     }
                     catch { }
 
+                    // Late entity resolve: Fusion may hand back a GO before NetworkEntity exists.
+                    if (id == 0)
+                    {
+                        try
+                        {
+                            var marrow = MarrowEntity.Cache.Get(go);
+                            if (marrow != null && IMarrowEntityExtender.Cache.TryGet(marrow, out var ne) && ne != null)
+                            {
+                                id = ne.ID;
+                                ClaimOwnership(ne);
+                            }
+                        }
+                        catch { }
+                    }
+
                     var g = new Guard
                     {
                         body = go,
@@ -1365,7 +1345,14 @@ namespace MonsterPanel
 
                     MelonCoroutines.Start(WakeRoutine(id, go));
 
-                    if (!g.ready) DumpComponents(go);
+                    if (g.puppet == null)
+                    {
+                        DumpComponents(go);
+                        MelonLogger.Warning(
+                            "Security Guards: no PuppetMaster yet on spawn callback — waiting for full NPC hierarchy. " +
+                            "If this stays Avatar+Poolee only, the crate was not an NPC SpawnableCrate.");
+                    }
+
                     MelonLogger.Msg(
                         $"Security Guards: spawned id={id} ready={g.ready} mode={(g.puppet != null ? g.puppet.mode.ToString() : "?")} " +
                         $"state={(g.puppet != null ? g.puppet.state.ToString() : "?")} (squad {_guards.Count}).");
@@ -1375,9 +1362,10 @@ namespace MonsterPanel
 
             private static IEnumerator WakeRoutine(ushort entityId, GameObject go)
             {
-                int[] waits = { 1, 2, 4, 8, 15, 30, 45, 60 };
+                int[] waits = { 1, 2, 4, 8, 15, 30, 45, 60, 90, 120, 180 };
                 int wi = 0;
                 int frame = 0;
+                bool loggedMissing = false;
                 while (wi < waits.Length)
                 {
                     yield return null;
@@ -1391,7 +1379,39 @@ namespace MonsterPanel
                     {
                         var g = _guards[i];
                         if (g.body != go && (entityId == 0 || g.entityId != entityId)) continue;
+
+                        // Resolve entity id late.
+                        if (g.entityId == 0)
+                        {
+                            try
+                            {
+                                var marrow = MarrowEntity.Cache.Get(go);
+                                if (marrow != null && IMarrowEntityExtender.Cache.TryGet(marrow, out var ne) && ne != null)
+                                {
+                                    g.entityId = ne.ID;
+                                    ClaimOwnership(ne);
+                                }
+                            }
+                            catch { }
+                        }
+
                         EnsureOwnership(g);
+                        CacheParts(ref g);
+                        if (g.puppet == null)
+                        {
+                            if (!loggedMissing && wi >= 4)
+                            {
+                                loggedMissing = true;
+                                DumpComponents(go);
+                                MelonLogger.Warning(
+                                    "Security Guards: still no PuppetMaster after wait — likely wrong crate (Avatar). " +
+                                    "Clearing barcode cache; next spawn will re-scan SpawnableCrates only.");
+                                _barcode = null;
+                            }
+                            _guards[i] = g;
+                            break;
+                        }
+
                         ActivateGuard(ref g);
                         ApplyAllegiance(ref g);
                         g.ready = IsGuardReady(g);
@@ -1676,21 +1696,72 @@ namespace MonsterPanel
                 if (!string.IsNullOrEmpty(_barcode)) return _barcode;
                 try
                 {
-                    var wh = Il2CppSLZ.Marrow.Warehouse.AssetWarehouse.Instance;
+                    var wh = AssetWarehouse.Instance;
                     if (wh == null) return null;
+
+                    string bestId = null;
+                    string bestTitle = null;
+                    int bestScore = -1;
+
                     foreach (var crate in wh.GetCrates())
                     {
                         if (crate == null) continue;
+                        // CRITICAL (Quest log): title "Security Guard" can match an AvatarCrate.
+                        // Avatar spawn = only Avatar+Poolee, no PuppetMaster/MarrowEntity → lifeless.
+                        if (crate.TryCast<AvatarCrate>() != null) continue;
+                        if (crate.TryCast<SpawnableCrate>() == null) continue;
+
                         string t = crate.Title;
-                        if (!string.IsNullOrEmpty(t) &&
-                            t.IndexOf("Security Guard", StringComparison.OrdinalIgnoreCase) >= 0)
+                        if (string.IsNullOrEmpty(t)) continue;
+
+                        int score = 0;
+                        if (t.IndexOf("Security Guard", StringComparison.OrdinalIgnoreCase) >= 0)
+                            score = 100;
+                        else if (t.Replace(" ", "").Equals("SecurityGuard", StringComparison.OrdinalIgnoreCase))
+                            score = 95;
+                        else
+                            continue;
+
+                        try
                         {
-                            _barcode = crate.Barcode.ID;
-                            MelonLogger.Msg($"Security Guards: crate '{t}' -> {_barcode}");
-                            return _barcode;
+                            var tags = crate.Tags;
+                            if (tags != null)
+                            {
+                                foreach (var tag in tags)
+                                {
+                                    string ts = tag != null ? tag.ToString() : null;
+                                    if (string.IsNullOrEmpty(ts)) continue;
+                                    if (ts.IndexOf("NPC", StringComparison.OrdinalIgnoreCase) >= 0) score += 25;
+                                    if (ts.IndexOf("Enemy", StringComparison.OrdinalIgnoreCase) >= 0) score += 10;
+                                }
+                            }
+                        }
+                        catch { }
+
+                        try
+                        {
+                            var pallet = crate.Pallet;
+                            if (pallet != null && pallet.Internal) score += 15;
+                        }
+                        catch { }
+
+                        MelonLogger.Msg($"Security Guards: candidate SpawnableCrate '{t}' score={score} -> {crate.Barcode.ID}");
+                        if (score > bestScore)
+                        {
+                            bestScore = score;
+                            bestId = crate.Barcode.ID;
+                            bestTitle = t;
                         }
                     }
-                    MelonLogger.Msg("Security Guards: no crate titled 'Security Guard'.");
+
+                    if (bestId != null)
+                    {
+                        _barcode = bestId;
+                        MelonLogger.Msg($"Security Guards: using SpawnableCrate '{bestTitle}' score={bestScore} -> {_barcode}");
+                        return _barcode;
+                    }
+
+                    MelonLogger.Msg("Security Guards: no SpawnableCrate titled 'Security Guard' (Avatar crates ignored).");
                 }
                 catch (Exception e) { MelonLogger.Warning("Guards barcode: " + e.Message); }
                 return null;
@@ -1702,7 +1773,7 @@ namespace MonsterPanel
                 _weaponLookupDone = true;
                 try
                 {
-                    var wh = Il2CppSLZ.Marrow.Warehouse.AssetWarehouse.Instance;
+                    var wh = AssetWarehouse.Instance;
                     if (wh == null) return null;
 
                     string[] prefer =
@@ -1714,7 +1785,7 @@ namespace MonsterPanel
                     string[] avoid =
                     {
                         "Spawn", "Utility", "Dev Tool", "DevTool", "Gravity", "Nimbus",
-                        "Constrainer", "Balloon", "Board", "Avatar", "NPC", "Gun Gun"
+                        "Constrainer", "Balloon", "Board", "Avatar", "Gun Gun"
                     };
 
                     string Pick(string[] keys)
@@ -1724,10 +1795,11 @@ namespace MonsterPanel
                             foreach (var crate in wh.GetCrates())
                             {
                                 if (crate == null) continue;
+                                if (crate.TryCast<AvatarCrate>() != null) continue;
+                                if (crate.TryCast<SpawnableCrate>() == null) continue;
                                 string t = crate.Title;
                                 if (string.IsNullOrEmpty(t)) continue;
-                                bool hit = t.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0;
-                                if (!hit) continue;
+                                if (t.IndexOf(key, StringComparison.OrdinalIgnoreCase) < 0) continue;
                                 bool bad = false;
                                 foreach (var a in avoid)
                                 {
@@ -1761,6 +1833,10 @@ namespace MonsterPanel
                 _dumped = true;
                 try
                 {
+                    int children = 0;
+                    try { children = go.transform.childCount; } catch { }
+                    bool hasMarrow = false;
+                    try { hasMarrow = MarrowEntity.Cache.Get(go) != null; } catch { }
                     var comps = go.GetComponentsInChildren<MonoBehaviour>(true);
                     var seen = new System.Collections.Generic.HashSet<string>();
                     var sb = new System.Text.StringBuilder();
@@ -1771,7 +1847,8 @@ namespace MonsterPanel
                         try { n = c.GetIl2CppType().Name; } catch { n = "?"; }
                         if (seen.Add(n)) { sb.Append(n); sb.Append(", "); }
                     }
-                    MelonLogger.Msg("Security Guards: components -> " + sb);
+                    MelonLogger.Msg(
+                        $"Security Guards: dump children={children} marrowEntity={hasMarrow} comps -> {sb}");
                 }
                 catch (Exception e) { MelonLogger.Warning("Guards dump: " + e.Message); }
             }
