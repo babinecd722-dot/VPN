@@ -4,6 +4,7 @@ using System.Reflection;
 using BoneLib.BoneMenu;
 using HarmonyLib;
 using Il2CppSLZ.Marrow;
+using Il2CppSLZ.Marrow.AI;
 using Il2CppSLZ.Marrow.Combat;
 using Il2CppSLZ.Marrow.Data;
 using Il2CppSLZ.Marrow.Interaction;
@@ -16,7 +17,7 @@ using UnityEngine;
 using UnityEngine.AI;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.5", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.6", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -85,6 +86,7 @@ namespace MonsterPanel
             if (_fusionLoaded)
                 PidSpoof.Init(HarmonyInstance); // Spoofing PID: hook SetPlatformID + restore saved state
             AntiManip.Install(HarmonyInstance); // silent Dev Manipulator immunity (no UI)
+            Guards.Install(HarmonyInstance);    // bodyguards: never agro the local player
             BuildMenu();
             ApplyPatches();
             MelonLogger.Msg("MONSTER Panel loaded.");
@@ -745,19 +747,25 @@ namespace MonsterPanel
         // NetworkAssetSpawner syncs the prefab for everyone, but Fusion often leaves the
         // PuppetMaster in Disabled (T-pose / no muscle drives / colliders off) and the
         // BehaviourBaseNav asleep. We take ownership (restores muscleSpring/Damper via
-        // PuppetMasterExtender), force Alive+Active, wake nav/AI, and keep asserting
-        // during a short wake window.
+        // PuppetMasterExtender), force Alive+Active, wake nav/AI, keep asserting during
+        // a wake window, stay friendly to the local player, agro other players, and
+        // try to put a networked pistol in their right hand.
         private static class Guards
         {
             private const int GuardCount = 3;
             private const float EscortRadius = 2.4f;
-            private const float TickInterval = 0.25f;
+            private const float TickInterval = 0.2f;
             private const float WakeWindow = 8f;
+            private const float AgroRange = 40f;
+            private const int FriendlyTeam = 9001;
 
             private static float _timer;
             private static bool _active;
             private static string _barcode;
+            private static string _weaponBarcode;
+            private static bool _weaponLookupDone;
             private static bool _dumped;
+            private static bool _patchesInstalled;
 
             private struct Guard
             {
@@ -768,10 +776,78 @@ namespace MonsterPanel
                 public NavMeshAgent agent;
                 public float wakeUntil;
                 public bool ready;
+                public GameObject weapon;
+                public ushort weaponEntityId;
+                public bool armed;
+                public bool armRequested;
             }
 
             private static readonly System.Collections.Generic.List<Guard> _guards =
                 new System.Collections.Generic.List<Guard>();
+
+            public static void Install(HarmonyLib.Harmony harmony)
+            {
+                if (_patchesInstalled || harmony == null) return;
+                try
+                {
+                    harmony.Patch(
+                        AccessTools.Method(typeof(BehaviourBaseNav), nameof(BehaviourBaseNav.SetAgro)),
+                        prefix: new HarmonyMethod(typeof(Guards), nameof(AgroPrefix_Nav)));
+                    harmony.Patch(
+                        AccessTools.Method(typeof(BehaviourBaseNav), nameof(BehaviourBaseNav.SetEngaged)),
+                        prefix: new HarmonyMethod(typeof(Guards), nameof(AgroPrefix_Nav)));
+                    harmony.Patch(
+                        AccessTools.Method(typeof(BehaviourBaseNav), nameof(BehaviourBaseNav.AddThreat),
+                            new[] { typeof(TriggerRefProxy), typeof(float) }),
+                        prefix: new HarmonyMethod(typeof(Guards), nameof(ThreatPrefix_Nav)));
+                    _patchesInstalled = true;
+                    MelonLogger.Msg("Security Guards: friendly-fire patches installed.");
+                }
+                catch (Exception e) { MelonLogger.Warning("Guards patches: " + e.Message); }
+            }
+
+            private static bool AgroPrefix_Nav(BehaviourBaseNav __instance, TriggerRefProxy trp) =>
+                !ShouldBlockAgro(__instance, trp);
+
+            private static bool ThreatPrefix_Nav(BehaviourBaseNav __instance, TriggerRefProxy trp, float __1) =>
+                !ShouldBlockAgro(__instance, trp);
+
+            private static bool ShouldBlockAgro(BehaviourBaseNav nav, TriggerRefProxy trp)
+            {
+                if (!_active || nav == null || trp == null) return false;
+                if (!IsOurGuard(nav)) return false;
+                return IsLocalPlayerProxy(trp);
+            }
+
+            private static bool IsOurGuard(BehaviourBaseNav nav)
+            {
+                if (nav == null) return false;
+                for (int i = 0; i < _guards.Count; i++)
+                {
+                    var g = _guards[i];
+                    if (g.nav == nav) return true;
+                    if (g.body != null && nav.transform.IsChildOf(g.body.transform)) return true;
+                }
+                return false;
+            }
+
+            private static bool IsLocalPlayerProxy(TriggerRefProxy trp)
+            {
+                if (trp == null) return false;
+                try
+                {
+                    var me = BoneLib.Player.RigManager;
+                    if (me == null) return false;
+                    if (trp.transform != null && trp.transform.IsChildOf(me.transform)) return true;
+                    if (trp.root != null && trp.root.transform != null &&
+                        (trp.root.transform == me.transform || trp.root.transform.IsChildOf(me.transform)))
+                        return true;
+                    var mine = me.GetComponentInChildren<TriggerRefProxy>(true);
+                    if (mine != null && mine == trp) return true;
+                }
+                catch { }
+                return false;
+            }
 
             public static void Spawn()
             {
@@ -807,7 +883,7 @@ namespace MonsterPanel
                     p = SnapToGround(p);
                     SpawnOne(bc, p);
                 }
-                MelonLogger.Msg($"Security Guards: spawn requested x{GuardCount}.");
+                MelonLogger.Msg($"Security Guards: spawn requested x{GuardCount} (friendly to you, weapons if available).");
             }
 
             public static void Despawn()
@@ -816,6 +892,7 @@ namespace MonsterPanel
                 for (int i = 0; i < _guards.Count; i++)
                 {
                     var g = _guards[i];
+                    DespawnWeapon(g);
                     try
                     {
                         if (g.entityId != 0)
@@ -839,6 +916,28 @@ namespace MonsterPanel
                 MelonLogger.Msg("Security Guards: despawned.");
             }
 
+            private static void DespawnWeapon(Guard g)
+            {
+                try
+                {
+                    if (g.weaponEntityId != 0)
+                    {
+                        LabFusion.RPC.NetworkAssetSpawner.Despawn(
+                            new LabFusion.RPC.NetworkAssetSpawner.DespawnRequestInfo
+                            {
+                                EntityID = g.weaponEntityId,
+                                DespawnEffect = false,
+                            });
+                    }
+                    else if (g.weapon != null)
+                        UnityEngine.Object.Destroy(g.weapon);
+                }
+                catch
+                {
+                    try { if (g.weapon != null) UnityEngine.Object.Destroy(g.weapon); } catch { }
+                }
+            }
+
             public static void Tick()
             {
                 if (!_active) return;
@@ -850,12 +949,15 @@ namespace MonsterPanel
                 if (me == null) return;
                 Vector3 c = RigPos(me);
                 float now = Time.time;
+                var myProxy = GetProxy(me);
+                var enemy = FindNearestEnemyProxy(c);
 
                 for (int i = _guards.Count - 1; i >= 0; i--)
                 {
                     var g = _guards[i];
                     if (g.body == null)
                     {
+                        DespawnWeapon(g);
                         _guards.RemoveAt(i);
                         continue;
                     }
@@ -866,14 +968,123 @@ namespace MonsterPanel
                     {
                         ActivateGuard(ref g);
                         g.ready = IsGuardReady(g);
-                        _guards[i] = g;
                     }
 
-                    Escort(ref g, i, c);
+                    ApplyAllegiance(ref g);
+                    ProtectOwner(ref g, myProxy);
+
+                    bool fighting = enemy != null && DirectHostility(ref g, enemy);
+                    if (!fighting)
+                        Escort(ref g, i, c);
+                    else
+                        UpdateHomeOnly(ref g, i, c);
+
+                    if (g.ready && !g.armed && !g.armRequested)
+                        RequestWeapon(ref g);
+
                     _guards[i] = g;
                 }
 
                 if (_guards.Count == 0) _active = false;
+            }
+
+            private static TriggerRefProxy GetProxy(RigManager rig)
+            {
+                if (rig == null) return null;
+                try { return rig.GetComponentInChildren<TriggerRefProxy>(true); }
+                catch { return null; }
+            }
+
+            private static TriggerRefProxy FindNearestEnemyProxy(Vector3 from)
+            {
+                TriggerRefProxy best = null;
+                float bestDist = AgroRange * AgroRange;
+                try
+                {
+                    foreach (var np in NetworkPlayer.Players)
+                    {
+                        if (np == null || np.PlayerID == null || np.PlayerID.IsMe || !np.HasRig) continue;
+                        RigManager rig = null;
+                        try { rig = np.RigRefs.RigManager; } catch { }
+                        if (rig == null) continue;
+                        float d = (RigPos(rig) - from).sqrMagnitude;
+                        if (d > bestDist) continue;
+                        var trp = GetProxy(rig);
+                        if (trp == null) continue;
+                        bestDist = d;
+                        best = trp;
+                    }
+                }
+                catch { }
+                return best;
+            }
+
+            private static void ApplyAllegiance(ref Guard g)
+            {
+                if (g.nav == null) return;
+                try { g.nav.SetTeam(FriendlyTeam); } catch { }
+                try
+                {
+                    if (g.nav.sensors != null && g.nav.sensors.selfTrp != null)
+                        g.nav.sensors.selfTrp.teamNumber = FriendlyTeam;
+                }
+                catch { }
+            }
+
+            private static void ProtectOwner(ref Guard g, TriggerRefProxy myProxy)
+            {
+                if (g.nav == null || myProxy == null) return;
+                try
+                {
+                    var sens = g.nav.sensors;
+                    if (sens != null)
+                    {
+                        try { sens.RemoveTarget(myProxy); } catch { }
+                        try
+                        {
+                            if (sens.target == myProxy)
+                                sens.target = null;
+                        }
+                        catch { }
+                    }
+                }
+                catch { }
+
+                try
+                {
+                    if (g.nav.mentalState == BehaviourBaseNav.MentalState.Agroed ||
+                        g.nav.mentalState == BehaviourBaseNav.MentalState.Engaged)
+                    {
+                        var sens = g.nav.sensors;
+                        if (sens != null && sens.target == myProxy)
+                            g.nav.SwitchMentalState(BehaviourBaseNav.MentalState.Roam);
+                    }
+                }
+                catch { }
+            }
+
+            private static bool DirectHostility(ref Guard g, TriggerRefProxy enemy)
+            {
+                if (g.nav == null || enemy == null) return false;
+                if (IsLocalPlayerProxy(enemy)) return false;
+                try
+                {
+                    g.nav.AddThreat(enemy, 100f);
+                    g.nav.SetAgro(enemy);
+                    try { g.nav.SetEngaged(enemy); } catch { }
+                    return true;
+                }
+                catch { return false; }
+            }
+
+            private static void UpdateHomeOnly(ref Guard g, int index, Vector3 center)
+            {
+                if (g.nav == null) return;
+                Vector3 home = center + Quaternion.Euler(0f, index * (360f / Mathf.Max(1, _guards.Count)), 0f)
+                                  * (Vector3.forward * EscortRadius);
+                home = SnapToGround(home);
+                try { g.nav.SetHomeIsPost(false); } catch { }
+                try { g.nav.SetHomePosition(home, true, true); } catch { }
             }
 
             private static void Escort(ref Guard g, int index, Vector3 center)
@@ -907,6 +1118,186 @@ namespace MonsterPanel
                     }
                     catch { }
                 }
+            }
+
+            private static void RequestWeapon(ref Guard g)
+            {
+                string wbc = FindWeaponBarcode();
+                if (wbc == null || g.body == null)
+                {
+                    g.armRequested = true;
+                    return;
+                }
+
+                g.armRequested = true;
+                int bodyId = g.body.GetInstanceID();
+                Vector3 handPos = g.body.transform.position + Vector3.up * 1.1f;
+                try
+                {
+                    var hand = FindRightHand(g);
+                    if (hand != null) handPos = hand.position;
+                }
+                catch { }
+
+                try
+                {
+                    var spawnable = new Spawnable
+                    {
+                        crateRef = new Il2CppSLZ.Marrow.Warehouse.SpawnableCrateReference(wbc)
+                    };
+                    var info = new LabFusion.RPC.NetworkAssetSpawner.SpawnRequestInfo
+                    {
+                        Spawnable = spawnable,
+                        Position = handPos,
+                        Rotation = g.body.transform.rotation,
+                        SpawnEffect = false,
+                        SpawnSource = LabFusion.Entities.EntitySource.Player,
+                        SpawnCallback = infoCb => OnWeaponSpawned(infoCb, bodyId),
+                    };
+                    LabFusion.RPC.NetworkAssetSpawner.Spawn(info);
+                    MelonLogger.Msg($"Security Guards: requesting weapon for body={bodyId}.");
+                }
+                catch (Exception e)
+                {
+                    MelonLogger.Warning("Guards arm: " + e.Message);
+                    g.armRequested = false;
+                }
+            }
+
+            private static void OnWeaponSpawned(LabFusion.RPC.NetworkAssetSpawner.SpawnCallbackInfo info, int bodyId)
+            {
+                try
+                {
+                    var go = info.Spawned;
+                    if (go == null) return;
+
+                    ushort wid = 0;
+                    try
+                    {
+                        if (info.Entity != null)
+                        {
+                            wid = info.Entity.ID;
+                            ClaimOwnership(info.Entity);
+                        }
+                    }
+                    catch { }
+
+                    for (int i = 0; i < _guards.Count; i++)
+                    {
+                        var g = _guards[i];
+                        if (g.body == null || g.body.GetInstanceID() != bodyId) continue;
+                        AttachWeapon(ref g, go, wid);
+                        _guards[i] = g;
+                        MelonLogger.Msg($"Security Guards: weapon attached to id={g.entityId}.");
+                        return;
+                    }
+
+                    try
+                    {
+                        if (wid != 0)
+                            LabFusion.RPC.NetworkAssetSpawner.Despawn(
+                                new LabFusion.RPC.NetworkAssetSpawner.DespawnRequestInfo
+                                { EntityID = wid, DespawnEffect = false });
+                        else
+                            UnityEngine.Object.Destroy(go);
+                    }
+                    catch { }
+                }
+                catch (Exception e) { MelonLogger.Warning("Guards onWeapon: " + e.Message); }
+            }
+
+            private static void AttachWeapon(ref Guard g, GameObject weaponGo, ushort weaponEntityId)
+            {
+                if (g.body == null || weaponGo == null) return;
+                g.weapon = weaponGo;
+                g.weaponEntityId = weaponEntityId;
+
+                Rigidbody handRb = FindRightHand(g);
+                Transform handTf = handRb != null ? handRb.transform : g.body.transform;
+
+                try
+                {
+                    weaponGo.transform.SetParent(handTf, false);
+                    weaponGo.transform.localPosition = new Vector3(0f, 0f, 0.05f);
+                    weaponGo.transform.localRotation = Quaternion.Euler(0f, 90f, 90f);
+                }
+                catch { }
+
+                if (handRb != null)
+                {
+                    try
+                    {
+                        foreach (var old in weaponGo.GetComponents<FixedJoint>())
+                            try { UnityEngine.Object.Destroy(old); } catch { }
+                        var joint = weaponGo.AddComponent<FixedJoint>();
+                        joint.connectedBody = handRb;
+                        joint.breakForce = float.PositiveInfinity;
+                        joint.breakTorque = float.PositiveInfinity;
+                    }
+                    catch { }
+                }
+
+                try
+                {
+                    var gun = weaponGo.GetComponentInChildren<Gun>(true);
+                    if (gun != null)
+                    {
+                        try
+                        {
+                            if (g.nav != null && g.nav.sensors != null && g.nav.sensors.selfTrp != null)
+                                gun.proxyOverride = g.nav.sensors.selfTrp;
+                        }
+                        catch { }
+                        try { gun.Charge(); } catch { }
+                    }
+                }
+                catch { }
+
+                try
+                {
+                    foreach (var host in weaponGo.GetComponentsInChildren<InteractableHost>(true))
+                    {
+                        if (host == null) continue;
+                        try { host.DisableFarHover(); } catch { }
+                    }
+                }
+                catch { }
+
+                g.armed = true;
+            }
+
+            private static Rigidbody FindRightHand(Guard g)
+            {
+                try
+                {
+                    if (g.nav != null && g.nav.sensors != null && g.nav.sensors.selfTrp != null)
+                    {
+                        var rb = g.nav.sensors.selfTrp.rtHandRb;
+                        if (rb != null) return rb;
+                    }
+                }
+                catch { }
+
+                if (g.body == null) return null;
+                try
+                {
+                    foreach (var t in g.body.GetComponentsInChildren<Transform>(true))
+                    {
+                        if (t == null) continue;
+                        string n = t.name;
+                        if (string.IsNullOrEmpty(n)) continue;
+                        string low = n.ToLowerInvariant();
+                        if (low.Contains("hand_r") || low.Contains("r_hand") || low.Contains("righthand")
+                            || low.Contains("hand.r") || low.Contains("right hand")
+                            || (low.Contains("hand") && low.Contains("right")))
+                        {
+                            var rb = t.GetComponent<Rigidbody>();
+                            if (rb != null) return rb;
+                        }
+                    }
+                }
+                catch { }
+                return null;
             }
 
             private static void SpawnOne(string barcode, Vector3 pos)
@@ -948,10 +1339,9 @@ namespace MonsterPanel
                     if (go == null) return;
 
                     ushort id = 0;
-                    NetworkEntity ent = null;
                     try
                     {
-                        ent = info.Entity;
+                        var ent = info.Entity;
                         if (ent != null)
                         {
                             id = ent.ID;
@@ -969,10 +1359,10 @@ namespace MonsterPanel
                     };
                     CacheParts(ref g);
                     ActivateGuard(ref g);
+                    ApplyAllegiance(ref g);
                     g.ready = IsGuardReady(g);
                     _guards.Add(g);
 
-                    // Staggered wake: Fusion extenders / pool init often finish a few frames later.
                     MelonCoroutines.Start(WakeRoutine(id, go));
 
                     if (!g.ready) DumpComponents(go);
@@ -985,7 +1375,6 @@ namespace MonsterPanel
 
             private static IEnumerator WakeRoutine(ushort entityId, GameObject go)
             {
-                // Immediate + delayed passes cover late PuppetMasterExtender registration.
                 int[] waits = { 1, 2, 4, 8, 15, 30, 45, 60 };
                 int wi = 0;
                 int frame = 0;
@@ -1004,7 +1393,10 @@ namespace MonsterPanel
                         if (g.body != go && (entityId == 0 || g.entityId != entityId)) continue;
                         EnsureOwnership(g);
                         ActivateGuard(ref g);
+                        ApplyAllegiance(ref g);
                         g.ready = IsGuardReady(g);
+                        if (g.ready && !g.armed && !g.armRequested)
+                            RequestWeapon(ref g);
                         _guards[i] = g;
                         if (g.ready && wi >= 4)
                             MelonLogger.Msg($"Security Guards: id={g.entityId} fully awake (frame {frame}).");
@@ -1035,7 +1427,6 @@ namespace MonsterPanel
                 }
                 catch { }
 
-                // Mirror Fusion owner-side drive restore in case transfer is delayed.
                 try
                 {
                     var pm = g.puppet;
@@ -1080,10 +1471,6 @@ namespace MonsterPanel
                 catch { }
             }
 
-            /// <summary>
-            /// Bring a networked NPC out of T-pose / no-collision / asleep AI.
-            /// Safe to call repeatedly during the wake window.
-            /// </summary>
             private static void ActivateGuard(ref Guard g)
             {
                 var go = g.body;
@@ -1092,7 +1479,6 @@ namespace MonsterPanel
                 CacheParts(ref g);
                 EnsureOwnership(g);
 
-                // --- PuppetMaster: Alive + Active (T-pose / arms-out fix) ---
                 try
                 {
                     var pm = g.puppet;
@@ -1123,7 +1509,6 @@ namespace MonsterPanel
 
                         try { pm.SetAnimationEnabled(true); } catch { }
 
-                        // Drive weights (Fusion zeroes these for non-owners).
                         try
                         {
                             pm.updateJointAnchors = true;
@@ -1136,7 +1521,6 @@ namespace MonsterPanel
                         }
                         catch { }
 
-                        // Mode transition: Il2Cpp IEnumerator must NOT go to MelonCoroutines.
                         try
                         {
                             if (pm.mode != PuppetMaster.Mode.Active)
@@ -1157,13 +1541,8 @@ namespace MonsterPanel
                                     }
                                 }
                             }
-                            else if (pm.isSwitchingMode)
+                            else if (!pm.isSwitchingMode)
                             {
-                                // Let existing transition finish; still poke SwitchModes if stuck.
-                            }
-                            else
-                            {
-                                // Already Active but may still be limp — re-assert internals.
                                 try { pm.SwitchModes(); } catch { }
                             }
                         }
@@ -1177,7 +1556,6 @@ namespace MonsterPanel
                 }
                 catch { }
 
-                // --- Nav / behaviour brain (do NOT ClearState / RestorePrefabState — those re-sleep NPCs) ---
                 try
                 {
                     var nav = g.nav;
@@ -1198,8 +1576,6 @@ namespace MonsterPanel
                         try { nav.ResetAnimator(); } catch { }
                         try { nav.SwitchLocoState(BehaviourBaseNav.LocoState.Standing, 0f, true); } catch { }
                         try { nav.SwitchMentalState(BehaviourBaseNav.MentalState.Roam); } catch { }
-
-                        // End spawn collision-block early if still active.
                         try { nav._blockCollisionsUntil = 0f; } catch { }
                     }
                     else
@@ -1221,7 +1597,6 @@ namespace MonsterPanel
                 }
                 catch { }
 
-                // --- AIBrain ---
                 try
                 {
                     foreach (var brain in go.GetComponentsInChildren<Il2CppSLZ.Marrow.AI.AIBrain>(true))
@@ -1234,7 +1609,6 @@ namespace MonsterPanel
                 }
                 catch { }
 
-                // --- NavMeshAgent on mesh ---
                 try
                 {
                     var agent = g.agent;
@@ -1253,7 +1627,6 @@ namespace MonsterPanel
                 }
                 catch { }
 
-                // --- Physics / collision ---
                 try
                 {
                     foreach (var col in go.GetComponentsInChildren<Collider>(true))
@@ -1274,7 +1647,6 @@ namespace MonsterPanel
                 }
                 catch { }
 
-                // Animator must be live for non-T-pose visuals while mapping blends in.
                 try
                 {
                     foreach (var anim in go.GetComponentsInChildren<Animator>(true))
@@ -1324,6 +1696,65 @@ namespace MonsterPanel
                 return null;
             }
 
+            private static string FindWeaponBarcode()
+            {
+                if (_weaponLookupDone) return _weaponBarcode;
+                _weaponLookupDone = true;
+                try
+                {
+                    var wh = Il2CppSLZ.Marrow.Warehouse.AssetWarehouse.Instance;
+                    if (wh == null) return null;
+
+                    string[] prefer =
+                    {
+                        "Pistol", "Handgun", "Hand Gun", "M1911", "1911", "Glock", "Revolver",
+                        "Semi-Auto", "Semi Auto"
+                    };
+                    string[] fallback = { "SMG", "Rifle", "Carbine", "Shotgun", "Machine Pistol" };
+                    string[] avoid =
+                    {
+                        "Spawn", "Utility", "Dev Tool", "DevTool", "Gravity", "Nimbus",
+                        "Constrainer", "Balloon", "Board", "Avatar", "NPC", "Gun Gun"
+                    };
+
+                    string Pick(string[] keys)
+                    {
+                        foreach (var key in keys)
+                        {
+                            foreach (var crate in wh.GetCrates())
+                            {
+                                if (crate == null) continue;
+                                string t = crate.Title;
+                                if (string.IsNullOrEmpty(t)) continue;
+                                bool hit = t.IndexOf(key, StringComparison.OrdinalIgnoreCase) >= 0;
+                                if (!hit) continue;
+                                bool bad = false;
+                                foreach (var a in avoid)
+                                {
+                                    if (t.IndexOf(a, StringComparison.OrdinalIgnoreCase) >= 0)
+                                    { bad = true; break; }
+                                }
+                                if (bad) continue;
+                                return crate.Barcode.ID + "\n" + t;
+                            }
+                        }
+                        return null;
+                    }
+
+                    string picked = Pick(prefer) ?? Pick(fallback);
+                    if (picked != null)
+                    {
+                        int nl = picked.IndexOf('\n');
+                        _weaponBarcode = picked.Substring(0, nl);
+                        MelonLogger.Msg($"Security Guards: weapon crate '{picked.Substring(nl + 1)}' -> {_weaponBarcode}");
+                    }
+                    else
+                        MelonLogger.Msg("Security Guards: no suitable weapon crate found (guards stay unarmed).");
+                }
+                catch (Exception e) { MelonLogger.Warning("Guards weapon barcode: " + e.Message); }
+                return _weaponBarcode;
+            }
+
             private static void DumpComponents(GameObject go)
             {
                 if (_dumped || go == null) return;
@@ -1346,7 +1777,6 @@ namespace MonsterPanel
             }
         }
 
-        /// <summary>Принадлежит ли трансформ собственному ригу игрока.</summary>
         private static bool IsOwnRig(Transform t)
         {
             var rig = BoneLib.Player.RigManager;
