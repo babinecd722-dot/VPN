@@ -20,6 +20,8 @@
     <Reference Include="Il2Cppmscorlib"><HintPath>refs/Il2Cppmscorlib.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.CoreModule"><HintPath>refs/UnityEngine.CoreModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.PhysicsModule"><HintPath>refs/UnityEngine.PhysicsModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.AIModule"><HintPath>refs/UnityEngine.AIModule.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="UnityEngine.AnimationModule"><HintPath>refs/UnityEngine.AnimationModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Il2CppSLZ.Marrow"><HintPath>refs/Il2CppSLZ.Marrow.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="LabFusion"><HintPath>refs/LabFusion.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>

@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Reflection;
 using BoneLib.BoneMenu;
 using HarmonyLib;
@@ -9,11 +10,13 @@ using Il2CppSLZ.Marrow.Interaction;
 using Il2CppSLZ.Marrow.PuppetMasta;
 using LabFusion.Entities;
 using LabFusion.Extensions;
+using LabFusion.Marrow.Extenders;
 using MelonLoader;
 using UnityEngine;
+using UnityEngine.AI;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.4", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.5", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -737,61 +740,105 @@ namespace MonsterPanel
             }
         }
 
-        // ---------------- Security Guards (сетевой спавн + эскорт) ----------------
+        // ---------------- Security Guards (сетевой спавн + полная активация) ----------------
         //
-        // Спавним 3 сетевых NPC «Security Guard» (видят все), берём владение (ИИ считаем мы),
-        // и держим их в эскорте вокруг тебя. Barcode находим сами по названию крейта.
-        // Всё с типами LabFusion/Marrow-warehouse — здесь (JIT только при вызове).
+        // NetworkAssetSpawner syncs the prefab for everyone, but Fusion often leaves the
+        // PuppetMaster in Disabled (T-pose / no muscle drives / colliders off) and the
+        // BehaviourBaseNav asleep. We take ownership (restores muscleSpring/Damper via
+        // PuppetMasterExtender), force Alive+Active, wake nav/AI, and keep asserting
+        // during a short wake window.
         private static class Guards
         {
             private const int GuardCount = 3;
-            private const float EscortRadius = 2.2f;
-            private const float TickInterval = 0.5f;
+            private const float EscortRadius = 2.4f;
+            private const float TickInterval = 0.25f;
+            private const float WakeWindow = 8f;
+
             private static float _timer;
             private static bool _active;
             private static string _barcode;
-            private static readonly System.Collections.Generic.List<BehaviourBaseNav> _navs =
-                new System.Collections.Generic.List<BehaviourBaseNav>();
-            private static readonly System.Collections.Generic.List<GameObject> _bodies =
-                new System.Collections.Generic.List<GameObject>();
+            private static bool _dumped;
+
+            private struct Guard
+            {
+                public GameObject body;
+                public ushort entityId;
+                public BehaviourBaseNav nav;
+                public PuppetMaster puppet;
+                public NavMeshAgent agent;
+                public float wakeUntil;
+                public bool ready;
+            }
+
+            private static readonly System.Collections.Generic.List<Guard> _guards =
+                new System.Collections.Generic.List<Guard>();
 
             public static void Spawn()
             {
-                // Сетевой спавн уходит на сервер Fusion; без активного лобби колбэк не придёт.
                 bool hasServer = false;
                 try { hasServer = LabFusion.Network.NetworkInfo.HasServer; } catch { }
-                MelonLogger.Msg($"Security Guards: HasServer={hasServer}.");
                 if (!hasServer)
                 {
-                    MelonLogger.Msg("Security Guards: нет активного сервера Fusion — создай/зайди в лобби и повтори.");
+                    MelonLogger.Msg("Security Guards: no Fusion lobby — join/create one first.");
                     return;
                 }
 
                 string bc = FindBarcode();
-                if (bc == null) { MelonLogger.Msg("Security Guards: crate 'Security Guard' не найден в реестре."); return; }
+                if (bc == null)
+                {
+                    MelonLogger.Msg("Security Guards: crate 'Security Guard' not found in warehouse.");
+                    return;
+                }
+
                 var me = BoneLib.Player.RigManager;
-                if (me == null) { MelonLogger.Msg("Security Guards: нет рига игрока."); return; }
+                if (me == null)
+                {
+                    MelonLogger.Msg("Security Guards: no local rig.");
+                    return;
+                }
+
+                Despawn();
+                _active = true;
+
                 Vector3 c = RigPos(me);
                 for (int i = 0; i < GuardCount; i++)
                 {
                     Vector3 p = c + Quaternion.Euler(0f, i * (360f / GuardCount), 0f) * (Vector3.forward * EscortRadius);
+                    p = SnapToGround(p);
                     SpawnOne(bc, p);
                 }
-                _active = true;
-                MelonLogger.Msg($"Security Guards: запрошен спавн x{GuardCount}.");
+                MelonLogger.Msg($"Security Guards: spawn requested x{GuardCount}.");
             }
 
             public static void Despawn()
             {
                 _active = false;
-                foreach (var go in _bodies) { if (go != null) { try { UnityEngine.Object.Destroy(go); } catch { } } }
-                _bodies.Clear();
-                _navs.Clear();
-                MelonLogger.Msg("Security Guards: убраны.");
+                for (int i = 0; i < _guards.Count; i++)
+                {
+                    var g = _guards[i];
+                    try
+                    {
+                        if (g.entityId != 0)
+                        {
+                            LabFusion.RPC.NetworkAssetSpawner.Despawn(
+                                new LabFusion.RPC.NetworkAssetSpawner.DespawnRequestInfo
+                                {
+                                    EntityID = g.entityId,
+                                    DespawnEffect = false,
+                                });
+                        }
+                        else if (g.body != null)
+                            UnityEngine.Object.Destroy(g.body);
+                    }
+                    catch
+                    {
+                        try { if (g.body != null) UnityEngine.Object.Destroy(g.body); } catch { }
+                    }
+                }
+                _guards.Clear();
+                MelonLogger.Msg("Security Guards: despawned.");
             }
 
-            /// <summary>Эскорт: держим охранников на точках вокруг тебя. Плюс ОТЛОЖЕННЫЙ поиск nav —
-            /// в момент спавна AI-компонент часто ещё не собран, поэтому доищем его здесь по кадрам.</summary>
             public static void Tick()
             {
                 if (!_active) return;
@@ -799,37 +846,457 @@ namespace MonsterPanel
                 if (_timer > 0f) return;
                 _timer = TickInterval;
 
-                // Отложенный поиск AI-компонента на телах, где его ещё не нашли.
-                if (_navs.Count < _bodies.Count)
+                var me = BoneLib.Player.RigManager;
+                if (me == null) return;
+                Vector3 c = RigPos(me);
+                float now = Time.time;
+
+                for (int i = _guards.Count - 1; i >= 0; i--)
                 {
-                    foreach (var body in _bodies)
+                    var g = _guards[i];
+                    if (g.body == null)
                     {
-                        if (body == null) continue;
+                        _guards.RemoveAt(i);
+                        continue;
+                    }
+
+                    EnsureOwnership(g);
+
+                    if (!g.ready || now < g.wakeUntil)
+                    {
+                        ActivateGuard(ref g);
+                        g.ready = IsGuardReady(g);
+                        _guards[i] = g;
+                    }
+
+                    Escort(ref g, i, c);
+                    _guards[i] = g;
+                }
+
+                if (_guards.Count == 0) _active = false;
+            }
+
+            private static void Escort(ref Guard g, int index, Vector3 center)
+            {
+                if (g.nav == null) return;
+                Vector3 home = center + Quaternion.Euler(0f, index * (360f / Mathf.Max(1, _guards.Count)), 0f)
+                                  * (Vector3.forward * EscortRadius);
+                home = SnapToGround(home);
+                try { g.nav.freezeWhileResting = false; } catch { }
+                try { g.nav.SetHomeIsPost(false); } catch { }
+                try { g.nav.SetHomePosition(home, true, true); } catch { }
+                try { g.nav.SetPath(home); } catch { }
+                try
+                {
+                    if (g.nav.mentalState == BehaviourBaseNav.MentalState.Rest)
+                        g.nav.SwitchMentalState(BehaviourBaseNav.MentalState.Roam);
+                }
+                catch
+                {
+                    try { g.nav.SwitchMentalState(BehaviourBaseNav.MentalState.Roam); } catch { }
+                }
+
+                if (g.agent != null)
+                {
+                    try
+                    {
+                        if (!g.agent.enabled) g.agent.enabled = true;
+                        if (g.agent.isOnNavMesh && g.agent.isStopped) g.agent.isStopped = false;
+                        if (g.agent.isOnNavMesh)
+                            g.agent.SetDestination(home);
+                    }
+                    catch { }
+                }
+            }
+
+            private static void SpawnOne(string barcode, Vector3 pos)
+            {
+                try
+                {
+                    var spawnable = new Spawnable
+                    {
+                        crateRef = new Il2CppSLZ.Marrow.Warehouse.SpawnableCrateReference(barcode)
+                    };
+                    Vector3 look = Vector3.forward;
+                    try
+                    {
+                        if (BoneLib.Player.RigManager != null)
+                            look = (RigPos(BoneLib.Player.RigManager) - pos).normalized;
+                        if (look.sqrMagnitude < 0.001f) look = Vector3.forward;
+                    }
+                    catch { }
+
+                    var info = new LabFusion.RPC.NetworkAssetSpawner.SpawnRequestInfo
+                    {
+                        Spawnable = spawnable,
+                        Position = pos,
+                        Rotation = Quaternion.LookRotation(look),
+                        SpawnEffect = true,
+                        SpawnSource = LabFusion.Entities.EntitySource.Player,
+                        SpawnCallback = OnSpawned,
+                    };
+                    LabFusion.RPC.NetworkAssetSpawner.Spawn(info);
+                }
+                catch (Exception e) { MelonLogger.Warning("Guards spawn: " + e.Message); }
+            }
+
+            private static void OnSpawned(LabFusion.RPC.NetworkAssetSpawner.SpawnCallbackInfo info)
+            {
+                try
+                {
+                    var go = info.Spawned;
+                    if (go == null) return;
+
+                    ushort id = 0;
+                    NetworkEntity ent = null;
+                    try
+                    {
+                        ent = info.Entity;
+                        if (ent != null)
+                        {
+                            id = ent.ID;
+                            ClaimOwnership(ent);
+                        }
+                    }
+                    catch { }
+
+                    var g = new Guard
+                    {
+                        body = go,
+                        entityId = id,
+                        wakeUntil = Time.time + WakeWindow,
+                        ready = false,
+                    };
+                    CacheParts(ref g);
+                    ActivateGuard(ref g);
+                    g.ready = IsGuardReady(g);
+                    _guards.Add(g);
+
+                    // Staggered wake: Fusion extenders / pool init often finish a few frames later.
+                    MelonCoroutines.Start(WakeRoutine(id, go));
+
+                    if (!g.ready) DumpComponents(go);
+                    MelonLogger.Msg(
+                        $"Security Guards: spawned id={id} ready={g.ready} mode={(g.puppet != null ? g.puppet.mode.ToString() : "?")} " +
+                        $"state={(g.puppet != null ? g.puppet.state.ToString() : "?")} (squad {_guards.Count}).");
+                }
+                catch (Exception e) { MelonLogger.Warning("Guards onSpawned: " + e.Message); }
+            }
+
+            private static IEnumerator WakeRoutine(ushort entityId, GameObject go)
+            {
+                // Immediate + delayed passes cover late PuppetMasterExtender registration.
+                int[] waits = { 1, 2, 4, 8, 15, 30, 45, 60 };
+                int wi = 0;
+                int frame = 0;
+                while (wi < waits.Length)
+                {
+                    yield return null;
+                    frame++;
+                    if (frame < waits[wi]) continue;
+                    wi++;
+
+                    if (!_active || go == null) yield break;
+
+                    for (int i = 0; i < _guards.Count; i++)
+                    {
+                        var g = _guards[i];
+                        if (g.body != go && (entityId == 0 || g.entityId != entityId)) continue;
+                        EnsureOwnership(g);
+                        ActivateGuard(ref g);
+                        g.ready = IsGuardReady(g);
+                        _guards[i] = g;
+                        if (g.ready && wi >= 4)
+                            MelonLogger.Msg($"Security Guards: id={g.entityId} fully awake (frame {frame}).");
+                        break;
+                    }
+                }
+            }
+
+            private static void ClaimOwnership(NetworkEntity ent)
+            {
+                if (ent == null) return;
+                try
+                {
+                    if (!ent.IsRegistered) return;
+                    if (!ent.IsOwner)
+                        NetworkEntityManager.TakeOwnership(ent);
+                }
+                catch { }
+            }
+
+            private static void EnsureOwnership(Guard g)
+            {
+                try
+                {
+                    if (g.puppet == null) return;
+                    if (PuppetMasterExtender.Cache.TryGet(g.puppet, out var ent) && ent != null)
+                        ClaimOwnership(ent);
+                }
+                catch { }
+
+                // Mirror Fusion owner-side drive restore in case transfer is delayed.
+                try
+                {
+                    var pm = g.puppet;
+                    if (pm == null) return;
+                    pm.updateJointAnchors = true;
+                    if (pm._defaultMuscleSpring > 0f) pm.muscleSpring = pm._defaultMuscleSpring;
+                    if (pm._defaultMuscleDamper >= 0f) pm.muscleDamper = pm._defaultMuscleDamper;
+                    if (pm._defaultMuscleWeight > 0f) pm.muscleWeight = pm._defaultMuscleWeight;
+                    else if (pm.muscleWeight < 0.5f) pm.muscleWeight = 1f;
+                    if (pm.mappingWeight < 0.5f) pm.mappingWeight = 1f;
+                }
+                catch { }
+            }
+
+            private static bool IsGuardReady(Guard g)
+            {
+                try
+                {
+                    if (g.puppet == null || g.nav == null) return false;
+                    if (g.puppet.isDead) return false;
+                    return g.puppet.mode == PuppetMaster.Mode.Active
+                           && g.puppet.state == PuppetMaster.State.Alive
+                           && g.nav.enabled
+                           && !g.nav.deactivated;
+                }
+                catch { return false; }
+            }
+
+            private static void CacheParts(ref Guard g)
+            {
+                var go = g.body;
+                if (go == null) return;
+                try
+                {
+                    if (g.puppet == null)
+                        g.puppet = go.GetComponentInChildren<PuppetMaster>(true);
+                    if (g.nav == null)
+                        g.nav = go.GetComponentInChildren<BehaviourBaseNav>(true);
+                    if (g.agent == null)
+                        g.agent = go.GetComponentInChildren<NavMeshAgent>(true);
+                }
+                catch { }
+            }
+
+            /// <summary>
+            /// Bring a networked NPC out of T-pose / no-collision / asleep AI.
+            /// Safe to call repeatedly during the wake window.
+            /// </summary>
+            private static void ActivateGuard(ref Guard g)
+            {
+                var go = g.body;
+                if (go == null) return;
+
+                CacheParts(ref g);
+                EnsureOwnership(g);
+
+                // --- PuppetMaster: Alive + Active (T-pose / arms-out fix) ---
+                try
+                {
+                    var pm = g.puppet;
+                    if (pm != null)
+                    {
+                        pm.enabled = true;
+                        try { pm.gameObject.SetActive(true); } catch { }
+
                         try
                         {
-                            var nav = body.GetComponentInChildren<BehaviourBaseNav>(true);
-                            if (nav != null && !_navs.Contains(nav))
+                            if (!pm.CheckIfInitiated())
+                                pm.Initiate();
+                        }
+                        catch
+                        {
+                            try { pm.Initiate(); } catch { }
+                        }
+
+                        try
+                        {
+                            if (pm.isDead || pm.state != PuppetMaster.State.Alive)
+                                pm.Resurrect();
+                        }
+                        catch
+                        {
+                            try { pm.state = PuppetMaster.State.Alive; } catch { }
+                        }
+
+                        try { pm.SetAnimationEnabled(true); } catch { }
+
+                        // Drive weights (Fusion zeroes these for non-owners).
+                        try
+                        {
+                            pm.updateJointAnchors = true;
+                            if (pm._defaultMuscleSpring > 0f) pm.muscleSpring = pm._defaultMuscleSpring;
+                            else if (pm.muscleSpring <= 0f) pm.muscleSpring = 100f;
+                            if (pm._defaultMuscleDamper >= 0f) pm.muscleDamper = pm._defaultMuscleDamper;
+                            if (pm._defaultMuscleWeight > 0f) pm.muscleWeight = pm._defaultMuscleWeight;
+                            else pm.muscleWeight = 1f;
+                            pm.mappingWeight = 1f;
+                        }
+                        catch { }
+
+                        // Mode transition: Il2Cpp IEnumerator must NOT go to MelonCoroutines.
+                        try
+                        {
+                            if (pm.mode != PuppetMaster.Mode.Active)
                             {
-                                _navs.Add(nav);
-                                MelonLogger.Msg($"Security Guards: nav найден отложенно (navs {_navs.Count}).");
+                                var from = pm.mode;
+                                pm.mode = PuppetMaster.Mode.Active;
+                                if (from == PuppetMaster.Mode.Disabled)
+                                {
+                                    try { pm.StartCoroutine(pm.DisabledToActive()); }
+                                    catch { try { pm.SwitchModes(); } catch { } }
+                                }
+                                else
+                                {
+                                    try { pm.SwitchModes(); }
+                                    catch
+                                    {
+                                        try { pm.StartCoroutine(pm.DisabledToActive()); } catch { }
+                                    }
+                                }
                             }
+                            else if (pm.isSwitchingMode)
+                            {
+                                // Let existing transition finish; still poke SwitchModes if stuck.
+                            }
+                            else
+                            {
+                                // Already Active but may still be limp — re-assert internals.
+                                try { pm.SwitchModes(); } catch { }
+                            }
+                        }
+                        catch
+                        {
+                            try { pm.mode = PuppetMaster.Mode.Active; } catch { }
+                        }
+
+                        try { pm.FixMusclePositions(); } catch { }
+                    }
+                }
+                catch { }
+
+                // --- Nav / behaviour brain (do NOT ClearState / RestorePrefabState — those re-sleep NPCs) ---
+                try
+                {
+                    var nav = g.nav;
+                    if (nav != null)
+                    {
+                        nav.enabled = true;
+                        try { nav.gameObject.SetActive(true); } catch { }
+                        try { nav.deactivated = false; } catch { }
+                        try { nav.freezeWhileResting = false; } catch { }
+
+                        try { nav.OnEntityUncull(); } catch { }
+                        try { nav.Resurrect(); } catch { }
+                        try { nav.OnReactivate(0); } catch { }
+                        try { nav.Activate(); } catch { }
+                        try { nav.Initiate(); } catch { }
+                        try { nav.EnableNav(); } catch { }
+                        try { nav.AnimAwake(); } catch { }
+                        try { nav.ResetAnimator(); } catch { }
+                        try { nav.SwitchLocoState(BehaviourBaseNav.LocoState.Standing, 0f, true); } catch { }
+                        try { nav.SwitchMentalState(BehaviourBaseNav.MentalState.Roam); } catch { }
+
+                        // End spawn collision-block early if still active.
+                        try { nav._blockCollisionsUntil = 0f; } catch { }
+                    }
+                    else
+                    {
+                        foreach (var b in go.GetComponentsInChildren<BehaviourBase>(true))
+                        {
+                            if (b == null) continue;
+                            try
+                            {
+                                b.enabled = true;
+                                b.deactivated = false;
+                                b.Resurrect();
+                                b.Activate();
+                                b.Initiate();
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch { }
+
+                // --- AIBrain ---
+                try
+                {
+                    foreach (var brain in go.GetComponentsInChildren<Il2CppSLZ.Marrow.AI.AIBrain>(true))
+                    {
+                        if (brain == null) continue;
+                        brain.enabled = true;
+                        try { brain.OnResurrection(); }
+                        catch { try { brain.Reset(); } catch { } }
+                    }
+                }
+                catch { }
+
+                // --- NavMeshAgent on mesh ---
+                try
+                {
+                    var agent = g.agent;
+                    if (agent != null)
+                    {
+                        agent.enabled = true;
+                        Vector3 p = go.transform.position;
+                        if (NavMesh.SamplePosition(p, out var hit, 4f, NavMesh.AllAreas))
+                        {
+                            try { agent.Warp(hit.position); } catch { }
+                            try { go.transform.position = hit.position; } catch { }
+                        }
+                        try { agent.isStopped = false; } catch { }
+                        try { agent.updatePosition = true; agent.updateRotation = true; } catch { }
+                    }
+                }
+                catch { }
+
+                // --- Physics / collision ---
+                try
+                {
+                    foreach (var col in go.GetComponentsInChildren<Collider>(true))
+                    {
+                        if (col == null) continue;
+                        try { col.enabled = true; } catch { }
+                    }
+                    foreach (var rb in go.GetComponentsInChildren<Rigidbody>(true))
+                    {
+                        if (rb == null) continue;
+                        try
+                        {
+                            rb.detectCollisions = true;
+                            rb.WakeUp();
                         }
                         catch { }
                     }
                 }
+                catch { }
 
-                if (_navs.Count == 0) return;
-                var me = BoneLib.Player.RigManager;
-                if (me == null) return;
-                Vector3 c = RigPos(me);
-                for (int i = 0; i < _navs.Count; i++)
+                // Animator must be live for non-T-pose visuals while mapping blends in.
+                try
                 {
-                    var nav = _navs[i];
-                    if (nav == null) continue;
-                    Vector3 p = c + Quaternion.Euler(0f, i * (360f / GuardCount), 0f) * (Vector3.forward * EscortRadius);
-                    try { nav.SetHomePosition(p, true, false); } catch { }
-                    try { nav.SetPath(p); } catch { }
+                    foreach (var anim in go.GetComponentsInChildren<Animator>(true))
+                    {
+                        if (anim == null) continue;
+                        anim.enabled = true;
+                        try { anim.cullingMode = AnimatorCullingMode.AlwaysAnimate; } catch { }
+                    }
                 }
+                catch { }
+            }
+
+            private static Vector3 SnapToGround(Vector3 pos)
+            {
+                try
+                {
+                    if (Physics.Raycast(pos + Vector3.up * 3f, Vector3.down, out var hit, 10f,
+                            Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                        return hit.point + Vector3.up * 0.05f;
+                }
+                catch { }
+                return pos;
             }
 
             private static string FindBarcode()
@@ -851,53 +1318,15 @@ namespace MonsterPanel
                             return _barcode;
                         }
                     }
-                    MelonLogger.Msg("Security Guards: крейт с названием 'Security Guard' не найден.");
+                    MelonLogger.Msg("Security Guards: no crate titled 'Security Guard'.");
                 }
                 catch (Exception e) { MelonLogger.Warning("Guards barcode: " + e.Message); }
                 return null;
             }
 
-            private static void SpawnOne(string barcode, Vector3 pos)
-            {
-                try
-                {
-                    var spawnable = new Spawnable { crateRef = new Il2CppSLZ.Marrow.Warehouse.SpawnableCrateReference(barcode) };
-                    var info = new LabFusion.RPC.NetworkAssetSpawner.SpawnRequestInfo
-                    {
-                        Spawnable = spawnable,
-                        Position = pos,
-                        Rotation = Quaternion.identity,
-                        SpawnEffect = false,
-                        SpawnCallback = OnSpawned,
-                    };
-                    LabFusion.RPC.NetworkAssetSpawner.Spawn(info);
-                }
-                catch (Exception e) { MelonLogger.Warning("Guards spawn: " + e.Message); }
-            }
-
-            private static bool _dumped;
-            private static void OnSpawned(LabFusion.RPC.NetworkAssetSpawner.SpawnCallbackInfo info)
-            {
-                try
-                {
-                    var go = info.Spawned;
-                    if (go != null)
-                    {
-                        _bodies.Add(go);
-                        var nav = go.GetComponentInChildren<BehaviourBaseNav>(true);
-                        if (nav != null) _navs.Add(nav);
-                        else DumpComponents(go);   // диагностика: какой AI реально на теле
-                    }
-                    // Владение: спавнер и так владелец заспавненного — отдельный TakeOwnership не нужен.
-                    MelonLogger.Msg($"Security Guards: заспавнен (bodies {_bodies.Count}, navs {_navs.Count}).");
-                }
-                catch (Exception e) { MelonLogger.Warning("Guards onSpawned: " + e.Message); }
-            }
-
-            /// <summary>Один раз выводим типы компонентов заспавненного тела — чтобы узнать реальный AI-класс.</summary>
             private static void DumpComponents(GameObject go)
             {
-                if (_dumped) return;
+                if (_dumped || go == null) return;
                 _dumped = true;
                 try
                 {
@@ -911,7 +1340,7 @@ namespace MonsterPanel
                         try { n = c.GetIl2CppType().Name; } catch { n = "?"; }
                         if (seen.Add(n)) { sb.Append(n); sb.Append(", "); }
                     }
-                    MelonLogger.Msg("Security Guards: components on body -> " + sb.ToString());
+                    MelonLogger.Msg("Security Guards: components -> " + sb);
                 }
                 catch (Exception e) { MelonLogger.Warning("Guards dump: " + e.Message); }
             }
