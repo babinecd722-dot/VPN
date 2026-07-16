@@ -13,6 +13,7 @@ namespace MonsterPanel
     /// - Stock Fusion gold NameTagHue
     /// - Description everyone sees in the player card
     /// - PermissionLevel OWNER (Fusion reads remote metadata → Permissions: OWNER)
+    /// - AvatarModID = -1 (nil) → no mod.io face; Fusion shows Mods stub icon
     /// </summary>
     internal static class AdminNick
     {
@@ -23,6 +24,8 @@ namespace MonsterPanel
             "Stress Level Zero · Official BONELAB Developer";
         private const string OfficialUsername = "dev.bonelab";
         private const string OwnerPerm = "OWNER";
+        /// <summary>Fusion ElementIconHelper: modID == -1 skips mod.io thumbnail (placeholder only).</summary>
+        private const int NilAvatarModId = -1;
 
         private const float GoldHue = 0.12f;
         private const float GoldSat = 0.9f;
@@ -30,7 +33,7 @@ namespace MonsterPanel
 
         private const float LetterInterval = 0.14f;
         private const float HoldFull = 1.8f;
-        private const float CredRefresh = 4f; // re-assert OWNER/description if Fusion overwrites
+        private const float CredRefresh = 4f; // re-assert OWNER/description/nil preview if Fusion overwrites
 
         private static int _len;
         private static bool _shrinking;
@@ -44,6 +47,8 @@ namespace MonsterPanel
         private static bool _haveSavedDesc;
         private static string _savedPerm;
         private static bool _haveSavedPerm;
+        private static int _savedAvatarModId;
+        private static bool _haveSavedAvatarModId;
         private static float _savedHue, _savedSat, _savedVal;
         private static bool _haveSavedColor;
         private static string _lastMeta = "";
@@ -153,6 +158,17 @@ namespace MonsterPanel
 
             try
             {
+                _savedAvatarModId = LabFusion.Player.LocalPlayer.Metadata?.AvatarModID?.GetValue() ?? NilAvatarModId;
+                _haveSavedAvatarModId = true;
+            }
+            catch
+            {
+                _haveSavedAvatarModId = false;
+                _savedAvatarModId = NilAvatarModId;
+            }
+
+            try
+            {
                 _savedHue = CS.NameTagHue.Value;
                 _savedSat = CS.NameTagSaturation.Value;
                 _savedVal = CS.NameTagValue.Value;
@@ -178,7 +194,7 @@ namespace MonsterPanel
 
             ApplyCredentials(quiet: false);
             PushNickMeta("");
-            MelonLogger.Msg("ADMIN NICKNAME: ON (typewriter + OWNER + official description)");
+            MelonLogger.Msg("ADMIN NICKNAME: ON (typewriter + OWNER + nil avatar preview)");
         }
 
         private static void Disable()
@@ -205,12 +221,17 @@ namespace MonsterPanel
                     md?.PermissionLevel?.SetValue(_savedPerm ?? "DEFAULT");
                 else
                     md?.PermissionLevel?.SetValue("DEFAULT");
+
+                // Restore real avatar preview (or leave nil if we never saved one).
+                if (_haveSavedAvatarModId)
+                    md?.AvatarModID?.SetValue(_savedAvatarModId);
             }
             catch { }
 
             _haveSavedNick = false;
             _haveSavedDesc = false;
             _haveSavedPerm = false;
+            _haveSavedAvatarModId = false;
             _haveSavedColor = false;
             _lastMeta = "";
             MelonLogger.Msg("ADMIN NICKNAME: OFF");
@@ -218,7 +239,9 @@ namespace MonsterPanel
 
         /// <summary>
         /// Credentials every client can read without our mod:
-        /// roster username, avatar title, Description, PermissionLevel OWNER.
+        /// roster username, avatar title, Description, PermissionLevel OWNER,
+        /// AvatarModID=-1 (no mod.io face → Fusion Mods stub).
+        /// Re-applied every CredRefresh so lobby joins / avatar swaps don't restore the face.
         /// </summary>
         private static void ApplyCredentials(bool quiet)
         {
@@ -230,8 +253,10 @@ namespace MonsterPanel
                 md.AvatarTitle?.SetValue(Phrase);
                 md.Description?.SetValue(OfficialDescription);
                 md.PermissionLevel?.SetValue(OwnerPerm);
+                // -1 = Fusion "nil" preview: skip ModIOThumbnailDownloader, show placeholder.
+                md.AvatarModID?.SetValue(NilAvatarModId);
                 if (!quiet)
-                    MelonLogger.Msg("ADMIN NICKNAME: credentials set (OWNER + description)");
+                    MelonLogger.Msg("ADMIN NICKNAME: credentials set (OWNER + nil avatar preview)");
             }
             catch (Exception e)
             {
