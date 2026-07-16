@@ -16,7 +16,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.13", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.14", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -105,7 +105,7 @@ namespace MonsterPanel
                 if (Disarm) Aura.DisarmTick();
                 Guards.Tick();
                 NetLightning.Tick();   // авто-удаление отживших сетевых молний
-                AdminNick.Tick();      // typewriter nametag (throttled network sync)
+                AdminNick.Tick();      // rainbow typewriter nametag (metadata @ ~10 Hz)
             }
             else
             {
@@ -1059,7 +1059,7 @@ namespace MonsterPanel
             if (Teleporter.FusionLoaded)
             {
                 PidSpoof.InstallMenu(page);
-                AdminNick.Install(page); // animated staff-looking nametag
+                AdminNick.Install(page); // rainbow staff nametag (AnimatedName-style)
                 page.CreateFunction("Fusion Cleanup (Despawn All)", new Color(1f, 0.55f, 0.15f),
                     (Action)FusionCleanup.Run);
                 page.CreateFunction("Spawn 3 Bodyguards", new Color(0.2f, 0.55f, 1f), (Action)Guards.Spawn);

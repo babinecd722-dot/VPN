@@ -1,4 +1,5 @@
 using System;
+using System.Text;
 using BoneLib.BoneMenu;
 using HarmonyLib;
 using MelonLoader;
@@ -9,8 +10,10 @@ namespace MonsterPanel
 {
     /// <summary>
     /// ADMIN NICKNAME — looks like official SLZ staff to the whole lobby:
-    /// - Typewriter nametag "DEV. OF BONELAB" (Metadata only — no freeze)
-    /// - Stock Fusion gold NameTagHue
+    /// - Typewriter nametag "DEV. OF BONELAB" with smooth scrolling rainbow
+    ///   (AnimatedName-style: per-letter &lt;color=#RRGGBB&gt; via Metadata.Nickname only —
+    ///   no SendClientSettings spam; Fusion LimitLength counts plain text, so tags are OK)
+    /// - White NameTag multiply so rich colors stay true (sat=0)
     /// - Description everyone sees in the player card
     /// - PermissionLevel OWNER (Fusion reads remote metadata → Permissions: OWNER)
     /// - AvatarModID = -1 (nil) → no mod.io face; Fusion shows Mods stub icon
@@ -27,19 +30,28 @@ namespace MonsterPanel
         /// <summary>Fusion ElementIconHelper: modID == -1 skips mod.io thumbnail (placeholder only).</summary>
         private const int NilAvatarModId = -1;
 
-        private const float GoldHue = 0.12f;
-        private const float GoldSat = 0.9f;
-        private const float GoldVal = 1f;
+        // White multiply so per-letter rich colors are not tinted gold.
+        private const float RainbowHue = 0f;
+        private const float RainbowSat = 0f;
+        private const float RainbowVal = 1f;
 
         private const float LetterInterval = 0.14f;
         private const float HoldFull = 1.8f;
-        private const float CredRefresh = 4f; // re-assert OWNER/description/nil preview if Fusion overwrites
+        private const float CredRefresh = 4f;
+
+        /// <summary>Network metadata push rate — AnimatedName-style timer, not every frame.</summary>
+        private const float RainbowNetInterval = 0.1f; // 10 Hz
+        /// <summary>Full hue lap across the name (~3s for a smooth spectrum scroll).</summary>
+        private const float RainbowHueSpeed = 120f; // degrees / second
 
         private static int _len;
         private static bool _shrinking;
         private static float _letterTimer;
         private static float _holdTimer;
         private static float _credTimer;
+        private static float _rainbowHue; // 0..360
+        private static float _rainbowNetTimer;
+        private static bool _lenDirty;
 
         private static string _savedNick;
         private static bool _haveSavedNick;
@@ -53,9 +65,12 @@ namespace MonsterPanel
         private static bool _haveSavedColor;
         private static string _lastMeta = "";
 
+        private static readonly StringBuilder _sb = new StringBuilder(256);
+        private static readonly char[] Hex = "0123456789ABCDEF".ToCharArray();
+
         public static void Install(Page root)
         {
-            root.CreateBool("ADMIN NICKNAME", new Color(1f, 0.82f, 0.12f), Enabled, v =>
+            root.CreateBool("ADMIN NICKNAME", new Color(1f, 0.4f, 0.85f), Enabled, v =>
             {
                 if (v) Enable();
                 else Disable();
@@ -77,40 +92,54 @@ namespace MonsterPanel
                 ApplyCredentials(quiet: true);
             }
 
+            // Smooth spectrum scroll (local clock; network push is throttled below).
+            _rainbowHue += RainbowHueSpeed * dt;
+            if (_rainbowHue >= 360f) _rainbowHue -= 360f;
+
+            // Typewriter length machine (rainbow keeps running during the full-phrase hold).
             if (!_shrinking && _len >= Phrase.Length)
             {
                 if (_holdTimer > 0f)
-                {
                     _holdTimer -= dt;
-                    return;
-                }
-                _shrinking = true;
-            }
-
-            _letterTimer -= dt;
-            if (_letterTimer > 0f) return;
-            _letterTimer = LetterInterval;
-
-            if (_shrinking)
-            {
-                _len--;
-                if (_len <= 0)
-                {
-                    _len = 0;
-                    _shrinking = false;
-                }
+                else
+                    _shrinking = true;
             }
             else
             {
-                _len++;
-                if (_len >= Phrase.Length)
+                _letterTimer -= dt;
+                if (_letterTimer <= 0f)
                 {
-                    _len = Phrase.Length;
-                    _holdTimer = HoldFull;
+                    _letterTimer = LetterInterval;
+
+                    if (_shrinking)
+                    {
+                        _len--;
+                        if (_len <= 0)
+                        {
+                            _len = 0;
+                            _shrinking = false;
+                        }
+                    }
+                    else
+                    {
+                        _len++;
+                        if (_len >= Phrase.Length)
+                        {
+                            _len = Phrase.Length;
+                            _holdTimer = HoldFull;
+                        }
+                    }
+
+                    _lenDirty = true;
                 }
             }
 
-            PushNickMeta(CurrentPlain());
+            _rainbowNetTimer -= dt;
+            if (!_lenDirty && _rainbowNetTimer > 0f) return;
+            _rainbowNetTimer = RainbowNetInterval;
+            _lenDirty = false;
+
+            PushNickMeta(BuildRainbow(CurrentPlain(), _rainbowHue));
         }
 
         private static void Enable()
@@ -121,6 +150,9 @@ namespace MonsterPanel
             _letterTimer = 0f;
             _holdTimer = 0f;
             _credTimer = CredRefresh;
+            _rainbowHue = 0f;
+            _rainbowNetTimer = 0f;
+            _lenDirty = true;
             _lastMeta = "";
 
             try
@@ -174,9 +206,10 @@ namespace MonsterPanel
                 _savedVal = CS.NameTagValue.Value;
                 _haveSavedColor = true;
 
-                CS.NameTagHue.Value = GoldHue;
-                CS.NameTagSaturation.Value = GoldSat;
-                CS.NameTagValue.Value = GoldVal;
+                // White multiply — rich-text letter colors stay true (not gold-tinted).
+                CS.NameTagHue.Value = RainbowHue;
+                CS.NameTagSaturation.Value = RainbowSat;
+                CS.NameTagValue.Value = RainbowVal;
             }
             catch
             {
@@ -186,15 +219,15 @@ namespace MonsterPanel
             try
             {
                 CS.NicknameVisibility.Value = LabFusion.Senders.NicknameVisibility.SHOW;
-                CS.Nickname.Value = Phrase;
-                CS.Description.Value = OfficialDescription; // → metadata via OnValueChanged
+                CS.Nickname.Value = Phrase; // prefs once; live display = Metadata rainbow
+                CS.Description.Value = OfficialDescription;
                 SendSettingsOnce();
             }
             catch (Exception e) { MelonLogger.Warning("ADMIN NICKNAME enable: " + e.Message); }
 
             ApplyCredentials(quiet: false);
-            PushNickMeta("");
-            MelonLogger.Msg("ADMIN NICKNAME: ON (typewriter + OWNER + nil avatar preview)");
+            PushNickMeta(BuildRainbow("", _rainbowHue));
+            MelonLogger.Msg("ADMIN NICKNAME: ON (rainbow typewriter + OWNER + nil avatar preview)");
         }
 
         private static void Disable()
@@ -222,7 +255,6 @@ namespace MonsterPanel
                 else
                     md?.PermissionLevel?.SetValue("DEFAULT");
 
-                // Restore real avatar preview (or leave nil if we never saved one).
                 if (_haveSavedAvatarModId)
                     md?.AvatarModID?.SetValue(_savedAvatarModId);
             }
@@ -253,7 +285,6 @@ namespace MonsterPanel
                 md.AvatarTitle?.SetValue(Phrase);
                 md.Description?.SetValue(OfficialDescription);
                 md.PermissionLevel?.SetValue(OwnerPerm);
-                // -1 = Fusion "nil" preview: skip ModIOThumbnailDownloader, show placeholder.
                 md.AvatarModID?.SetValue(NilAvatarModId);
                 if (!quiet)
                     MelonLogger.Msg("ADMIN NICKNAME: credentials set (OWNER + nil avatar preview)");
@@ -271,13 +302,65 @@ namespace MonsterPanel
             return Phrase.Substring(0, _len);
         }
 
-        private static void PushNickMeta(string plain)
+        /// <summary>
+        /// Scrolling HSV rainbow across letters (AnimatedName GenerateScrollingName style).
+        /// Open-only &lt;color=#RRGGBB&gt; tags — no per-letter close — keeps strings smaller.
+        /// Spaces stay uncolored so the spectrum stays on glyphs.
+        /// </summary>
+        private static string BuildRainbow(string plain, float hueOffset)
         {
-            if (plain == _lastMeta) return;
-            _lastMeta = plain;
+            if (string.IsNullOrEmpty(plain)) return " ";
+
+            int colored = 0;
+            for (int i = 0; i < plain.Length; i++)
+            {
+                if (plain[i] != ' ') colored++;
+            }
+            if (colored < 1) colored = 1;
+
+            _sb.Clear();
+            int vi = 0;
+            for (int i = 0; i < plain.Length; i++)
+            {
+                char c = plain[i];
+                if (c == ' ')
+                {
+                    _sb.Append(' ');
+                    continue;
+                }
+
+                float h = (hueOffset + vi * (360f / colored)) % 360f;
+                if (h < 0f) h += 360f;
+                Color col = Color.HSVToRGB(h / 360f, 1f, 1f);
+                int r = Mathf.Clamp(Mathf.RoundToInt(col.r * 255f), 0, 255);
+                int g = Mathf.Clamp(Mathf.RoundToInt(col.g * 255f), 0, 255);
+                int b = Mathf.Clamp(Mathf.RoundToInt(col.b * 255f), 0, 255);
+
+                _sb.Append("<color=#");
+                AppendByteHex(r);
+                AppendByteHex(g);
+                AppendByteHex(b);
+                _sb.Append('>');
+                _sb.Append(c);
+                vi++;
+            }
+
+            return _sb.ToString();
+        }
+
+        private static void AppendByteHex(int v)
+        {
+            _sb.Append(Hex[(v >> 4) & 0xF]);
+            _sb.Append(Hex[v & 0xF]);
+        }
+
+        private static void PushNickMeta(string rich)
+        {
+            if (rich == _lastMeta) return;
+            _lastMeta = rich;
             try
             {
-                string v = string.IsNullOrEmpty(plain) ? " " : plain;
+                string v = string.IsNullOrEmpty(rich) ? " " : rich;
                 LabFusion.Player.LocalPlayer.Metadata?.Nickname?.SetValue(v);
             }
             catch (Exception e) { MelonLogger.Warning("ADMIN NICKNAME meta: " + e.Message); }
