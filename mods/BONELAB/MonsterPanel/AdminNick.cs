@@ -10,9 +10,9 @@ namespace MonsterPanel
 {
     /// <summary>
     /// ADMIN NICKNAME — looks like official SLZ staff to the whole lobby:
-    /// - Typewriter nametag "DEV. OF BONELAB" with smooth scrolling rainbow
-    ///   (AnimatedName-style: per-letter &lt;color=#RRGGBB&gt; via Metadata.Nickname only —
-    ///   no SendClientSettings spam; Fusion LimitLength counts plain text, so tags are OK)
+    /// - Typewriter nametag "DEV. OF BONELAB" with a curated OWNER/dev shimmer
+    ///   (gold → champagne → platinum → lab cyan — not a toy HSV rainbow)
+    ///   AnimatedName-style per-letter &lt;color=#RRGGBB&gt; via Metadata.Nickname only
     /// - White NameTag multiply so rich colors stay true (sat=0)
     /// - Description everyone sees in the player card
     /// - PermissionLevel OWNER (Fusion reads remote metadata → Permissions: OWNER)
@@ -30,27 +30,44 @@ namespace MonsterPanel
         /// <summary>Fusion ElementIconHelper: modID == -1 skips mod.io thumbnail (placeholder only).</summary>
         private const int NilAvatarModId = -1;
 
-        // White multiply so per-letter rich colors are not tinted gold.
-        private const float RainbowHue = 0f;
-        private const float RainbowSat = 0f;
-        private const float RainbowVal = 1f;
+        // White multiply so per-letter rich colors are not tinted.
+        private const float ShimmerMulHue = 0f;
+        private const float ShimmerMulSat = 0f;
+        private const float ShimmerMulVal = 1f;
 
         private const float LetterInterval = 0.14f;
         private const float HoldFull = 1.8f;
         private const float CredRefresh = 4f;
 
         /// <summary>Network metadata push rate — AnimatedName-style timer, not every frame.</summary>
-        private const float RainbowNetInterval = 0.1f; // 10 Hz
-        /// <summary>Full hue lap across the name (~3s for a smooth spectrum scroll).</summary>
-        private const float RainbowHueSpeed = 120f; // degrees / second
+        private const float ShimmerNetInterval = 0.1f; // 10 Hz
+        /// <summary>One full palette lap (~4s) — slower = more “premium staff”, less disco.</summary>
+        private const float ShimmerPhaseSpeed = 0.25f; // cycles / second
+
+        /// <summary>
+        /// Official-dev palette: Fusion OWNER gold, champagne, ivory, platinum, lab cyan.
+        /// Loops seamlessly — no green/magenta circus.
+        /// </summary>
+        private static readonly Color[] DevPalette =
+        {
+            new Color(1.00f, 0.88f, 0.40f), // soft gold
+            new Color(1.00f, 0.82f, 0.12f), // Fusion OWNER gold
+            new Color(1.00f, 0.72f, 0.22f), // amber
+            new Color(1.00f, 0.94f, 0.72f), // champagne / ivory
+            new Color(0.92f, 0.95f, 1.00f), // platinum
+            new Color(0.55f, 0.88f, 1.00f), // lab cyan
+            new Color(0.40f, 0.72f, 1.00f), // soft staff blue
+            new Color(0.85f, 0.90f, 1.00f), // cool silver
+            new Color(1.00f, 0.90f, 0.50f), // return toward gold
+        };
 
         private static int _len;
         private static bool _shrinking;
         private static float _letterTimer;
         private static float _holdTimer;
         private static float _credTimer;
-        private static float _rainbowHue; // 0..360
-        private static float _rainbowNetTimer;
+        private static float _shimmerPhase; // 0..1
+        private static float _shimmerNetTimer;
         private static bool _lenDirty;
 
         private static string _savedNick;
@@ -70,7 +87,7 @@ namespace MonsterPanel
 
         public static void Install(Page root)
         {
-            root.CreateBool("ADMIN NICKNAME", new Color(1f, 0.4f, 0.85f), Enabled, v =>
+            root.CreateBool("ADMIN NICKNAME", new Color(1f, 0.82f, 0.12f), Enabled, v =>
             {
                 if (v) Enable();
                 else Disable();
@@ -92,11 +109,11 @@ namespace MonsterPanel
                 ApplyCredentials(quiet: true);
             }
 
-            // Smooth spectrum scroll (local clock; network push is throttled below).
-            _rainbowHue += RainbowHueSpeed * dt;
-            if (_rainbowHue >= 360f) _rainbowHue -= 360f;
+            // Curated palette scroll (local clock; network push is throttled below).
+            _shimmerPhase += ShimmerPhaseSpeed * dt;
+            if (_shimmerPhase >= 1f) _shimmerPhase -= 1f;
 
-            // Typewriter length machine (rainbow keeps running during the full-phrase hold).
+            // Typewriter length machine (shimmer keeps running during the full-phrase hold).
             if (!_shrinking && _len >= Phrase.Length)
             {
                 if (_holdTimer > 0f)
@@ -134,12 +151,12 @@ namespace MonsterPanel
                 }
             }
 
-            _rainbowNetTimer -= dt;
-            if (!_lenDirty && _rainbowNetTimer > 0f) return;
-            _rainbowNetTimer = RainbowNetInterval;
+            _shimmerNetTimer -= dt;
+            if (!_lenDirty && _shimmerNetTimer > 0f) return;
+            _shimmerNetTimer = ShimmerNetInterval;
             _lenDirty = false;
 
-            PushNickMeta(BuildRainbow(CurrentPlain(), _rainbowHue));
+            PushNickMeta(BuildDevShimmer(CurrentPlain(), _shimmerPhase));
         }
 
         private static void Enable()
@@ -150,8 +167,8 @@ namespace MonsterPanel
             _letterTimer = 0f;
             _holdTimer = 0f;
             _credTimer = CredRefresh;
-            _rainbowHue = 0f;
-            _rainbowNetTimer = 0f;
+            _shimmerPhase = 0f;
+            _shimmerNetTimer = 0f;
             _lenDirty = true;
             _lastMeta = "";
 
@@ -206,10 +223,10 @@ namespace MonsterPanel
                 _savedVal = CS.NameTagValue.Value;
                 _haveSavedColor = true;
 
-                // White multiply — rich-text letter colors stay true (not gold-tinted).
-                CS.NameTagHue.Value = RainbowHue;
-                CS.NameTagSaturation.Value = RainbowSat;
-                CS.NameTagValue.Value = RainbowVal;
+                // White multiply — rich-text letter colors stay true.
+                CS.NameTagHue.Value = ShimmerMulHue;
+                CS.NameTagSaturation.Value = ShimmerMulSat;
+                CS.NameTagValue.Value = ShimmerMulVal;
             }
             catch
             {
@@ -226,8 +243,8 @@ namespace MonsterPanel
             catch (Exception e) { MelonLogger.Warning("ADMIN NICKNAME enable: " + e.Message); }
 
             ApplyCredentials(quiet: false);
-            PushNickMeta(BuildRainbow("", _rainbowHue));
-            MelonLogger.Msg("ADMIN NICKNAME: ON (rainbow typewriter + OWNER + nil avatar preview)");
+            PushNickMeta(BuildDevShimmer("", _shimmerPhase));
+            MelonLogger.Msg("ADMIN NICKNAME: ON (dev-gold shimmer + OWNER + nil avatar preview)");
         }
 
         private static void Disable()
@@ -303,11 +320,10 @@ namespace MonsterPanel
         }
 
         /// <summary>
-        /// Scrolling HSV rainbow across letters (AnimatedName GenerateScrollingName style).
-        /// Open-only &lt;color=#RRGGBB&gt; tags — no per-letter close — keeps strings smaller.
-        /// Spaces stay uncolored so the spectrum stays on glyphs.
+        /// Scrolling curated OWNER/dev palette across letters (AnimatedName open-tag style).
+        /// Phase 0..1 walks the gold↔cyan staff loop; letters sample along the same gradient.
         /// </summary>
-        private static string BuildRainbow(string plain, float hueOffset)
+        private static string BuildDevShimmer(string plain, float phase)
         {
             if (string.IsNullOrEmpty(plain)) return " ";
 
@@ -329,9 +345,10 @@ namespace MonsterPanel
                     continue;
                 }
 
-                float h = (hueOffset + vi * (360f / colored)) % 360f;
-                if (h < 0f) h += 360f;
-                Color col = Color.HSVToRGB(h / 360f, 1f, 1f);
+                // Spread letters across ~70% of one palette lap so the name reads as a band, not noise.
+                float t = phase + vi * (0.7f / colored);
+                t -= Mathf.Floor(t);
+                Color col = SampleDevPalette(t);
                 int r = Mathf.Clamp(Mathf.RoundToInt(col.r * 255f), 0, 255);
                 int g = Mathf.Clamp(Mathf.RoundToInt(col.g * 255f), 0, 255);
                 int b = Mathf.Clamp(Mathf.RoundToInt(col.b * 255f), 0, 255);
@@ -346,6 +363,19 @@ namespace MonsterPanel
             }
 
             return _sb.ToString();
+        }
+
+        private static Color SampleDevPalette(float t01)
+        {
+            int n = DevPalette.Length;
+            float x = t01 * n;
+            int i0 = Mathf.FloorToInt(x) % n;
+            if (i0 < 0) i0 += n;
+            int i1 = (i0 + 1) % n;
+            float f = x - Mathf.Floor(x);
+            // Smoothstep — less “cheap lerp flash” between stops.
+            f = f * f * (3f - 2f * f);
+            return Color.Lerp(DevPalette[i0], DevPalette[i1], f);
         }
 
         private static void AppendByteHex(int v)
