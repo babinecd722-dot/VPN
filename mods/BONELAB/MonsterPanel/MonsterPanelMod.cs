@@ -9,11 +9,14 @@ using Il2CppSLZ.Marrow.Interaction;
 using Il2CppSLZ.Marrow.PuppetMasta;
 using LabFusion.Entities;
 using LabFusion.Extensions;
+using LabFusion.Marrow.Extenders;
+using LabFusion.RPC;
+using LabFusion.Utilities;
 using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.4", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.12", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -80,7 +83,10 @@ namespace MonsterPanel
         {
             _fusionLoaded = Teleporter.FusionLoaded;
             if (_fusionLoaded)
+            {
                 PidSpoof.Init(HarmonyInstance); // Spoofing PID: hook SetPlatformID + restore saved state
+                FusionCleanup.Install(HarmonyInstance); // Fusion Admin → Cleanup → Despawn All (non-host too)
+            }
             AntiManip.Install(HarmonyInstance); // silent Dev Manipulator immunity (no UI)
             BuildMenu();
             ApplyPatches();
@@ -737,6 +743,113 @@ namespace MonsterPanel
             }
         }
 
+        // ---------------- Fusion Cleanup (Admin → Cleanup → Despawn All) ----------------
+        //
+        // Vanilla LabFusion only runs PooleeUtilities.DespawnAll when NetworkInfo.IsHost.
+        // We patch that method so the SAME Fusion menu button works for non-hosts too:
+        // despawn every networked NetworkProp+Poolee (skip circuit fixtures / players).
+        // Non-host path uses NetworkAssetSpawner.Despawn (DespawnRequest → server → all clients).
+        private static class FusionCleanup
+        {
+            private static bool _patched;
+
+            public static void Install(HarmonyLib.Harmony harmony)
+            {
+                if (_patched) return;
+                try
+                {
+                    var target = AccessTools.Method(typeof(PooleeUtilities), nameof(PooleeUtilities.DespawnAll));
+                    if (target == null)
+                    {
+                        MelonLogger.Warning("Fusion Cleanup: PooleeUtilities.DespawnAll not found.");
+                        return;
+                    }
+                    harmony.Patch(target,
+                        prefix: new HarmonyMethod(typeof(FusionCleanup), nameof(DespawnAllPrefix)));
+                    _patched = true;
+                    MelonLogger.Msg("Fusion Cleanup: Despawn All unlocked (works without host).");
+                }
+                catch (Exception e)
+                {
+                    MelonLogger.Warning("Fusion Cleanup patch: " + e.Message);
+                }
+            }
+
+            /// <summary>Harmony prefix — replace host-only DespawnAll.</summary>
+            private static bool DespawnAllPrefix()
+            {
+                Run();
+                return false; // skip original IsHost gate
+            }
+
+            /// <summary>Same entity filter as LabFusion PooleeUtilities.DespawnAll.</summary>
+            public static void Run()
+            {
+                try
+                {
+                    bool hasServer = false;
+                    try { hasServer = LabFusion.Network.NetworkInfo.HasServer; } catch { }
+                    if (!hasServer)
+                    {
+                        MelonLogger.Msg("Fusion Cleanup: not in a Fusion lobby.");
+                        return;
+                    }
+
+                    var lookup = NetworkEntityManager.IDManager.RegisteredEntities.EntityIDLookup;
+                    if (lookup == null)
+                    {
+                        MelonLogger.Msg("Fusion Cleanup: no registered entities.");
+                        return;
+                    }
+
+                    var entities = new System.Collections.Generic.List<NetworkEntity>();
+                    try
+                    {
+                        foreach (var key in lookup.Keys)
+                            if (key != null) entities.Add(key);
+                    }
+                    catch (Exception e)
+                    {
+                        MelonLogger.Warning("Fusion Cleanup: enum failed — " + e.Message);
+                        return;
+                    }
+
+                    int n = 0;
+                    for (int i = 0; i < entities.Count; i++)
+                    {
+                        var networkEntity = entities[i];
+                        try
+                        {
+                            if (networkEntity.GetExtender<NetworkProp>() == null) continue;
+                            if (networkEntity.GetExtender<PooleeExtender>() == null) continue;
+                            // Don't despawn fixtures (same as Fusion IsFixture).
+                            if (networkEntity.GetExtender<CircuitSocketExtender>() != null) continue;
+                            // Extra safety: never touch player entities.
+                            try
+                            {
+                                if (networkEntity.GetExtender<NetworkPlayer>() != null) continue;
+                            }
+                            catch { }
+
+                            NetworkAssetSpawner.Despawn(new NetworkAssetSpawner.DespawnRequestInfo
+                            {
+                                EntityID = networkEntity.ID,
+                                DespawnEffect = false,
+                            });
+                            n++;
+                        }
+                        catch { }
+                    }
+
+                    MelonLogger.Msg($"Fusion Cleanup: Despawn All → {n} prop(s).");
+                }
+                catch (Exception e)
+                {
+                    MelonLogger.Warning("Fusion Cleanup: " + e.Message);
+                }
+            }
+        }
+
         // ---------------- Security Guards (сетевой спавн + эскорт) ----------------
         //
         // Спавним 3 сетевых NPC «Security Guard» (видят все), берём владение (ИИ считаем мы),
@@ -947,13 +1060,15 @@ namespace MonsterPanel
             {
                 PidSpoof.InstallMenu(page);
                 AdminNick.Install(page); // animated staff-looking nametag
+                page.CreateFunction("Fusion Cleanup (Despawn All)", new Color(1f, 0.55f, 0.15f),
+                    (Action)FusionCleanup.Run);
                 page.CreateFunction("Spawn 3 Bodyguards", new Color(0.2f, 0.55f, 1f), (Action)Guards.Spawn);
                 page.CreateFunction("Despawn Bodyguards", new Color(0.5f, 0.5f, 0.5f), (Action)Guards.Despawn);
                 page.CreateFunction("Avatar preview 6114112", new Color(0.7f, 0.5f, 1f), (Action)NickHider.SetAvatarPreview);
                 KillAuraMenu.Install(page);
                 NickHider.Install(page);
                 Teleporter.Install(page);
-                MelonLogger.Msg("MONSTER Panel: Kill Aura + Teleport + Nickname + Bodyguards + Spoofing PID added (LabFusion found).");
+                MelonLogger.Msg("MONSTER Panel: Kill Aura + Teleport + Nickname + Bodyguards + Spoofing PID + Cleanup added (LabFusion found).");
             }
             else
                 MelonLogger.Msg("MONSTER Panel: LabFusion not loaded - Teleport/Nickname/Bodyguards/Spoofing PID hidden.");
