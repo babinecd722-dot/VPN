@@ -1,24 +1,19 @@
 using System;
-using System.Collections;
 using System.Reflection;
 using BoneLib.BoneMenu;
 using HarmonyLib;
 using Il2CppSLZ.Marrow;
-using Il2CppSLZ.Marrow.AI;
 using Il2CppSLZ.Marrow.Combat;
 using Il2CppSLZ.Marrow.Data;
 using Il2CppSLZ.Marrow.Interaction;
 using Il2CppSLZ.Marrow.PuppetMasta;
-using Il2CppSLZ.Marrow.Warehouse;
 using LabFusion.Entities;
 using LabFusion.Extensions;
-using LabFusion.Marrow.Extenders;
 using MelonLoader;
 using UnityEngine;
-using UnityEngine.AI;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.11", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.4", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -87,7 +82,6 @@ namespace MonsterPanel
             if (_fusionLoaded)
                 PidSpoof.Init(HarmonyInstance); // Spoofing PID: hook SetPlatformID + restore saved state
             AntiManip.Install(HarmonyInstance); // silent Dev Manipulator immunity (no UI)
-            Guards.Install(HarmonyInstance);    // bodyguards: never agro the local player
             BuildMenu();
             ApplyPatches();
             MelonLogger.Msg("MONSTER Panel loaded.");
@@ -743,679 +737,99 @@ namespace MonsterPanel
             }
         }
 
-        // ---------------- Security Guards (admin mannequins) ----------------
+        // ---------------- Security Guards (сетевой спавн + эскорт) ----------------
         //
-        // Purpose: flex props for Fusion lobbies — three networked Security Guards that
-        // stand near you in T-pose and attack nobody. Weapons were unreliable on Quest,
-        // so this is intentionally unarmed. Keep them on the NavMesh beside you and
-        // strip agro every frame.
+        // Спавним 3 сетевых NPC «Security Guard» (видят все), берём владение (ИИ считаем мы),
+        // и держим их в эскорте вокруг тебя. Barcode находим сами по названию крейта.
+        // Всё с типами LabFusion/Marrow-warehouse — здесь (JIT только при вызове).
         private static class Guards
         {
             private const int GuardCount = 3;
-            private const float EscortRadius = 1.8f;
-            private const float TickInterval = 0.35f;
-            private const float WakeWindow = 2f;
-            private const float ResnapBelow = 0.75f;
-            private const float HeartbeatEvery = 2f;
-            private const float MaxDrift = 6f;
-            private const float PendingSpawnTimeout = 12f;
-
+            private const float EscortRadius = 2.2f;
+            private const float TickInterval = 0.5f;
             private static float _timer;
-            private static float _heartbeat;
             private static bool _active;
-            private static int _pendingSpawns;
-            private static float _pendingUntil;
             private static string _barcode;
-            private static bool _dumped;
-            private static bool _patchesInstalled;
-            private static int _ownerTeam = 0;
-
-            private struct Guard
-            {
-                public GameObject body;
-                public ushort entityId;
-                public BehaviourBaseNav nav;
-                public PuppetMaster puppet;
-                public NavMeshAgent agent;
-                public float wakeUntil;
-                public bool ready;
-                public float spawnedAt;
-                public bool ignoredPlayerCols;
-                public bool allegianceOnce;
-                public bool activatedOnce;
-                public Vector3 homePos;
-            }
-
-            private static readonly System.Collections.Generic.List<Guard> _guards =
-                new System.Collections.Generic.List<Guard>();
-
-            private static bool BodyAlive(GameObject go)
-            {
-                try { return go != null && go; } catch { return go != null; }
-            }
-
-            public static void Install(HarmonyLib.Harmony harmony)
-            {
-                if (_patchesInstalled) return;
-                _patchesInstalled = true;
-                MelonLogger.Msg("Security Guards: peaceful T-pose mannequins (no weapons, no agro).");
-            }
+            private static readonly System.Collections.Generic.List<BehaviourBaseNav> _navs =
+                new System.Collections.Generic.List<BehaviourBaseNav>();
+            private static readonly System.Collections.Generic.List<GameObject> _bodies =
+                new System.Collections.Generic.List<GameObject>();
 
             public static void Spawn()
             {
+                // Сетевой спавн уходит на сервер Fusion; без активного лобби колбэк не придёт.
                 bool hasServer = false;
                 try { hasServer = LabFusion.Network.NetworkInfo.HasServer; } catch { }
+                MelonLogger.Msg($"Security Guards: HasServer={hasServer}.");
                 if (!hasServer)
                 {
-                    MelonLogger.Msg("Security Guards: no Fusion lobby — join/create one first.");
+                    MelonLogger.Msg("Security Guards: нет активного сервера Fusion — создай/зайди в лобби и повтори.");
                     return;
                 }
 
                 string bc = FindBarcode();
-                if (bc == null)
-                {
-                    MelonLogger.Msg("Security Guards: crate 'Security Guard' not found in warehouse.");
-                    return;
-                }
-
+                if (bc == null) { MelonLogger.Msg("Security Guards: crate 'Security Guard' не найден в реестре."); return; }
                 var me = BoneLib.Player.RigManager;
-                if (me == null)
-                {
-                    MelonLogger.Msg("Security Guards: no local rig.");
-                    return;
-                }
-
-                Despawn();
-                _active = true;
-                _heartbeat = 0f;
-                _timer = 0f;
-                _pendingSpawns = GuardCount;
-                _pendingUntil = Time.time + PendingSpawnTimeout;
-
+                if (me == null) { MelonLogger.Msg("Security Guards: нет рига игрока."); return; }
                 Vector3 c = RigPos(me);
-                Vector3 fwd = Vector3.forward;
-                Vector3 right = Vector3.right;
-                try
-                {
-                    var t = me.transform;
-                    fwd = t.forward; fwd.y = 0f;
-                    if (fwd.sqrMagnitude < 0.01f) fwd = Vector3.forward;
-                    fwd.Normalize();
-                    right = Vector3.Cross(Vector3.up, fwd).normalized;
-                }
-                catch { }
-
-                Vector3[] offsets =
-                {
-                    fwd * 2.0f + right * (-EscortRadius),
-                    fwd * 2.2f,
-                    fwd * 2.0f + right * EscortRadius,
-                };
-
                 for (int i = 0; i < GuardCount; i++)
                 {
-                    Vector3 p = PlaceNearPlayer(c, offsets[i % offsets.Length]);
-                    MelonLogger.Msg($"Security Guards: seat[{i}] ({p.x:0.0},{p.y:0.0},{p.z:0.0}) playerY={c.y:0.0}");
+                    Vector3 p = c + Quaternion.Euler(0f, i * (360f / GuardCount), 0f) * (Vector3.forward * EscortRadius);
                     SpawnOne(bc, p);
                 }
-                MelonLogger.Msg($"Security Guards: spawn requested x{GuardCount} (peaceful T-pose mannequins).");
-            }
-
-            private static void Heartbeat()
-            {
-                _heartbeat -= Time.deltaTime;
-                if (_heartbeat > 0f) return;
-                _heartbeat = HeartbeatEvery;
-                MelonLogger.Msg(
-                    $"Security Guards: hb active={_active} squad={_guards.Count} pending={_pendingSpawns}");
+                _active = true;
+                MelonLogger.Msg($"Security Guards: запрошен спавн x{GuardCount}.");
             }
 
             public static void Despawn()
             {
                 _active = false;
-                _pendingSpawns = 0;
-                for (int i = 0; i < _guards.Count; i++)
-                {
-                    var g = _guards[i];
-                    try
-                    {
-                        if (g.entityId != 0)
-                        {
-                            LabFusion.RPC.NetworkAssetSpawner.Despawn(
-                                new LabFusion.RPC.NetworkAssetSpawner.DespawnRequestInfo
-                                {
-                                    EntityID = g.entityId,
-                                    DespawnEffect = false,
-                                });
-                        }
-                        else if (BodyAlive(g.body))
-                            UnityEngine.Object.Destroy(g.body);
-                    }
-                    catch
-                    {
-                        try { if (BodyAlive(g.body)) UnityEngine.Object.Destroy(g.body); } catch { }
-                    }
-                }
-                _guards.Clear();
-                MelonLogger.Msg("Security Guards: despawned.");
+                foreach (var go in _bodies) { if (go != null) { try { UnityEngine.Object.Destroy(go); } catch { } } }
+                _bodies.Clear();
+                _navs.Clear();
+                MelonLogger.Msg("Security Guards: убраны.");
             }
 
+            /// <summary>Эскорт: держим охранников на точках вокруг тебя. Плюс ОТЛОЖЕННЫЙ поиск nav —
+            /// в момент спавна AI-компонент часто ещё не собран, поэтому доищем его здесь по кадрам.</summary>
             public static void Tick()
             {
                 if (!_active) return;
+                _timer -= Time.deltaTime;
+                if (_timer > 0f) return;
+                _timer = TickInterval;
 
-                try { Heartbeat(); } catch { }
-
-                if (_pendingSpawns > 0 && Time.time > _pendingUntil)
+                // Отложенный поиск AI-компонента на телах, где его ещё не нашли.
+                if (_navs.Count < _bodies.Count)
                 {
-                    MelonLogger.Warning($"Security Guards: pending spawn timeout ({_pendingSpawns} left).");
-                    _pendingSpawns = 0;
-                }
-
-                try
-                {
-                    var me = BoneLib.Player.RigManager;
-                    if (me == null) return;
-                    var myProxy = GetProxy(me);
-
-                    try
+                    foreach (var body in _bodies)
                     {
-                        if (myProxy != null)
-                            _ownerTeam = myProxy.teamNumber;
-                    }
-                    catch { }
-
-                    Vector3 c = RigPos(me);
-
-                    for (int i = 0; i < _guards.Count; i++)
-                    {
+                        if (body == null) continue;
                         try
                         {
-                            var g = _guards[i];
-                            if (!BodyAlive(g.body)) continue;
-                            CacheParts(ref g);
-                            ApplyPeaceful(ref g, myProxy);
-                            ResnapIfBuried(ref g, c);
-                            _guards[i] = g;
-                        }
-                        catch { }
-                    }
-
-                    _timer -= Time.deltaTime;
-                    if (_timer > 0f) return;
-                    _timer = TickInterval;
-
-                    for (int i = _guards.Count - 1; i >= 0; i--)
-                    {
-                        var g = _guards[i];
-                        try
-                        {
-                            if (!BodyAlive(g.body))
+                            var nav = body.GetComponentInChildren<BehaviourBaseNav>(true);
+                            if (nav != null && !_navs.Contains(nav))
                             {
-                                _guards.RemoveAt(i);
-                                continue;
-                            }
-
-                            EnsureOwnership(g);
-                            CacheParts(ref g);
-
-                            if (!g.activatedOnce)
-                            {
-                                ActivateMannequin(ref g);
-                                g.ready = g.puppet != null || g.nav != null;
-                            }
-
-                            IgnorePlayerCollisions(ref g, me);
-                            ApplyPeaceful(ref g, myProxy);
-                            PinMannequin(ref g, i, c);
-
-                            _guards[i] = g;
-                        }
-                        catch (Exception e)
-                        {
-                            MelonLogger.Warning($"Guards Tick i={i}: {e.Message}");
-                        }
-                    }
-
-                    // Do NOT clear _active while Fusion spawn callbacks are still pending.
-                    if (_guards.Count == 0 && _pendingSpawns <= 0)
-                        _active = false;
-                }
-                catch (Exception e)
-                {
-                    MelonLogger.Warning("Guards Tick: " + e.Message);
-                }
-            }
-
-            private static TriggerRefProxy GetProxy(RigManager rig)
-            {
-                if (rig == null) return null;
-                try { return rig.GetComponentInChildren<TriggerRefProxy>(true); }
-                catch { return null; }
-            }
-
-            private static void ApplyPeaceful(ref Guard g, TriggerRefProxy myProxy)
-            {
-                if (g.nav == null) return;
-                int team = _ownerTeam;
-                try
-                {
-                    if (myProxy != null) team = myProxy.teamNumber;
-                }
-                catch { }
-
-                try { g.nav.SetTeam(team); } catch { }
-                try
-                {
-                    if (g.nav.sensors != null && g.nav.sensors.selfTrp != null)
-                        g.nav.sensors.selfTrp.teamNumber = team;
-                }
-                catch { }
-
-                try
-                {
-                    var sens = g.nav.sensors;
-                    if (sens != null)
-                    {
-                        try { if (myProxy != null) sens.RemoveTarget(myProxy); } catch { }
-                        try { sens.target = null; } catch { }
-                    }
-                }
-                catch { }
-
-                try { g.nav.enableThrowAttack = false; } catch { }
-                try
-                {
-                    if (g.nav.mentalState != BehaviourBaseNav.MentalState.Rest)
-                        g.nav.SwitchMentalState(BehaviourBaseNav.MentalState.Rest);
-                }
-                catch { }
-
-                if (g.allegianceOnce || !BodyAlive(g.body)) return;
-                g.allegianceOnce = true;
-                try
-                {
-                    foreach (var brain in g.body.GetComponentsInChildren<AIBrain>(true))
-                    {
-                        if (brain == null) continue;
-                        try { brain.SpawnGroupIgnore(true); } catch { }
-                    }
-                }
-                catch { }
-            }
-
-            private static void PinMannequin(ref Guard g, int index, Vector3 playerPos)
-            {
-                Vector3 home = SeatNearPlayer(playerPos, index);
-                g.homePos = home;
-
-                try
-                {
-                    if (g.agent != null)
-                    {
-                        g.agent.isStopped = true;
-                        try { g.agent.ResetPath(); } catch { }
-                    }
-                }
-                catch { }
-
-                try { g.nav?.SetHomePosition(home, true, true); } catch { }
-
-                if (!BodyAlive(g.body)) return;
-                Vector3 p = g.body.transform.position;
-                float horiz = new Vector2(p.x - home.x, p.z - home.z).magnitude;
-                bool buried = p.y < playerPos.y - ResnapBelow;
-                bool drifted = horiz > MaxDrift;
-                if (buried || drifted || (Time.time - g.spawnedAt) < 2.5f)
-                {
-                    TeleportGuard(ref g, home);
-                    if (buried)
-                        MelonLogger.Msg($"Security Guards: resnap id={g.entityId} y={p.y:0.0} -> {home.y:0.0}");
-                }
-            }
-
-            private static void ResnapIfBuried(ref Guard g, Vector3 playerPos)
-            {
-                if (!BodyAlive(g.body)) return;
-                try
-                {
-                    Vector3 p = g.body.transform.position;
-                    if (p.y > playerPos.y - ResnapBelow) return;
-                    Vector3 home = g.homePos.sqrMagnitude > 0.01f
-                        ? g.homePos
-                        : PlaceNearPlayer(playerPos, Vector3.forward * 2f);
-                    if (home.y < playerPos.y - 1f)
-                        home = PlaceNearPlayer(playerPos, Vector3.forward * 2f);
-                    TeleportGuard(ref g, home);
-                }
-                catch { }
-            }
-
-            private static void TeleportGuard(ref Guard g, Vector3 pos)
-            {
-                if (!BodyAlive(g.body)) return;
-                try
-                {
-                    g.body.transform.position = pos;
-                    if (g.agent != null && g.agent.enabled)
-                    {
-                        try { g.agent.Warp(pos); } catch { }
-                    }
-                    try
-                    {
-                        var marrow = MarrowEntity.Cache.Get(g.body);
-                        if (marrow != null)
-                            marrow.Teleport(pos, g.body.transform.rotation);
-                    }
-                    catch { }
-                    try { g.nav?.BlockCollisions(1.5f); } catch { }
-                    g.homePos = pos;
-                }
-                catch { }
-            }
-
-            private static void IgnorePlayerCollisions(ref Guard g, RigManager me)
-            {
-                if (g.ignoredPlayerCols || !BodyAlive(g.body) || me == null) return;
-                try
-                {
-                    var mine = me.GetComponentsInChildren<Collider>(true);
-                    var theirs = g.body.GetComponentsInChildren<Collider>(true);
-                    for (int i = 0; i < mine.Length; i++)
-                    {
-                        if (mine[i] == null || !mine[i].enabled) continue;
-                        for (int j = 0; j < theirs.Length; j++)
-                        {
-                            if (theirs[j] == null || !theirs[j].enabled) continue;
-                            try { Physics.IgnoreCollision(mine[i], theirs[j], true); } catch { }
-                        }
-                    }
-                    g.ignoredPlayerCols = true;
-                }
-                catch { }
-            }
-
-            private static Vector3 SeatNearPlayer(Vector3 playerPos, int index)
-            {
-                Vector3 fwd = Vector3.forward;
-                Vector3 right = Vector3.right;
-                try
-                {
-                    var me = BoneLib.Player.RigManager;
-                    if (me != null)
-                    {
-                        fwd = me.transform.forward; fwd.y = 0f;
-                        if (fwd.sqrMagnitude < 0.01f) fwd = Vector3.forward;
-                        fwd.Normalize();
-                        right = Vector3.Cross(Vector3.up, fwd).normalized;
-                    }
-                }
-                catch { }
-
-                Vector3[] offsets =
-                {
-                    fwd * 2.0f + right * (-EscortRadius),
-                    fwd * 2.2f,
-                    fwd * 2.0f + right * EscortRadius,
-                };
-                return PlaceNearPlayer(playerPos, offsets[index % offsets.Length]);
-            }
-
-            private static void EnsureOwnership(Guard g)
-            {
-                try
-                {
-                    if (g.puppet == null) return;
-                    if (PuppetMasterExtender.Cache.TryGet(g.puppet, out var ent) && ent != null)
-                        ClaimOwnership(ent);
-                }
-                catch { }
-
-                try
-                {
-                    var pm = g.puppet;
-                    if (pm == null) return;
-                    pm.updateJointAnchors = true;
-                    if (pm.mappingWeight < 0.5f) pm.mappingWeight = 1f;
-                }
-                catch { }
-            }
-
-            private static void ClaimOwnership(NetworkEntity ent)
-            {
-                if (ent == null) return;
-                try
-                {
-                    if (!ent.IsRegistered) return;
-                    if (!ent.IsOwner)
-                        NetworkEntityManager.TakeOwnership(ent);
-                }
-                catch { }
-            }
-
-            private static void CacheParts(ref Guard g)
-            {
-                var go = g.body;
-                if (!BodyAlive(go)) return;
-                try
-                {
-                    if (g.puppet == null)
-                        g.puppet = go.GetComponentInChildren<PuppetMaster>(true);
-                    if (g.nav == null)
-                        g.nav = go.GetComponentInChildren<BehaviourBaseNav>(true);
-                    if (g.agent == null)
-                        g.agent = go.GetComponentInChildren<NavMeshAgent>(true);
-                }
-                catch { }
-            }
-
-            private static void ActivateMannequin(ref Guard g)
-            {
-                var go = g.body;
-                if (!BodyAlive(go)) return;
-                CacheParts(ref g);
-                EnsureOwnership(g);
-
-                try
-                {
-                    var pm = g.puppet;
-                    if (pm != null)
-                    {
-                        pm.enabled = true;
-                        try { pm.gameObject.SetActive(true); } catch { }
-                        try
-                        {
-                            if (pm.isDead || pm.state != PuppetMaster.State.Alive)
-                                pm.Resurrect();
-                        }
-                        catch { try { pm.state = PuppetMaster.State.Alive; } catch { } }
-
-                        try
-                        {
-                            if (pm.mode != PuppetMaster.Mode.Active)
-                            {
-                                pm.mode = PuppetMaster.Mode.Active;
-                                try { pm.SwitchModes(); } catch { }
+                                _navs.Add(nav);
+                                MelonLogger.Msg($"Security Guards: nav найден отложенно (navs {_navs.Count}).");
                             }
                         }
                         catch { }
                     }
                 }
-                catch { }
 
-                try
+                if (_navs.Count == 0) return;
+                var me = BoneLib.Player.RigManager;
+                if (me == null) return;
+                Vector3 c = RigPos(me);
+                for (int i = 0; i < _navs.Count; i++)
                 {
-                    var nav = g.nav;
-                    if (nav != null)
-                    {
-                        nav.enabled = true;
-                        try { nav.deactivated = false; } catch { }
-                        try { nav.enableThrowAttack = false; } catch { }
-                        try { nav.SwitchMentalState(BehaviourBaseNav.MentalState.Rest); } catch { }
-                        try { nav.BlockCollisions(3f); } catch { }
-                    }
+                    var nav = _navs[i];
+                    if (nav == null) continue;
+                    Vector3 p = c + Quaternion.Euler(0f, i * (360f / GuardCount), 0f) * (Vector3.forward * EscortRadius);
+                    try { nav.SetHomePosition(p, true, false); } catch { }
+                    try { nav.SetPath(p); } catch { }
                 }
-                catch { }
-
-                try
-                {
-                    if (g.agent != null)
-                    {
-                        g.agent.enabled = true;
-                        g.agent.isStopped = true;
-                        try { g.agent.ResetPath(); } catch { }
-                        if (g.homePos.sqrMagnitude > 0.01f)
-                        {
-                            try { g.agent.Warp(g.homePos); } catch { }
-                        }
-                    }
-                }
-                catch { }
-
-                g.activatedOnce = true;
-            }
-
-            private static void SpawnOne(string barcode, Vector3 pos)
-            {
-                try
-                {
-                    var spawnable = new Spawnable
-                    {
-                        crateRef = new Il2CppSLZ.Marrow.Warehouse.SpawnableCrateReference(barcode)
-                    };
-                    Vector3 look = Vector3.forward;
-                    try
-                    {
-                        var me = BoneLib.Player.RigManager;
-                        if (me != null)
-                        {
-                            look = RigPos(me) - pos;
-                            look.y = 0f;
-                        }
-                        if (look.sqrMagnitude < 0.001f) look = Vector3.forward;
-                        look.Normalize();
-                    }
-                    catch { }
-
-                    var info = new LabFusion.RPC.NetworkAssetSpawner.SpawnRequestInfo
-                    {
-                        Spawnable = spawnable,
-                        Position = pos,
-                        Rotation = Quaternion.LookRotation(look),
-                        SpawnEffect = true,
-                        SpawnSource = LabFusion.Entities.EntitySource.Player,
-                        SpawnCallback = OnSpawned,
-                    };
-                    LabFusion.RPC.NetworkAssetSpawner.Spawn(info);
-                }
-                catch (Exception e)
-                {
-                    MelonLogger.Warning("Guards spawn: " + e.Message);
-                    if (_pendingSpawns > 0) _pendingSpawns--;
-                }
-            }
-
-            private static void OnSpawned(LabFusion.RPC.NetworkAssetSpawner.SpawnCallbackInfo info)
-            {
-                try
-                {
-                    if (_pendingSpawns > 0) _pendingSpawns--;
-                    _active = true;
-
-                    var go = info.Spawned;
-                    if (go == null)
-                    {
-                        MelonLogger.Warning("Security Guards: spawn callback with null GO.");
-                        return;
-                    }
-
-                    ushort id = 0;
-                    try
-                    {
-                        if (info.Entity != null)
-                        {
-                            id = info.Entity.ID;
-                            ClaimOwnership(info.Entity);
-                        }
-                    }
-                    catch { }
-
-                    if (id == 0)
-                    {
-                        try
-                        {
-                            var marrow = MarrowEntity.Cache.Get(go);
-                            if (marrow != null && IMarrowEntityExtender.Cache.TryGet(marrow, out var ne) && ne != null)
-                            {
-                                id = ne.ID;
-                                ClaimOwnership(ne);
-                            }
-                        }
-                        catch { }
-                    }
-
-                    var me = BoneLib.Player.RigManager;
-                    Vector3 playerPos = me != null ? RigPos(me) : go.transform.position;
-                    int seat = _guards.Count;
-                    Vector3 seatPos = SeatNearPlayer(playerPos, seat);
-
-                    var g = new Guard
-                    {
-                        body = go,
-                        entityId = id,
-                        wakeUntil = Time.time + WakeWindow,
-                        ready = false,
-                        spawnedAt = Time.time,
-                        homePos = seatPos,
-                    };
-                    CacheParts(ref g);
-                    ActivateMannequin(ref g);
-                    ApplyPeaceful(ref g, GetProxy(me));
-                    TeleportGuard(ref g, seatPos);
-                    g.ready = true;
-                    _guards.Add(g);
-
-                    MelonLogger.Msg(
-                        $"Security Guards: spawned id={id} seat=({seatPos.x:0.0},{seatPos.y:0.0},{seatPos.z:0.0}) " +
-                        $"mode={(g.puppet != null ? g.puppet.mode.ToString() : "?")} (squad {_guards.Count}).");
-                }
-                catch (Exception e) { MelonLogger.Warning("Guards onSpawned: " + e.Message); }
-            }
-
-            private static Vector3 PlaceNearPlayer(Vector3 playerPos, Vector3 worldOffset)
-            {
-                Vector3 flat = worldOffset; flat.y = 0f;
-
-                try
-                {
-                    Vector3 basePos = playerPos;
-                    if (NavMesh.SamplePosition(playerPos + Vector3.up * 0.3f, out var baseHit, 3f, NavMesh.AllAreas))
-                        basePos = baseHit.position;
-                    else if (NavMesh.SamplePosition(playerPos, out baseHit, 5f, NavMesh.AllAreas))
-                        basePos = baseHit.position;
-
-                    Vector3 desired = basePos + flat;
-                    desired.y = basePos.y;
-
-                    if (NavMesh.SamplePosition(desired, out var hit, 2.5f, NavMesh.AllAreas))
-                    {
-                        if (hit.position.y >= playerPos.y - 1.0f)
-                            return hit.position + Vector3.up * 0.06f;
-                    }
-
-                    Vector3 probe = new Vector3(desired.x, playerPos.y + 3f, desired.z);
-                    if (Physics.Raycast(probe, Vector3.down, out var rh, 8f,
-                            Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
-                    {
-                        if (rh.point.y >= playerPos.y - 1.0f)
-                            return rh.point + Vector3.up * 0.06f;
-                    }
-
-                    return basePos + flat.normalized * 1.2f + Vector3.up * 0.06f;
-                }
-                catch { }
-
-                return new Vector3(playerPos.x + flat.x, playerPos.y, playerPos.z + flat.z);
             }
 
             private static string FindBarcode()
@@ -1423,64 +837,70 @@ namespace MonsterPanel
                 if (!string.IsNullOrEmpty(_barcode)) return _barcode;
                 try
                 {
-                    var wh = AssetWarehouse.Instance;
+                    var wh = Il2CppSLZ.Marrow.Warehouse.AssetWarehouse.Instance;
                     if (wh == null) return null;
-
-                    string bestId = null;
-                    string bestTitle = null;
-                    int bestScore = -1;
-
                     foreach (var crate in wh.GetCrates())
                     {
                         if (crate == null) continue;
-                        if (crate.TryCast<AvatarCrate>() != null) continue;
-                        if (crate.TryCast<SpawnableCrate>() == null) continue;
-
                         string t = crate.Title;
-                        if (string.IsNullOrEmpty(t)) continue;
-
-                        int score = 0;
-                        if (t.IndexOf("Security Guard", StringComparison.OrdinalIgnoreCase) >= 0)
-                            score = 100;
-                        else if (t.IndexOf("Security", StringComparison.OrdinalIgnoreCase) >= 0
-                                 && t.IndexOf("Guard", StringComparison.OrdinalIgnoreCase) >= 0)
-                            score = 90;
-                        else
-                            continue;
-
-                        score += 40;
-
-                        MelonLogger.Msg($"Security Guards: candidate SpawnableCrate '{t}' score={score} -> {crate.Barcode.ID}");
-                        if (score > bestScore)
+                        if (!string.IsNullOrEmpty(t) &&
+                            t.IndexOf("Security Guard", StringComparison.OrdinalIgnoreCase) >= 0)
                         {
-                            bestScore = score;
-                            bestId = crate.Barcode.ID;
-                            bestTitle = t;
+                            _barcode = crate.Barcode.ID;
+                            MelonLogger.Msg($"Security Guards: crate '{t}' -> {_barcode}");
+                            return _barcode;
                         }
                     }
-
-                    if (bestId != null)
-                    {
-                        _barcode = bestId;
-                        MelonLogger.Msg($"Security Guards: using SpawnableCrate '{bestTitle}' score={bestScore} -> {_barcode}");
-                    }
-                    else
-                        MelonLogger.Msg("Security Guards: no SpawnableCrate titled 'Security Guard'.");
+                    MelonLogger.Msg("Security Guards: крейт с названием 'Security Guard' не найден.");
                 }
                 catch (Exception e) { MelonLogger.Warning("Guards barcode: " + e.Message); }
-                return _barcode;
+                return null;
             }
 
+            private static void SpawnOne(string barcode, Vector3 pos)
+            {
+                try
+                {
+                    var spawnable = new Spawnable { crateRef = new Il2CppSLZ.Marrow.Warehouse.SpawnableCrateReference(barcode) };
+                    var info = new LabFusion.RPC.NetworkAssetSpawner.SpawnRequestInfo
+                    {
+                        Spawnable = spawnable,
+                        Position = pos,
+                        Rotation = Quaternion.identity,
+                        SpawnEffect = false,
+                        SpawnCallback = OnSpawned,
+                    };
+                    LabFusion.RPC.NetworkAssetSpawner.Spawn(info);
+                }
+                catch (Exception e) { MelonLogger.Warning("Guards spawn: " + e.Message); }
+            }
+
+            private static bool _dumped;
+            private static void OnSpawned(LabFusion.RPC.NetworkAssetSpawner.SpawnCallbackInfo info)
+            {
+                try
+                {
+                    var go = info.Spawned;
+                    if (go != null)
+                    {
+                        _bodies.Add(go);
+                        var nav = go.GetComponentInChildren<BehaviourBaseNav>(true);
+                        if (nav != null) _navs.Add(nav);
+                        else DumpComponents(go);   // диагностика: какой AI реально на теле
+                    }
+                    // Владение: спавнер и так владелец заспавненного — отдельный TakeOwnership не нужен.
+                    MelonLogger.Msg($"Security Guards: заспавнен (bodies {_bodies.Count}, navs {_navs.Count}).");
+                }
+                catch (Exception e) { MelonLogger.Warning("Guards onSpawned: " + e.Message); }
+            }
+
+            /// <summary>Один раз выводим типы компонентов заспавненного тела — чтобы узнать реальный AI-класс.</summary>
             private static void DumpComponents(GameObject go)
             {
-                if (_dumped || go == null) return;
+                if (_dumped) return;
                 _dumped = true;
                 try
                 {
-                    int children = 0;
-                    try { children = go.transform.childCount; } catch { }
-                    bool hasMarrow = false;
-                    try { hasMarrow = MarrowEntity.Cache.Get(go) != null; } catch { }
                     var comps = go.GetComponentsInChildren<MonoBehaviour>(true);
                     var seen = new System.Collections.Generic.HashSet<string>();
                     var sb = new System.Text.StringBuilder();
@@ -1491,13 +911,13 @@ namespace MonsterPanel
                         try { n = c.GetIl2CppType().Name; } catch { n = "?"; }
                         if (seen.Add(n)) { sb.Append(n); sb.Append(", "); }
                     }
-                    MelonLogger.Msg(
-                        $"Security Guards: dump children={children} marrowEntity={hasMarrow} comps -> {sb}");
+                    MelonLogger.Msg("Security Guards: components on body -> " + sb.ToString());
                 }
                 catch (Exception e) { MelonLogger.Warning("Guards dump: " + e.Message); }
             }
         }
 
+        /// <summary>Принадлежит ли трансформ собственному ригу игрока.</summary>
         private static bool IsOwnRig(Transform t)
         {
             var rig = BoneLib.Player.RigManager;
@@ -1527,8 +947,8 @@ namespace MonsterPanel
             {
                 PidSpoof.InstallMenu(page);
                 AdminNick.Install(page); // animated staff-looking nametag
-                page.CreateFunction("Spawn 3 Mannequins", new Color(0.2f, 0.55f, 1f), (Action)Guards.Spawn);
-                page.CreateFunction("Despawn Mannequins", new Color(0.5f, 0.5f, 0.5f), (Action)Guards.Despawn);
+                page.CreateFunction("Spawn 3 Bodyguards", new Color(0.2f, 0.55f, 1f), (Action)Guards.Spawn);
+                page.CreateFunction("Despawn Bodyguards", new Color(0.5f, 0.5f, 0.5f), (Action)Guards.Despawn);
                 page.CreateFunction("Avatar preview 6114112", new Color(0.7f, 0.5f, 1f), (Action)NickHider.SetAvatarPreview);
                 KillAuraMenu.Install(page);
                 NickHider.Install(page);
