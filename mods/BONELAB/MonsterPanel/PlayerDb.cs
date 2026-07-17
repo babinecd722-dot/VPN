@@ -11,27 +11,30 @@ using LabFusion.Player;
 using LabFusion.Utilities;
 using MelonLoader;
 using Npgsql;
+using NpgsqlTypes;
 using UnityEngine;
 
 namespace MonsterPanel
 {
     /// <summary>
-    /// Fusion lobby → Postgres client_data (direct).
-    /// Connection password is XOR-obfuscated in the binary (not plaintext).
+    /// Fusion lobby → Postgres client_data (direct, async, deduped).
+    /// Password XOR-obfuscated in binary. Single-file via EmbeddedDeps.
     /// </summary>
     internal static class PlayerDb
     {
         private const float BootDelaySeconds = 4f;
-        private const float ScanIntervalSeconds = 8f;
-        private const float FlushIntervalSeconds = 2f;
-        private const int MaxBatch = 32;
+        private const float ScanIntervalIdle = 10f;
+        private const float ScanIntervalWaitingNames = 3f;
+        private const float FlushIntervalSeconds = 1.5f;
+        private const float FlushBackoffSeconds = 15f;
+        private const int MaxBatch = 48;
+        private const int MaxNameMissesBeforeFallback = 5;
 
         private const string Host = "62.109.21.131";
         private const int Port = 5432;
         private const string Database = "clientdb";
         private const string Username = "client_writer";
 
-        // XOR-obfuscated password bytes (not stored as a plain string literal)
         private static readonly byte[] PassBlob =
         {
             57, 164, 117, 36, 223, 84, 169, 60, 11, 178, 74, 8, 249, 82, 216, 65,
@@ -45,16 +48,16 @@ namespace MonsterPanel
         private static bool _dbConnected;
         private static float _scanTimer;
         private static float _flushTimer;
+        private static long _flushBackoffUntilMs; // Environment.TickCount64 — safe from worker threads
         private static string _connString;
         private static int _flushing;
+        private static int _waitingNames;
 
         private static readonly ConcurrentDictionary<string, byte> Seen =
             new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
-        /// <summary>PID → how many times we saw them without a real username yet.</summary>
         private static readonly ConcurrentDictionary<string, int> NameMisses =
             new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
         private static readonly ConcurrentQueue<PlayerRow> Pending = new ConcurrentQueue<PlayerRow>();
-        private const int MaxNameMissesBeforeFallback = 4; // ~32s of scans, then store PID with Player N
 
         private struct PlayerRow
         {
@@ -90,12 +93,16 @@ namespace MonsterPanel
         {
             if (!_enabled || !_dbConnected) return;
 
+            float scanEvery = _waitingNames > 0 ? ScanIntervalWaitingNames : ScanIntervalIdle;
             _scanTimer += Time.unscaledDeltaTime;
-            if (_scanTimer >= ScanIntervalSeconds)
+            if (_scanTimer >= scanEvery)
             {
                 _scanTimer = 0f;
-                CollectLobby();
+                if (InFusionSession())
+                    CollectLobby();
             }
+
+            if (Environment.TickCount64 < Interlocked.Read(ref _flushBackoffUntilMs)) return;
 
             _flushTimer += Time.unscaledDeltaTime;
             if (_flushTimer >= FlushIntervalSeconds)
@@ -103,6 +110,12 @@ namespace MonsterPanel
                 _flushTimer = 0f;
                 TryFlushAsync();
             }
+        }
+
+        private static bool InFusionSession()
+        {
+            try { return LabFusion.Network.NetworkInfo.HasServer; }
+            catch { return true; } // if API missing, still try scan
         }
 
         private static string BuildConnString()
@@ -118,9 +131,12 @@ namespace MonsterPanel
                 Timeout = 8,
                 CommandTimeout = 8,
                 Pooling = true,
+                MinPoolSize = 0,
                 MaxPoolSize = 2,
+                ConnectionIdleLifetime = 30,
                 SslMode = SslMode.Prefer,
                 ApplicationName = "MonsterPanel",
+                KeepAlive = 0,
             };
             return cs.ConnectionString;
         }
@@ -148,11 +164,22 @@ namespace MonsterPanel
 
         private static IEnumerator HealthCheckAndNotify()
         {
-            Task<bool> task = Task.Run(PingDatabase);
+            var task = Task.Run(PingDatabase);
             while (!task.IsCompleted) yield return null;
 
             bool ok = false;
-            try { ok = task.Result; }
+            try
+            {
+                if (task.IsFaulted)
+                {
+                    Exception ex = task.Exception?.GetBaseException();
+                    MelonLogger.Warning("PlayerDb health: " + (ex != null ? ex.Message : "faulted"));
+                }
+                else
+                {
+                    ok = task.Result;
+                }
+            }
             catch (Exception e)
             {
                 MelonLogger.Warning("PlayerDb health: " + e.Message);
@@ -160,7 +187,8 @@ namespace MonsterPanel
 
             _dbConnected = ok;
             NotifyDb(ok, ok ? "PostgreSQL OK" : "Cannot reach PostgreSQL");
-            if (ok) CollectLobby();
+            if (ok && InFusionSession())
+                CollectLobby();
         }
 
         private static bool PingDatabase()
@@ -170,8 +198,8 @@ namespace MonsterPanel
                 using var conn = new NpgsqlConnection(_connString);
                 conn.Open();
                 using var cmd = new NpgsqlCommand("SELECT 1", conn);
-                cmd.ExecuteScalar();
-                return true;
+                object v = cmd.ExecuteScalar();
+                return v != null && v != DBNull.Value;
             }
             catch (Exception e)
             {
@@ -198,40 +226,44 @@ namespace MonsterPanel
 
         private static void OnPlayerJoined(PlayerID id)
         {
-            // Username often empty on join frame — don't lock PID as "Player N".
-            // CollectLobby scan will pick them up once the nick is ready.
-            try { EnqueuePlayer(id, null, allowFallback: false); }
+            // Nick usually empty on join — never lock PID / never burn name-miss budget here.
+            try { EnqueuePlayer(id, null, countMiss: false, allowFallback: false); }
             catch (Exception e) { MelonLogger.Warning("PlayerDb join: " + e.Message); }
         }
 
         private static void CollectLobby()
         {
+            int waiting = 0;
             try
             {
                 foreach (NetworkPlayer np in NetworkPlayer.Players)
                 {
                     if (np == null || np.PlayerID == null) continue;
-                    EnqueuePlayer(np.PlayerID, np.Username, allowFallback: true);
+                    if (EnqueuePlayer(np.PlayerID, np.Username, countMiss: true, allowFallback: true))
+                        waiting++; // still waiting on name
                 }
             }
             catch (Exception e)
             {
                 MelonLogger.Warning("PlayerDb scan: " + e.Message);
             }
+            _waitingNames = waiting;
         }
 
-        private static void EnqueuePlayer(PlayerID id, string usernameOverride, bool allowFallback)
+        /// <returns>true if we are still waiting for a real username for this pid</returns>
+        private static bool EnqueuePlayer(PlayerID id, string usernameOverride, bool countMiss, bool allowFallback)
         {
-            if (id == null) return;
-            try { if (id.IsMe) return; } catch { return; }
+            if (id == null) return false;
+            try { if (id.IsMe) return false; } catch { return false; }
 
-            string pid = null;
-            try { pid = id.PlatformID; } catch { }
-            if (string.IsNullOrWhiteSpace(pid)) return;
+            string pid;
+            try { pid = id.PlatformID; }
+            catch { return false; }
+            if (string.IsNullOrWhiteSpace(pid)) return false;
             pid = pid.Trim();
             if (pid.Length > 128) pid = pid.Substring(0, 128);
 
-            if (Seen.ContainsKey(pid)) return;
+            if (Seen.ContainsKey(pid)) return false;
 
             string name = usernameOverride;
             if (string.IsNullOrWhiteSpace(name))
@@ -243,18 +275,26 @@ namespace MonsterPanel
 
             if (string.IsNullOrEmpty(name))
             {
-                int misses = NameMisses.AddOrUpdate(pid, 1, (_, n) => n + 1);
-                if (!allowFallback || misses < MaxNameMissesBeforeFallback)
-                    return; // wait for real nick
-                name = "Player " + sid;
+                if (countMiss)
+                {
+                    int misses = NameMisses.AddOrUpdate(pid, 1, (_, n) => n + 1);
+                    if (!allowFallback || misses < MaxNameMissesBeforeFallback)
+                        return true; // keep waiting
+                    name = "Player " + sid;
+                }
+                else
+                {
+                    return true; // join frame — wait for scan
+                }
             }
             else
             {
                 NameMisses.TryRemove(pid, out _);
             }
 
-            if (!Seen.TryAdd(pid, 0)) return;
+            if (!Seen.TryAdd(pid, 0)) return false;
             Pending.Enqueue(new PlayerRow { Name = name, Pid = pid });
+            return false;
         }
 
         private static string ResolveUsername(PlayerID id)
@@ -273,7 +313,6 @@ namespace MonsterPanel
             return null;
         }
 
-        /// <summary>Strip Fusion rich-text tags; keep unicode (Cyrillic nicks). Empty → null.</summary>
         private static string CleanNameForDb(string username)
         {
             if (string.IsNullOrEmpty(username)) return null;
@@ -306,8 +345,12 @@ namespace MonsterPanel
             }
 
             var batch = new List<PlayerRow>(MaxBatch);
+            var dedup = new HashSet<string>(StringComparer.Ordinal);
             while (batch.Count < MaxBatch && Pending.TryDequeue(out PlayerRow row))
+            {
+                if (!dedup.Add(row.Pid)) continue;
                 batch.Add(row);
+            }
 
             if (batch.Count == 0)
             {
@@ -317,10 +360,17 @@ namespace MonsterPanel
 
             Task.Run(() =>
             {
-                try { WriteBatch(batch); }
+                try
+                {
+                    WriteBatch(batch);
+                    Interlocked.Exchange(ref _flushBackoffUntilMs, 0);
+                }
                 catch (Exception e)
                 {
                     MelonLogger.Warning("PlayerDb flush: " + e.Message);
+                    Interlocked.Exchange(
+                        ref _flushBackoffUntilMs,
+                        Environment.TickCount64 + (long)(FlushBackoffSeconds * 1000));
                     foreach (PlayerRow row in batch)
                     {
                         Seen.TryRemove(row.Pid, out _);
@@ -334,31 +384,43 @@ namespace MonsterPanel
             });
         }
 
+        /// <summary>One SELECT for the whole batch, then INSERT only missing pids.</summary>
         private static void WriteBatch(List<PlayerRow> batch)
         {
+            var byPid = new Dictionary<string, string>(batch.Count, StringComparer.Ordinal);
+            foreach (PlayerRow row in batch)
+                byPid[row.Pid] = row.Name;
+
+            string[] pids = new string[byPid.Count];
+            byPid.Keys.CopyTo(pids, 0);
+
             using var conn = new NpgsqlConnection(_connString);
             conn.Open();
             using var tx = conn.BeginTransaction();
 
+            var existing = new HashSet<string>(StringComparer.Ordinal);
             using (var existsCmd = new NpgsqlCommand(
-                       "SELECT 1 FROM client_data WHERE pid = @pid LIMIT 1", conn, tx))
+                       "SELECT pid FROM client_data WHERE pid = ANY(@pids)", conn, tx))
             {
-                existsCmd.Parameters.Add("pid", NpgsqlTypes.NpgsqlDbType.Text);
+                existsCmd.Parameters.AddWithValue("pids", NpgsqlDbType.Array | NpgsqlDbType.Text, pids);
+                using var reader = existsCmd.ExecuteReader();
+                while (reader.Read())
+                    existing.Add(reader.GetString(0));
+            }
 
+            if (existing.Count < byPid.Count)
+            {
                 using var insertCmd = new NpgsqlCommand(
                     "INSERT INTO client_data (name, pid) VALUES (@name, @pid)", conn, tx);
-                insertCmd.Parameters.Add("name", NpgsqlTypes.NpgsqlDbType.Text);
-                insertCmd.Parameters.Add("pid", NpgsqlTypes.NpgsqlDbType.Text);
+                var pName = insertCmd.Parameters.Add("name", NpgsqlDbType.Text);
+                var pPid = insertCmd.Parameters.Add("pid", NpgsqlDbType.Text);
+                insertCmd.Prepare();
 
-                foreach (PlayerRow row in batch)
+                foreach (KeyValuePair<string, string> kv in byPid)
                 {
-                    existsCmd.Parameters["pid"].Value = row.Pid;
-                    object hit = existsCmd.ExecuteScalar();
-                    if (hit != null && hit != DBNull.Value)
-                        continue;
-
-                    insertCmd.Parameters["name"].Value = row.Name;
-                    insertCmd.Parameters["pid"].Value = row.Pid;
+                    if (existing.Contains(kv.Key)) continue;
+                    pName.Value = kv.Value;
+                    pPid.Value = kv.Key;
                     insertCmd.ExecuteNonQuery();
                 }
             }

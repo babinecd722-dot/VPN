@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
+using System.Threading;
 using MelonLoader;
 
 namespace MonsterPanel
@@ -11,32 +12,32 @@ namespace MonsterPanel
     /// </summary>
     internal static class EmbeddedDeps
     {
-        private static bool _installed;
+        private static int _installed;
+        private static readonly object Gate = new object();
         private static readonly Dictionary<string, Assembly> Cache =
             new Dictionary<string, Assembly>(StringComparer.OrdinalIgnoreCase);
 
-        private static readonly string[] ResourceDlls =
-        {
-            "MonsterPanel.Embedded.Npgsql.dll",
-            "MonsterPanel.Embedded.Microsoft.Extensions.Logging.Abstractions.dll",
-            "MonsterPanel.Embedded.Microsoft.Extensions.DependencyInjection.Abstractions.dll",
-        };
+        private static readonly Dictionary<string, string> NameToResource =
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["Npgsql"] = "MonsterPanel.Embedded.Npgsql.dll",
+                ["Microsoft.Extensions.Logging.Abstractions"] = "MonsterPanel.Embedded.Microsoft.Extensions.Logging.Abstractions.dll",
+                ["Microsoft.Extensions.DependencyInjection.Abstractions"] = "MonsterPanel.Embedded.Microsoft.Extensions.DependencyInjection.Abstractions.dll",
+            };
 
         [System.Runtime.CompilerServices.ModuleInitializer]
-        internal static void AutoInstall()
-        {
-            Install();
-        }
+        internal static void AutoInstall() => Install();
 
         public static void Install()
         {
-            if (_installed) return;
-            _installed = true;
+            if (Interlocked.Exchange(ref _installed, 1) != 0) return;
 
             AppDomain.CurrentDomain.AssemblyResolve += Resolve;
-            // Preload so MelonLoader / first Npgsql use doesn't race.
-            foreach (string res in ResourceDlls)
-                TryLoadResource(res);
+            lock (Gate)
+            {
+                foreach (string res in NameToResource.Values)
+                    TryLoadResource_NoLock(res);
+            }
         }
 
         private static Assembly Resolve(object sender, ResolveEventArgs args)
@@ -46,20 +47,16 @@ namespace MonsterPanel
                 string name = new AssemblyName(args.Name).Name;
                 if (string.IsNullOrEmpty(name)) return null;
 
-                if (Cache.TryGetValue(name, out Assembly hit))
-                    return hit;
+                lock (Gate)
+                {
+                    if (Cache.TryGetValue(name, out Assembly hit))
+                        return hit;
 
-                string res =
-                    name.Equals("Npgsql", StringComparison.OrdinalIgnoreCase)
-                        ? "MonsterPanel.Embedded.Npgsql.dll"
-                        : name.Equals("Microsoft.Extensions.Logging.Abstractions", StringComparison.OrdinalIgnoreCase)
-                            ? "MonsterPanel.Embedded.Microsoft.Extensions.Logging.Abstractions.dll"
-                            : name.Equals("Microsoft.Extensions.DependencyInjection.Abstractions", StringComparison.OrdinalIgnoreCase)
-                                ? "MonsterPanel.Embedded.Microsoft.Extensions.DependencyInjection.Abstractions.dll"
-                                : null;
+                    if (!NameToResource.TryGetValue(name, out string res))
+                        return null;
 
-                if (res == null) return null;
-                return TryLoadResource(res);
+                    return TryLoadResource_NoLock(res);
+                }
             }
             catch (Exception e)
             {
@@ -68,7 +65,7 @@ namespace MonsterPanel
             }
         }
 
-        private static Assembly TryLoadResource(string resourceName)
+        private static Assembly TryLoadResource_NoLock(string resourceName)
         {
             try
             {
@@ -90,8 +87,7 @@ namespace MonsterPanel
                 }
 
                 Assembly asm = Assembly.Load(data);
-                string simple = asm.GetName().Name;
-                Cache[simple] = asm;
+                Cache[asm.GetName().Name] = asm;
                 return asm;
             }
             catch (Exception e)
