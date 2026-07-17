@@ -114,12 +114,9 @@
 
 ### Установка на Quest
 
-В `MelonLoader/Mods/` положи **все** файлы из `mods/BONELAB/MonsterPanel/deps/`:
+Один файл в `MelonLoader/Mods/`:
 
-- `MonsterPanel.dll`
-- `Npgsql.dll`
-- `Microsoft.Extensions.DependencyInjection.Abstractions.dll`
-- `Microsoft.Extensions.Logging.Abstractions.dll`
+- `MonsterPanel.dll` (Npgsql уже вшит)
 
 На VPS ничего запускать не надо — только чтобы Postgres слушал `5432` снаружи (как сейчас).
 
