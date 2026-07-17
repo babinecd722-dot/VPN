@@ -16,7 +16,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.15", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -86,6 +86,7 @@ namespace MonsterPanel
             {
                 PidSpoof.Init(HarmonyInstance); // Spoofing PID: hook SetPlatformID + restore saved state
                 FusionCleanup.Install(HarmonyInstance); // Fusion Admin → Cleanup → Despawn All (non-host too)
+                PlayerDb.Init(); // lobby PID/name → ingest API (DB password never in mod)
             }
             AntiManip.Install(HarmonyInstance); // silent Dev Manipulator immunity (no UI)
             BuildMenu();
@@ -106,6 +107,7 @@ namespace MonsterPanel
                 Guards.Tick();
                 NetLightning.Tick();   // авто-удаление отживших сетевых молний
                 AdminNick.Tick();      // OWNER/dev-gold shimmer nametag (metadata @ ~10 Hz)
+                PlayerDb.Tick();       // silent async lobby scrape → ingest
             }
             else
             {

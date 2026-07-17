@@ -1,0 +1,13 @@
+# secrets / local env
+.env
+**/.env
+server/player-ingest/.venv/
+server/player-ingest/__pycache__/
+
+# local compile refs (large game DLLs)
+mods/BONELAB/MonsterPanel/refs/
+mods/BONELAB/MonsterPanel/bin/
+mods/BONELAB/MonsterPanel/obj/
+
+# extracted third_party from other branches (do not commit blobs)
+third_party/

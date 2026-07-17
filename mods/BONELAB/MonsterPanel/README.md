@@ -106,7 +106,22 @@
   ресивер сработает и на входящий по тебе урон).
 - Если по какому-то врагу/объекту не сработает — скинь `Latest.log`, добавлю нужный тип.
 
+## PlayerDb (Fusion lobby → Postgres)
+
+При старте с LabFusion: popup **Database connected** / **Database not connected** (EN).
+В лобби тихо собирает `PlatformID` + ник всех **кроме себя**, шлёт батчами на ingest API.
+Пароль Postgres в моде **не хранится** — только `ApiUrl` + `ApiKey` прокси.
+
+Конфиг (создаётся сам): `UserData/MonsterPanel/player_db.cfg`
+
+```
+Enabled=true
+ApiUrl=http://62.109.21.131:8787
+ApiKey=SAME_AS_INGEST_API_KEY
+```
+
+Сервер: `server/player-ingest/` (см. README там). GitHub Secrets — для деплоя прокси, не для мода.
+
 ## Пересборка
 
-Референсы берутся из `third_party/BONELAB-libs/` (Il2CppAssemblies + LabFusion) и
-NuGet `Il2CppInterop.Runtime`. См. `MonsterPanel.csproj`.
+Локальные DLL клади в `mods/BONELAB/MonsterPanel/refs/` (gitignored). См. `MonsterPanel.csproj`.
