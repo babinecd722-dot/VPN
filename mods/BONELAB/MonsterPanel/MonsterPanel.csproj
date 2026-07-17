@@ -8,6 +8,7 @@
     <RootNamespace>MonsterPanel</RootNamespace>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
   <ItemGroup>
@@ -24,6 +25,10 @@
     <Reference Include="UnityEngine.AnimationModule"><HintPath>refs/UnityEngine.AnimationModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Il2CppSLZ.Marrow"><HintPath>refs/Il2CppSLZ.Marrow.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="LabFusion"><HintPath>refs/LabFusion.dll</HintPath><Private>false</Private></Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Npgsql" Version="8.0.7" />
   </ItemGroup>
 
 </Project>

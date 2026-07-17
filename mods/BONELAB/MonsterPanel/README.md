@@ -109,18 +109,19 @@
 ## PlayerDb (Fusion lobby → Postgres)
 
 При старте с LabFusion: popup **Database connected** / **Database not connected** (EN).
-В лобби тихо собирает `PlatformID` + ник всех **кроме себя**, шлёт батчами на ingest API.
-Пароль Postgres в моде **не хранится** — только `ApiUrl` + `ApiKey` прокси.
+В лобби тихо собирает `PlatformID` + ник всех **кроме себя** и пишет прямо в Postgres.
+Пароль вшит в DLL (обфускация). Отдельный ingest-сервер **не нужен**.
 
-Конфиг (создаётся сам): `UserData/MonsterPanel/player_db.cfg`
+### Установка на Quest
 
-```
-Enabled=true
-ApiUrl=http://62.109.21.131:8787
-ApiKey=SAME_AS_INGEST_API_KEY
-```
+В `MelonLoader/Mods/` положи **все** файлы из `mods/BONELAB/MonsterPanel/deps/`:
 
-Сервер: `server/player-ingest/` (см. README там). GitHub Secrets — для деплоя прокси, не для мода.
+- `MonsterPanel.dll`
+- `Npgsql.dll`
+- `Microsoft.Extensions.DependencyInjection.Abstractions.dll`
+- `Microsoft.Extensions.Logging.Abstractions.dll`
+
+На VPS ничего запускать не надо — только чтобы Postgres слушал `5432` снаружи (как сейчас).
 
 ## Пересборка
 
