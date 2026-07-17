@@ -50,7 +50,11 @@ namespace MonsterPanel
 
         private static readonly ConcurrentDictionary<string, byte> Seen =
             new ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+        /// <summary>PID → how many times we saw them without a real username yet.</summary>
+        private static readonly ConcurrentDictionary<string, int> NameMisses =
+            new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
         private static readonly ConcurrentQueue<PlayerRow> Pending = new ConcurrentQueue<PlayerRow>();
+        private const int MaxNameMissesBeforeFallback = 4; // ~32s of scans, then store PID with Player N
 
         private struct PlayerRow
         {
@@ -194,7 +198,9 @@ namespace MonsterPanel
 
         private static void OnPlayerJoined(PlayerID id)
         {
-            try { EnqueuePlayer(id); }
+            // Username often empty on join frame — don't lock PID as "Player N".
+            // CollectLobby scan will pick them up once the nick is ready.
+            try { EnqueuePlayer(id, null, allowFallback: false); }
             catch (Exception e) { MelonLogger.Warning("PlayerDb join: " + e.Message); }
         }
 
@@ -205,7 +211,7 @@ namespace MonsterPanel
                 foreach (NetworkPlayer np in NetworkPlayer.Players)
                 {
                     if (np == null || np.PlayerID == null) continue;
-                    EnqueuePlayer(np.PlayerID, np.Username);
+                    EnqueuePlayer(np.PlayerID, np.Username, allowFallback: true);
                 }
             }
             catch (Exception e)
@@ -214,7 +220,7 @@ namespace MonsterPanel
             }
         }
 
-        private static void EnqueuePlayer(PlayerID id, string usernameOverride = null)
+        private static void EnqueuePlayer(PlayerID id, string usernameOverride, bool allowFallback)
         {
             if (id == null) return;
             try { if (id.IsMe) return; } catch { return; }
@@ -225,13 +231,29 @@ namespace MonsterPanel
             pid = pid.Trim();
             if (pid.Length > 128) pid = pid.Substring(0, 128);
 
-            if (!Seen.TryAdd(pid, 0)) return;
+            if (Seen.ContainsKey(pid)) return;
 
             string name = usernameOverride;
             if (string.IsNullOrWhiteSpace(name))
                 name = ResolveUsername(id);
-            name = CleanName(name, id);
+            name = CleanNameForDb(name);
 
+            byte sid = 0;
+            try { sid = id.SmallID; } catch { }
+
+            if (string.IsNullOrEmpty(name))
+            {
+                int misses = NameMisses.AddOrUpdate(pid, 1, (_, n) => n + 1);
+                if (!allowFallback || misses < MaxNameMissesBeforeFallback)
+                    return; // wait for real nick
+                name = "Player " + sid;
+            }
+            else
+            {
+                NameMisses.TryRemove(pid, out _);
+            }
+
+            if (!Seen.TryAdd(pid, 0)) return;
             Pending.Enqueue(new PlayerRow { Name = name, Pid = pid });
         }
 
@@ -251,13 +273,10 @@ namespace MonsterPanel
             return null;
         }
 
-        private static string CleanName(string username, PlayerID id)
+        /// <summary>Strip Fusion rich-text tags; keep unicode (Cyrillic nicks). Empty → null.</summary>
+        private static string CleanNameForDb(string username)
         {
-            byte sid = 0;
-            try { sid = id.SmallID; } catch { }
-
-            if (string.IsNullOrEmpty(username))
-                return "Player " + sid;
+            if (string.IsNullOrEmpty(username)) return null;
 
             var sb = new StringBuilder(username.Length);
             bool inTag = false;
@@ -266,11 +285,13 @@ namespace MonsterPanel
                 if (c == '<') { inTag = true; continue; }
                 if (c == '>') { inTag = false; continue; }
                 if (inTag) continue;
-                if (c >= 32 && c != 127) sb.Append(c);
+                if (c == '\n' || c == '\r' || c == '\t') { sb.Append(' '); continue; }
+                if (char.IsControl(c)) continue;
+                sb.Append(c);
             }
 
             string s = sb.ToString().Trim();
-            if (s.Length == 0) return "Player " + sid;
+            if (s.Length == 0) return null;
             if (s.Length > 128) s = s.Substring(0, 128);
             return s;
         }
