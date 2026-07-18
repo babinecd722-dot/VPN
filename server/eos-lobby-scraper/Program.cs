@@ -279,8 +279,17 @@ internal static class Program
 
         // Bucketed searches cover modes Fusion's public browser hides (PRIVATE/LOCKED).
         lobbyCount += RunSearch(players, privacyCounts, seenLobbyIds, "public+friends", excludePrivateAndLocked: true, privacyEq: null, code: null);
+        Pump(0.25);
         lobbyCount += RunSearch(players, privacyCounts, seenLobbyIds, "private", excludePrivateAndLocked: false, privacyEq: "1", code: null);
-        lobbyCount += RunSearch(players, privacyCounts, seenLobbyIds, "locked", excludePrivateAndLocked: false, privacyEq: "3", code: null);
+        Pump(0.25);
+        try
+        {
+            lobbyCount += RunSearch(players, privacyCounts, seenLobbyIds, "locked", excludePrivateAndLocked: false, privacyEq: "3", code: null);
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine("[scraper] locked search skipped: " + e.Message);
+        }
 
         // Codes are 8×[A-Z0-9] — not brute-forceable. Re-probe harvested/env codes not already seen.
         foreach (string code in TakeCodeProbes(CodeProbeBudget))
@@ -361,15 +370,20 @@ internal static class Program
                     continue;
                 try
                 {
-                    string lobbyKey = GetLobbyId(details) ?? ($"{label}:{i}");
+                    // Avoid LobbyDetails.CopyInfo — native EOS 1.15.5 can SIGSEGV on some Quest lobbies.
+                    string lobbyKey = BuildLobbyKey(details, label, i);
                     if (!seenLobbyIds.Add(lobbyKey))
                         continue;
                     added++;
                     ParseLobby(details, players, privacyCounts);
                 }
+                catch (Exception e)
+                {
+                    Console.Error.WriteLine($"[scraper] lobby parse ({label}#{i}): {e.Message}");
+                }
                 finally
                 {
-                    details.Release();
+                    try { details.Release(); } catch { /* ignore */ }
                 }
             }
         }
@@ -381,12 +395,35 @@ internal static class Program
         return added;
     }
 
-    private static string GetLobbyId(LobbyDetails details)
+    private static string BuildLobbyKey(LobbyDetails details, string label, uint index)
     {
-        var opts = default(LobbyDetailsCopyInfoOptions);
-        if (details.CopyInfo(ref opts, out LobbyDetailsInfo? info) != Result.Success || !info.HasValue)
-            return null;
-        return info.Value.LobbyId?.ToString();
+        string code = GetAttr(details, "LobbyCode");
+        string privacy = GetAttr(details, "Privacy");
+        string host = null;
+        string lobbyInfoJson = GetAttr(details, "LobbyInfo");
+        if (!string.IsNullOrEmpty(lobbyInfoJson))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(lobbyInfoJson);
+                if (doc.RootElement.TryGetProperty("lobbyID", out var idEl))
+                {
+                    string id = idEl.ValueKind == JsonValueKind.String ? idEl.GetString() : idEl.ToString();
+                    if (!string.IsNullOrWhiteSpace(id) && id != "0")
+                        return "id:" + id;
+                }
+                if (doc.RootElement.TryGetProperty("lobbyHostName", out var hn) && hn.ValueKind == JsonValueKind.String)
+                    host = hn.GetString();
+            }
+            catch
+            {
+                // fall through
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(code))
+            return "code:" + code.Trim().ToUpperInvariant();
+        return $"{label}:{privacy}:{host}:{index}";
     }
 
     private static void ParseLobby(
