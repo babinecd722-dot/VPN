@@ -4,25 +4,30 @@ Headless bot: EOS DeviceId login → `FindLobbies` → parse `LobbyInfo.playerLi
 
 Tested live: **163 lobbies / 490 players** in one pass.
 
-## Setup (VPS)
+## Setup
 
 ```bash
 cd server/eos-lobby-scraper
-# native SDK (Linux x64)
-# already in native/libEOSSDK-Linux-Shipping.so (EOS 1.15.5)
-
-dotnet build -c Release
-cd bin/Release/net8.0
-SCRAPE_ONCE=1 \
-POSTGRES_DSN='Host=127.0.0.1;Port=5432;Database=clientdb;Username=client_writer;Password=YOUR_PASSWORD;SSL Mode=Prefer' \
-dotnet EosLobbyScraper.dll
+cp .env.example .env   # set POSTGRES_DSN
+chmod +x run.sh
+./run.sh               # loop every 60s
 ```
 
-Loop every 60s (default):
+One-shot:
 
 ```bash
-POSTGRES_DSN='...' SCRAPE_INTERVAL_SEC=60 dotnet EosLobbyScraper.dll
+SCRAPE_ONCE=1 ./run.sh
 ```
+
+### VPS (systemd)
+
+```bash
+# copy this folder to the VPS, then:
+sudo ./install-vps.sh
+# logs: journalctl -u eos-lobby-scraper -f
+```
+
+`install-vps.sh` installs Release build to `/opt/eos-lobby-scraper` and enables `eos-lobby-scraper.service`.
 
 ## Env
 
