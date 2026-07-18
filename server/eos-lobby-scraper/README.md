@@ -1,8 +1,14 @@
 # EOS Lobby Scraper (Quest Fusion matchmaking)
 
-Headless bot: EOS DeviceId login → `FindLobbies` → parse `LobbyInfo.playerList` → Postgres `client_data`.
+Headless bot: EOS DeviceId login → bucketed `FindLobbies` (public/friends + private + locked + LobbyCode cache) → sync Postgres `client_data` presence:
 
-Tested live: **163 lobbies / 490 players** in one pass.
+| column | when ONLINE | when OFFLINE |
+|---|---|---|
+| `status` | `ONLINE` | `OFFLINE` |
+| `server` | `lobbyName` | `NULL` |
+| `server_map` | `levelTitle` | `NULL` |
+
+Private notes: Fusion hides `Privacy=PRIVATE/LOCKED` from the public browser, but those lobbies stay searchable by attribute / by `LobbyCode`. Codes are 8×`[A-Z0-9]` — not brute-forceable; we harvest codes from seen lobbies and re-probe them (`CODE_PROBE_BUDGET`).
 
 ## Setup
 

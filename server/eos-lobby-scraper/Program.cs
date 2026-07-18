@@ -13,7 +13,7 @@ namespace EosLobbyScraper;
 
 /// <summary>
 /// Headless Fusion matchmaking scraper (Quest EOS).
-/// DeviceId login → FindLobbies → LobbyInfo.playerList → Postgres.
+/// DeviceId → bucketed Find (+ LobbyCode cache) → Postgres presence sync.
 /// </summary>
 internal static class Program
 {
@@ -28,12 +28,19 @@ internal static class Program
 
     private static readonly string GameName = Env("FUSION_GAME_NAME", "BONELAB");
     private static readonly string PostgresDsn = ResolvePostgresDsn();
-    private static readonly int IntervalSec = int.TryParse(Env("SCRAPE_INTERVAL_SEC", "60"), out var s) ? s : 60;
+    private static readonly int IntervalSec = int.TryParse(Env("SCRAPE_INTERVAL_SEC", "45"), out var s) ? Math.Max(15, s) : 45;
     private static readonly bool Once = Env("SCRAPE_ONCE", "0") == "1";
+    private static readonly int CodeProbeBudget = int.TryParse(Env("CODE_PROBE_BUDGET", "25"), out var c) ? Math.Clamp(c, 0, 200) : 25;
+    private static readonly string CodeCachePath = Env("CODE_CACHE_PATH", Path.Combine(AppContext.BaseDirectory, "data", "lobby_codes.txt"));
 
+    // ServerPrivacy: PUBLIC=0 PRIVATE=1 FRIENDS_ONLY=2 LOCKED=3
     private static PlatformInterface _platform;
     private static ProductUserId _localUser;
     private static readonly ConcurrentQueue<Action> MainQueue = new();
+    private static readonly object CodeLock = new();
+    private static readonly HashSet<string> KnownCodes = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly Queue<string> CodeProbeQueue = new();
+    private static readonly HashSet<string> CodesSeenThisCycle = new(StringComparer.OrdinalIgnoreCase);
 
     private static string Env(string key, string fallback)
         => Environment.GetEnvironmentVariable(key) is { Length: > 0 } v ? v : fallback;
@@ -44,7 +51,6 @@ internal static class Program
         if (string.IsNullOrWhiteSpace(raw))
             throw new InvalidOperationException("Set POSTGRES_DSN (postgresql:// or Npgsql key=value).");
 
-        // Accept both URI and key=value forms.
         if (raw.StartsWith("postgres://", StringComparison.OrdinalIgnoreCase) ||
             raw.StartsWith("postgresql://", StringComparison.OrdinalIgnoreCase))
         {
@@ -62,7 +68,10 @@ internal static class Program
                 Username = user,
                 Password = pass,
                 SslMode = SslMode.Prefer,
-                Timeout = 8,
+                Timeout = 15,
+                CommandTimeout = 30,
+                KeepAlive = 30,
+                MaxAutoPrepare = 20,
             }.ConnectionString;
         }
 
@@ -72,9 +81,11 @@ internal static class Program
     private static int Main(string[] args)
     {
         InstallNativeResolver();
+        LoadCodeCache();
+        SeedCodesFromEnv();
 
-        Console.WriteLine($"[scraper] EOS SDK bind → native/libEOSSDK-Linux-Shipping.so");
-        Console.WriteLine($"[scraper] game={GameName} interval={IntervalSec}s once={Once}");
+        Console.WriteLine("[scraper] EOS SDK bind → native/libEOSSDK-Linux-Shipping.so");
+        Console.WriteLine($"[scraper] game={GameName} interval={IntervalSec}s once={Once} code_cache={KnownCodes.Count} probe_budget={CodeProbeBudget}");
 
         if (!InitEos())
         {
@@ -94,12 +105,20 @@ internal static class Program
         {
             try
             {
-                var players = ScrapeOnce();
-                Console.WriteLine($"[scraper] unique players scraped: {players.Count}");
-                foreach (var p in players.Take(5))
-                    Console.WriteLine($"  sample: {p.Pid} | {p.Name}");
-                int written = UpsertPlayers(players);
-                Console.WriteLine($"[scraper] postgres inserted new: {written}");
+                var snapshot = ScrapeOnce();
+                Console.WriteLine(
+                    $"[scraper] lobbies={snapshot.LobbyCount} players={snapshot.Players.Count} " +
+                    $"privacy[pub={snapshot.PrivacyCounts.GetValueOrDefault(0)} priv={snapshot.PrivacyCounts.GetValueOrDefault(1)} " +
+                    $"friends={snapshot.PrivacyCounts.GetValueOrDefault(2)} locked={snapshot.PrivacyCounts.GetValueOrDefault(3)}] " +
+                    $"codes_cached={KnownCodes.Count}");
+
+                foreach (var p in snapshot.Players.Values.Take(5))
+                    Console.WriteLine($"  sample: {p.Pid} | {p.Name} | {p.Server ?? "-"} | {p.ServerMap ?? "-"}");
+
+                var stats = SyncPresence(snapshot.Players);
+                Console.WriteLine(
+                    $"[scraper] db upserted={stats.Upserted} inserted={stats.Inserted} " +
+                    $"offline={stats.MarkedOffline} unchanged={stats.Unchanged}");
             }
             catch (Exception e)
             {
@@ -179,7 +198,6 @@ internal static class Program
             return false;
         }
 
-        // Ensure device credential exists
         bool createDone = false;
         Result createResult = Result.UnexpectedError;
         var createOpts = new CreateDeviceIdOptions { DeviceModel = "EosLobbyScraper-VPS" };
@@ -203,7 +221,7 @@ internal static class Program
             Credentials = new Credentials
             {
                 Type = ExternalCredentialType.DeviceidAccessToken,
-                Token = "", // device-id login: empty token
+                Token = "",
             },
             UserLoginInfo = new UserLoginInfo
             {
@@ -249,24 +267,70 @@ internal static class Program
         return _localUser != null;
     }
 
-    private static List<PlayerRow> ScrapeOnce()
+    private static ScrapeSnapshot ScrapeOnce()
+    {
+        var players = new Dictionary<string, PlayerPresence>(StringComparer.Ordinal);
+        var privacyCounts = new Dictionary<int, int>();
+        var seenLobbyIds = new HashSet<string>(StringComparer.Ordinal);
+        int lobbyCount = 0;
+
+        lock (CodeLock)
+            CodesSeenThisCycle.Clear();
+
+        // Bucketed searches cover modes Fusion's public browser hides (PRIVATE/LOCKED).
+        lobbyCount += RunSearch(players, privacyCounts, seenLobbyIds, "public+friends", excludePrivateAndLocked: true, privacyEq: null, code: null);
+        lobbyCount += RunSearch(players, privacyCounts, seenLobbyIds, "private", excludePrivateAndLocked: false, privacyEq: "1", code: null);
+        lobbyCount += RunSearch(players, privacyCounts, seenLobbyIds, "locked", excludePrivateAndLocked: false, privacyEq: "3", code: null);
+
+        // Codes are 8×[A-Z0-9] — not brute-forceable. Re-probe harvested/env codes not already seen.
+        foreach (string code in TakeCodeProbes(CodeProbeBudget))
+        {
+            lobbyCount += RunSearch(players, privacyCounts, seenLobbyIds, "code:" + code, excludePrivateAndLocked: false, privacyEq: null, code: code);
+        }
+
+        PersistCodeCache();
+        return new ScrapeSnapshot(players, lobbyCount, privacyCounts);
+    }
+
+    private static int RunSearch(
+        Dictionary<string, PlayerPresence> players,
+        Dictionary<int, int> privacyCounts,
+        HashSet<string> seenLobbyIds,
+        string label,
+        bool excludePrivateAndLocked,
+        string privacyEq,
+        string code)
     {
         var lobbyIface = _platform.GetLobbyInterface();
-        var players = new Dictionary<string, string>(StringComparer.Ordinal); // pid -> name
-
-        var createOpts = new CreateLobbySearchOptions { MaxResults = 200 };
+        uint maxResults = string.IsNullOrEmpty(code) ? 200u : 1u;
+        var createOpts = new CreateLobbySearchOptions { MaxResults = maxResults };
         Result cr = lobbyIface.CreateLobbySearch(ref createOpts, out LobbySearch search);
         if (cr != Result.Success || search == null)
-            throw new Exception($"CreateLobbySearch: {cr}");
+        {
+            Console.Error.WriteLine($"[scraper] CreateLobbySearch({label}): {cr}");
+            return 0;
+        }
 
+        int added = 0;
         try
         {
             SetEq(search, "HasLobbyOpen", bool.TrueString);
             SetEq(search, "MarrowFusion", bool.TrueString);
             SetEq(search, "Game", GameName);
-            // Skip private(1) and locked(3) — same as Fusion EOSMatchmaker
-            SetNeq(search, "Privacy", "1");
-            SetNeq(search, "Privacy", "3");
+
+            if (!string.IsNullOrWhiteSpace(code))
+            {
+                SetEq(search, "LobbyCode", code.Trim().ToUpperInvariant());
+            }
+            else if (!string.IsNullOrEmpty(privacyEq))
+            {
+                SetEq(search, "Privacy", privacyEq);
+            }
+            else if (excludePrivateAndLocked)
+            {
+                SetNeq(search, "Privacy", "1");
+                SetNeq(search, "Privacy", "3");
+            }
 
             bool findDone = false;
             Result findResult = Result.UnexpectedError;
@@ -277,13 +341,18 @@ internal static class Program
                 findDone = true;
             });
             PumpUntil(() => findDone, 45);
-            Console.WriteLine($"[scraper] LobbySearch.Find: {findResult}");
+
             if (findResult != Result.Success)
-                return new List<PlayerRow>();
+            {
+                if (string.IsNullOrEmpty(code))
+                    Console.Error.WriteLine($"[scraper] Find({label}): {findResult}");
+                return 0;
+            }
 
             var countOpts = default(LobbySearchGetSearchResultCountOptions);
             uint count = search.GetSearchResultCount(ref countOpts);
-            Console.WriteLine($"[scraper] lobbies found: {count}");
+            if (string.IsNullOrEmpty(code) || count > 0)
+                Console.WriteLine($"[scraper] Find({label}): {findResult} lobbies={count}");
 
             for (uint i = 0; i < count; i++)
             {
@@ -292,7 +361,11 @@ internal static class Program
                     continue;
                 try
                 {
-                    ParseLobbyPlayers(details, players);
+                    string lobbyKey = GetLobbyId(details) ?? ($"{label}:{i}");
+                    if (!seenLobbyIds.Add(lobbyKey))
+                        continue;
+                    added++;
+                    ParseLobby(details, players, privacyCounts);
                 }
                 finally
                 {
@@ -305,7 +378,131 @@ internal static class Program
             search.Release();
         }
 
-        return players.Select(kv => new PlayerRow(kv.Value, kv.Key)).ToList();
+        return added;
+    }
+
+    private static string GetLobbyId(LobbyDetails details)
+    {
+        var opts = default(LobbyDetailsCopyInfoOptions);
+        if (details.CopyInfo(ref opts, out LobbyDetailsInfo? info) != Result.Success || !info.HasValue)
+            return null;
+        return info.Value.LobbyId?.ToString();
+    }
+
+    private static void ParseLobby(
+        LobbyDetails details,
+        Dictionary<string, PlayerPresence> players,
+        Dictionary<int, int> privacyCounts)
+    {
+        string lobbyInfoJson = GetAttr(details, "LobbyInfo");
+        string server = null;
+        string map = null;
+        int privacy = -1;
+        string code = GetAttr(details, "LobbyCode");
+
+        string privacyRaw = GetAttr(details, "Privacy");
+        if (int.TryParse(privacyRaw, out var pAttr))
+            privacy = pAttr;
+
+        if (!string.IsNullOrEmpty(lobbyInfoJson))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(lobbyInfoJson);
+                var root = doc.RootElement;
+
+                if (root.TryGetProperty("lobbyName", out var ln) && ln.ValueKind == JsonValueKind.String)
+                    server = CleanText(ln.GetString(), 128);
+                if (string.IsNullOrWhiteSpace(server) && root.TryGetProperty("lobbyHostName", out var host) && host.ValueKind == JsonValueKind.String)
+                    server = CleanText(host.GetString(), 128);
+
+                if (root.TryGetProperty("levelTitle", out var lt) && lt.ValueKind == JsonValueKind.String)
+                    map = CleanText(lt.GetString(), 128);
+                if (string.IsNullOrWhiteSpace(map) && root.TryGetProperty("levelBarcode", out var lb) && lb.ValueKind == JsonValueKind.String)
+                    map = CleanText(lb.GetString(), 128);
+
+                if (root.TryGetProperty("privacy", out var pr))
+                {
+                    if (pr.ValueKind == JsonValueKind.Number && pr.TryGetInt32(out var pi))
+                        privacy = pi;
+                    else if (pr.ValueKind == JsonValueKind.String && int.TryParse(pr.GetString(), out var ps))
+                        privacy = ps;
+                }
+
+                if (root.TryGetProperty("lobbyCode", out var lc) && lc.ValueKind == JsonValueKind.String)
+                    code = lc.GetString() ?? code;
+
+                RememberCode(code, seenThisCycle: true);
+
+                if (privacy >= 0)
+                    privacyCounts[privacy] = privacyCounts.GetValueOrDefault(privacy) + 1;
+
+                if (root.TryGetProperty("playerList", out var pl) &&
+                    pl.TryGetProperty("players", out var arr) &&
+                    arr.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var p in arr.EnumerateArray())
+                    {
+                        string pid = null;
+                        if (p.TryGetProperty("platformID", out var pidEl))
+                            pid = pidEl.ValueKind == JsonValueKind.String ? pidEl.GetString() : pidEl.ToString();
+                        if (string.IsNullOrWhiteSpace(pid) || pid == "0") continue;
+
+                        string name = null;
+                        if (p.TryGetProperty("nickname", out var nick) && nick.ValueKind == JsonValueKind.String)
+                            name = nick.GetString();
+                        if (string.IsNullOrWhiteSpace(name) && p.TryGetProperty("username", out var user) && user.ValueKind == JsonValueKind.String)
+                            name = user.GetString();
+                        name = CleanText(name, 128) ?? ("pid:" + Short(pid));
+
+                        UpsertPresence(players, pid.Trim(), name, server, map);
+                    }
+                    return;
+                }
+            }
+            catch (Exception e)
+            {
+                Console.Error.WriteLine("[scraper] LobbyInfo parse: " + e.Message);
+            }
+        }
+
+        RememberCode(code, seenThisCycle: true);
+        if (privacy >= 0)
+            privacyCounts[privacy] = privacyCounts.GetValueOrDefault(privacy) + 1;
+
+        var mcOpts = default(LobbyDetailsGetMemberCountOptions);
+        uint members = details.GetMemberCount(ref mcOpts);
+        for (uint m = 0; m < members; m++)
+        {
+            var byIdx = new LobbyDetailsGetMemberByIndexOptions { MemberIndex = m };
+            ProductUserId mid = details.GetMemberByIndex(ref byIdx);
+            if (mid == null) continue;
+            string pid = mid.ToString();
+            if (string.IsNullOrWhiteSpace(pid)) continue;
+            UpsertPresence(players, pid, "pid:" + Short(pid), server, map);
+        }
+    }
+
+    private static void UpsertPresence(
+        Dictionary<string, PlayerPresence> players,
+        string pid,
+        string name,
+        string server,
+        string map)
+    {
+        if (players.TryGetValue(pid, out var existing))
+        {
+            if (!string.IsNullOrWhiteSpace(name) && !name.StartsWith("pid:", StringComparison.Ordinal))
+                existing = existing with { Name = name };
+            if (string.IsNullOrWhiteSpace(existing.Server) && !string.IsNullOrWhiteSpace(server))
+                existing = existing with { Server = server };
+            if (string.IsNullOrWhiteSpace(existing.ServerMap) && !string.IsNullOrWhiteSpace(map))
+                existing = existing with { ServerMap = map };
+            players[pid] = existing;
+            return;
+        }
+
+        players[pid] = new PlayerPresence(pid, name, server, map);
     }
 
     private static void SetEq(LobbySearch search, string key, string value)
@@ -328,59 +525,6 @@ internal static class Program
         search.SetParameter(ref p);
     }
 
-    private static void ParseLobbyPlayers(LobbyDetails details, Dictionary<string, string> players)
-    {
-        // Prefer LobbyInfo JSON (has playerList). Fallback: enumerate members.
-        string lobbyInfoJson = GetAttr(details, "LobbyInfo");
-        if (!string.IsNullOrEmpty(lobbyInfoJson))
-        {
-            try
-            {
-                using var doc = JsonDocument.Parse(lobbyInfoJson);
-                if (doc.RootElement.TryGetProperty("playerList", out var pl) &&
-                    pl.TryGetProperty("players", out var arr) &&
-                    arr.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var p in arr.EnumerateArray())
-                    {
-                        string pid = null;
-                        if (p.TryGetProperty("platformID", out var pidEl))
-                            pid = pidEl.ValueKind == JsonValueKind.String ? pidEl.GetString() : pidEl.ToString();
-                        if (string.IsNullOrWhiteSpace(pid) || pid == "0") continue;
-
-                        string name = null;
-                        if (p.TryGetProperty("nickname", out var nick) && nick.ValueKind == JsonValueKind.String)
-                            name = nick.GetString();
-                        if (string.IsNullOrWhiteSpace(name) && p.TryGetProperty("username", out var user) && user.ValueKind == JsonValueKind.String)
-                            name = user.GetString();
-                        name = CleanName(name) ?? ("pid:" + Short(pid));
-
-                        players[pid.Trim()] = name;
-                    }
-                    return;
-                }
-            }
-            catch (Exception e)
-            {
-                Console.Error.WriteLine("[scraper] LobbyInfo parse: " + e.Message);
-            }
-        }
-
-        // Fallback: member ProductUserIds (no display names)
-        var mcOpts = default(LobbyDetailsGetMemberCountOptions);
-        uint members = details.GetMemberCount(ref mcOpts);
-        for (uint m = 0; m < members; m++)
-        {
-            var byIdx = new LobbyDetailsGetMemberByIndexOptions { MemberIndex = m };
-            ProductUserId mid = details.GetMemberByIndex(ref byIdx);
-            if (mid == null) continue;
-            string pid = mid.ToString();
-            if (string.IsNullOrWhiteSpace(pid)) continue;
-            if (!players.ContainsKey(pid))
-                players[pid] = "pid:" + Short(pid);
-        }
-    }
-
     private static string GetAttr(LobbyDetails details, string key)
     {
         var opts = new LobbyDetailsCopyAttributeByKeyOptions { AttrKey = key };
@@ -400,63 +544,262 @@ internal static class Program
         }
     }
 
-    private static string CleanName(string name)
+    private static string CleanText(string text, int maxLen)
     {
-        if (string.IsNullOrWhiteSpace(name)) return null;
-        var sb = new System.Text.StringBuilder(name.Length);
+        if (string.IsNullOrWhiteSpace(text)) return null;
+        var sb = new System.Text.StringBuilder(text.Length);
         bool inTag = false;
-        foreach (char c in name)
+        foreach (char ch in text)
         {
-            if (c == '<') { inTag = true; continue; }
-            if (c == '>') { inTag = false; continue; }
+            if (ch == '<') { inTag = true; continue; }
+            if (ch == '>') { inTag = false; continue; }
             if (inTag) continue;
-            if (char.IsControl(c)) continue;
-            sb.Append(c);
+            if (char.IsControl(ch)) continue;
+            sb.Append(ch);
         }
-        string s = sb.ToString().Trim();
-        if (s.Length == 0) return null;
-        return s.Length > 128 ? s.Substring(0, 128) : s;
+        string cleaned = sb.ToString().Trim();
+        if (cleaned.Length == 0) return null;
+        return cleaned.Length > maxLen ? cleaned.Substring(0, maxLen) : cleaned;
     }
 
     private static string Short(string pid) => pid.Length <= 8 ? pid : pid.Substring(0, 8);
 
-    private static int UpsertPlayers(List<PlayerRow> rows)
+    private static SyncStats SyncPresence(Dictionary<string, PlayerPresence> online)
     {
-        if (rows.Count == 0) return 0;
+        Exception last = null;
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            try
+            {
+                return SyncPresenceOnce(online);
+            }
+            catch (Exception e) when (attempt < 3)
+            {
+                last = e;
+                Console.Error.WriteLine($"[scraper] db retry {attempt}/3: {e.Message}");
+                Thread.Sleep(400 * attempt);
+            }
+        }
+        throw last ?? new Exception("db sync failed");
+    }
 
+    private static SyncStats SyncPresenceOnce(Dictionary<string, PlayerPresence> online)
+    {
         using var conn = new NpgsqlConnection(PostgresDsn);
         conn.Open();
         using var tx = conn.BeginTransaction();
 
-        string[] pids = rows.Select(r => r.Pid).Distinct().ToArray();
-        var existing = new HashSet<string>(StringComparer.Ordinal);
-        using (var exists = new NpgsqlCommand("SELECT pid FROM client_data WHERE pid = ANY(@pids)", conn, tx))
+        var onlineList = online.Values.ToList();
+        string[] seenPids = onlineList.Select(p => p.Pid).ToArray();
+
+        var current = new Dictionary<string, DbRow>(StringComparer.Ordinal);
+        using (var cmd = new NpgsqlCommand(
+                   @"SELECT pid, name, status, server, server_map
+                     FROM client_data
+                     WHERE pid = ANY(@seen) OR status = 'ONLINE'", conn, tx))
         {
-            exists.Parameters.AddWithValue("pids", NpgsqlDbType.Array | NpgsqlDbType.Text, pids);
-            using var reader = exists.ExecuteReader();
-            while (reader.Read()) existing.Add(reader.GetString(0));
+            cmd.Parameters.AddWithValue(
+                "seen",
+                NpgsqlDbType.Array | NpgsqlDbType.Text,
+                seenPids.Length == 0 ? Array.Empty<string>() : seenPids);
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                string pid = reader.GetString(0);
+                current[pid] = new DbRow(
+                    pid,
+                    reader.GetString(1),
+                    reader.IsDBNull(2) ? "OFFLINE" : reader.GetString(2),
+                    reader.IsDBNull(3) ? null : reader.GetString(3),
+                    reader.IsDBNull(4) ? null : reader.GetString(4));
+            }
         }
 
+        int upserted = 0;
         int inserted = 0;
-        using (var insert = new NpgsqlCommand(
-                   "INSERT INTO client_data (name, pid) VALUES (@name, @pid)", conn, tx))
+        int unchanged = 0;
+        int offlineCount = 0;
+
+        using (var upd = new NpgsqlCommand(
+                   @"UPDATE client_data
+                     SET name = @name,
+                         status = 'ONLINE',
+                         server = @server,
+                         server_map = @map
+                     WHERE pid = @pid", conn, tx))
+        using (var ins = new NpgsqlCommand(
+                   @"INSERT INTO client_data (name, pid, status, server, server_map)
+                     VALUES (@name, @pid, 'ONLINE', @server, @map)", conn, tx))
         {
-            var pName = insert.Parameters.Add("name", NpgsqlDbType.Text);
-            var pPid = insert.Parameters.Add("pid", NpgsqlDbType.Text);
-            insert.Prepare();
-            foreach (var row in rows)
+            var uName = upd.Parameters.Add("name", NpgsqlDbType.Text);
+            var uServer = upd.Parameters.Add("server", NpgsqlDbType.Text);
+            var uMap = upd.Parameters.Add("map", NpgsqlDbType.Text);
+            var uPid = upd.Parameters.Add("pid", NpgsqlDbType.Text);
+            upd.Prepare();
+
+            var iName = ins.Parameters.Add("name", NpgsqlDbType.Text);
+            var iPid = ins.Parameters.Add("pid", NpgsqlDbType.Text);
+            var iServer = ins.Parameters.Add("server", NpgsqlDbType.Text);
+            var iMap = ins.Parameters.Add("map", NpgsqlDbType.Text);
+            ins.Prepare();
+
+            foreach (var p in onlineList)
             {
-                if (existing.Contains(row.Pid)) continue;
-                pName.Value = row.Name;
-                pPid.Value = row.Pid;
-                insert.ExecuteNonQuery();
-                existing.Add(row.Pid);
-                inserted++;
+                if (current.TryGetValue(p.Pid, out var row))
+                {
+                    bool same =
+                        string.Equals(row.Name, p.Name, StringComparison.Ordinal) &&
+                        string.Equals(row.Status, "ONLINE", StringComparison.Ordinal) &&
+                        string.Equals(row.Server ?? "", p.Server ?? "", StringComparison.Ordinal) &&
+                        string.Equals(row.ServerMap ?? "", p.ServerMap ?? "", StringComparison.Ordinal);
+                    if (same)
+                    {
+                        unchanged++;
+                        continue;
+                    }
+
+                    uName.Value = p.Name;
+                    uServer.Value = (object)p.Server ?? DBNull.Value;
+                    uMap.Value = (object)p.ServerMap ?? DBNull.Value;
+                    uPid.Value = p.Pid;
+                    upd.ExecuteNonQuery();
+                    upserted++;
+                }
+                else
+                {
+                    iName.Value = p.Name;
+                    iPid.Value = p.Pid;
+                    iServer.Value = (object)p.Server ?? DBNull.Value;
+                    iMap.Value = (object)p.ServerMap ?? DBNull.Value;
+                    ins.ExecuteNonQuery();
+                    inserted++;
+                }
+            }
+        }
+
+        if (seenPids.Length == 0)
+        {
+            using (var offAll = new NpgsqlCommand(
+                       @"UPDATE client_data
+                         SET status = 'OFFLINE', server = NULL, server_map = NULL
+                         WHERE status = 'ONLINE'", conn, tx))
+            {
+                offlineCount = offAll.ExecuteNonQuery();
+            }
+        }
+        else
+        {
+            using (var off = new NpgsqlCommand(
+                       @"UPDATE client_data
+                         SET status = 'OFFLINE', server = NULL, server_map = NULL
+                         WHERE status = 'ONLINE'
+                           AND NOT (pid = ANY(@seen))", conn, tx))
+            {
+                off.Parameters.AddWithValue("seen", NpgsqlDbType.Array | NpgsqlDbType.Text, seenPids);
+                offlineCount = off.ExecuteNonQuery();
             }
         }
 
         tx.Commit();
-        return inserted;
+        return new SyncStats(upserted, inserted, offlineCount, unchanged);
+    }
+
+    private static void SeedCodesFromEnv()
+    {
+        string raw = Env("LOBBY_CODES", "");
+        if (string.IsNullOrWhiteSpace(raw)) return;
+        foreach (string part in raw.Split(new[] { ',', ';', ' ', '\n', '\r', '\t' }, StringSplitOptions.RemoveEmptyEntries))
+            RememberCode(part, seenThisCycle: false);
+    }
+
+    private static void LoadCodeCache()
+    {
+        try
+        {
+            if (!File.Exists(CodeCachePath)) return;
+            foreach (string line in File.ReadAllLines(CodeCachePath))
+            {
+                string code = NormalizeCode(line);
+                if (code == null) continue;
+                lock (CodeLock)
+                {
+                    if (KnownCodes.Add(code))
+                        CodeProbeQueue.Enqueue(code);
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine("[scraper] code cache load: " + e.Message);
+        }
+    }
+
+    private static void PersistCodeCache()
+    {
+        try
+        {
+            string dir = Path.GetDirectoryName(CodeCachePath);
+            if (!string.IsNullOrEmpty(dir))
+                Directory.CreateDirectory(dir);
+            string[] codes;
+            lock (CodeLock)
+                codes = KnownCodes.OrderBy(c => c, StringComparer.Ordinal).ToArray();
+            File.WriteAllLines(CodeCachePath, codes);
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine("[scraper] code cache save: " + e.Message);
+        }
+    }
+
+    private static void RememberCode(string code, bool seenThisCycle)
+    {
+        code = NormalizeCode(code);
+        if (code == null) return;
+        lock (CodeLock)
+        {
+            if (seenThisCycle)
+                CodesSeenThisCycle.Add(code);
+            if (KnownCodes.Add(code))
+                CodeProbeQueue.Enqueue(code);
+        }
+    }
+
+    private static string NormalizeCode(string code)
+    {
+        if (string.IsNullOrWhiteSpace(code)) return null;
+        code = code.Trim().ToUpperInvariant();
+        if (code.Length < 4 || code.Length > 16) return null;
+        foreach (char ch in code)
+        {
+            if (!char.IsLetterOrDigit(ch)) return null;
+        }
+        return code;
+    }
+
+    private static List<string> TakeCodeProbes(int budget)
+    {
+        if (budget <= 0) return new List<string>();
+        lock (CodeLock)
+        {
+            if (CodeProbeQueue.Count == 0)
+            {
+                foreach (string known in KnownCodes)
+                    CodeProbeQueue.Enqueue(known);
+            }
+
+            var batch = new List<string>(Math.Min(budget, KnownCodes.Count));
+            int guard = CodeProbeQueue.Count;
+            while (batch.Count < budget && guard-- > 0 && CodeProbeQueue.Count > 0)
+            {
+                string code = CodeProbeQueue.Dequeue();
+                CodeProbeQueue.Enqueue(code);
+                if (CodesSeenThisCycle.Contains(code))
+                    continue;
+                batch.Add(code);
+            }
+            return batch;
+        }
     }
 
     private static void Pump(double seconds)
@@ -485,5 +828,21 @@ internal static class Program
             throw new TimeoutException("EOS callback timed out");
     }
 
-    private readonly record struct PlayerRow(string Name, string Pid);
+    private readonly record struct PlayerPresence(string Pid, string Name, string Server, string ServerMap);
+    private readonly record struct DbRow(string Pid, string Name, string Status, string Server, string ServerMap);
+    private readonly record struct SyncStats(int Upserted, int Inserted, int MarkedOffline, int Unchanged);
+
+    private sealed class ScrapeSnapshot
+    {
+        public ScrapeSnapshot(Dictionary<string, PlayerPresence> players, int lobbyCount, Dictionary<int, int> privacyCounts)
+        {
+            Players = players;
+            LobbyCount = lobbyCount;
+            PrivacyCounts = privacyCounts;
+        }
+
+        public Dictionary<string, PlayerPresence> Players { get; }
+        public int LobbyCount { get; }
+        public Dictionary<int, int> PrivacyCounts { get; }
+    }
 }
