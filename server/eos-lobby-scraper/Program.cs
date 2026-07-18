@@ -31,7 +31,12 @@ internal static class Program
     private static readonly int IntervalSec = int.TryParse(Env("SCRAPE_INTERVAL_SEC", "45"), out var s) ? Math.Max(15, s) : 45;
     private static readonly bool Once = Env("SCRAPE_ONCE", "0") == "1";
     private static readonly int CodeProbeBudget = int.TryParse(Env("CODE_PROBE_BUDGET", "25"), out var c) ? Math.Clamp(c, 0, 200) : 25;
+    private static readonly double LoadingSec = double.TryParse(Env("LOADING_SEC", "3"), out var ls) ? Math.Clamp(ls, 0.5, 30) : 3;
     private static readonly string CodeCachePath = Env("CODE_CACHE_PATH", Path.Combine(AppContext.BaseDirectory, "data", "lobby_codes.txt"));
+
+    private const string StatusOffline = "OFFLINE";
+    private const string StatusLoading = "LOADING";
+    private const string StatusInGame = "IN GAME";
 
     // ServerPrivacy: PUBLIC=0 PRIVATE=1 FRIENDS_ONLY=2 LOCKED=3
     private static PlatformInterface _platform;
@@ -41,6 +46,8 @@ internal static class Program
     private static readonly HashSet<string> KnownCodes = new(StringComparer.OrdinalIgnoreCase);
     private static readonly Queue<string> CodeProbeQueue = new();
     private static readonly HashSet<string> CodesSeenThisCycle = new(StringComparer.OrdinalIgnoreCase);
+    // pid → first time seen in a lobby playerList (cleared on OFFLINE)
+    private static readonly Dictionary<string, DateTime> FirstSeenUtc = new(StringComparer.Ordinal);
 
     private static string Env(string key, string fallback)
         => Environment.GetEnvironmentVariable(key) is { Length: > 0 } v ? v : fallback;
@@ -85,7 +92,7 @@ internal static class Program
         SeedCodesFromEnv();
 
         Console.WriteLine("[scraper] EOS SDK bind → native/libEOSSDK-Linux-Shipping.so");
-        Console.WriteLine($"[scraper] game={GameName} interval={IntervalSec}s once={Once} code_cache={KnownCodes.Count} probe_budget={CodeProbeBudget}");
+        Console.WriteLine($"[scraper] game={GameName} interval={IntervalSec}s once={Once} loading_sec={LoadingSec:0.#} code_cache={KnownCodes.Count} probe_budget={CodeProbeBudget}");
 
         if (!InitEos())
         {
@@ -118,6 +125,7 @@ internal static class Program
                 var stats = SyncPresence(snapshot.Players);
                 Console.WriteLine(
                     $"[scraper] db upserted={stats.Upserted} inserted={stats.Inserted} " +
+                    $"loading={stats.Loading} ingame={stats.InGame} " +
                     $"offline={stats.MarkedOffline} unchanged={stats.Unchanged}");
             }
             catch (Exception e)
@@ -620,25 +628,99 @@ internal static class Program
         throw last ?? new Exception("db sync failed");
     }
 
+    private static string ResolveStatus(string pid, DateTime nowUtc)
+    {
+        if (!FirstSeenUtc.ContainsKey(pid))
+            FirstSeenUtc[pid] = nowUtc;
+
+        double age = (nowUtc - FirstSeenUtc[pid]).TotalSeconds;
+        return age < LoadingSec ? StatusLoading : StatusInGame;
+    }
+
     private static SyncStats SyncPresenceOnce(Dictionary<string, PlayerPresence> online)
+    {
+        var onlineList = online.Values.ToList();
+        string[] seenPids = onlineList.Select(p => p.Pid).ToArray();
+        var seenSet = new HashSet<string>(seenPids, StringComparer.Ordinal);
+        DateTime nowUtc = DateTime.UtcNow;
+
+        // Drop first-seen for anyone who left — next reappear gets LOADING again.
+        var stale = FirstSeenUtc.Keys.Where(pid => !seenSet.Contains(pid)).ToList();
+        foreach (string pid in stale)
+            FirstSeenUtc.Remove(pid);
+
+        var desired = new Dictionary<string, (PlayerPresence P, string Status)>(StringComparer.Ordinal);
+        var loadingPids = new List<string>();
+        foreach (var p in onlineList)
+        {
+            string status = ResolveStatus(p.Pid, nowUtc);
+            desired[p.Pid] = (p, status);
+            if (status == StatusLoading)
+                loadingPids.Add(p.Pid);
+        }
+
+        SyncStats stats = WritePresence(desired, seenPids);
+
+        // Hold LOADING briefly so DB consumers can see it, then promote to IN GAME.
+        if (loadingPids.Count > 0)
+        {
+            Console.WriteLine($"[scraper] loading→ingame in {LoadingSec:0.#}s for {loadingPids.Count} players");
+            Pump(LoadingSec);
+
+            nowUtc = DateTime.UtcNow;
+            var promote = new Dictionary<string, (PlayerPresence P, string Status)>(StringComparer.Ordinal);
+            foreach (string pid in loadingPids)
+            {
+                if (!online.TryGetValue(pid, out var p)) continue;
+                FirstSeenUtc[pid] = nowUtc.AddSeconds(-LoadingSec - 0.01);
+                promote[pid] = (p, StatusInGame);
+            }
+
+            if (promote.Count > 0)
+            {
+                var promoteStats = WritePresence(promote, seenPids, markOffline: false);
+                stats = new SyncStats(
+                    stats.Upserted + promoteStats.Upserted,
+                    stats.Inserted + promoteStats.Inserted,
+                    stats.MarkedOffline,
+                    stats.Unchanged + promoteStats.Unchanged,
+                    Loading: loadingPids.Count,
+                    InGame: desired.Count - loadingPids.Count + promote.Count);
+            }
+            else
+            {
+                stats = stats with { Loading = loadingPids.Count, InGame = desired.Count - loadingPids.Count };
+            }
+        }
+        else
+        {
+            stats = stats with { Loading = 0, InGame = desired.Count };
+        }
+
+        return stats;
+    }
+
+    private static SyncStats WritePresence(
+        Dictionary<string, (PlayerPresence P, string Status)> desired,
+        string[] seenPids,
+        bool markOffline = true)
     {
         using var conn = new NpgsqlConnection(PostgresDsn);
         conn.Open();
         using var tx = conn.BeginTransaction();
 
-        var onlineList = online.Values.ToList();
-        string[] seenPids = onlineList.Select(p => p.Pid).ToArray();
-
+        string[] lookupPids = desired.Keys.ToArray();
         var current = new Dictionary<string, DbRow>(StringComparer.Ordinal);
         using (var cmd = new NpgsqlCommand(
                    @"SELECT pid, name, status, server, server_map
                      FROM client_data
-                     WHERE pid = ANY(@seen) OR status = 'ONLINE'", conn, tx))
+                     WHERE pid = ANY(@seen)
+                        OR status IN ('ONLINE', 'IN GAME', 'LOADING')", conn, tx))
         {
             cmd.Parameters.AddWithValue(
                 "seen",
                 NpgsqlDbType.Array | NpgsqlDbType.Text,
-                seenPids.Length == 0 ? Array.Empty<string>() : seenPids);
+                lookupPids.Length == 0 ? Array.Empty<string>() : lookupPids);
             using var reader = cmd.ExecuteReader();
             while (reader.Read())
             {
@@ -646,7 +728,7 @@ internal static class Program
                 current[pid] = new DbRow(
                     pid,
                     reader.GetString(1),
-                    reader.IsDBNull(2) ? "OFFLINE" : reader.GetString(2),
+                    reader.IsDBNull(2) ? StatusOffline : reader.GetString(2),
                     reader.IsDBNull(3) ? null : reader.GetString(3),
                     reader.IsDBNull(4) ? null : reader.GetString(4));
             }
@@ -660,15 +742,16 @@ internal static class Program
         using (var upd = new NpgsqlCommand(
                    @"UPDATE client_data
                      SET name = @name,
-                         status = 'ONLINE',
+                         status = @status,
                          server = @server,
                          server_map = @map
                      WHERE pid = @pid", conn, tx))
         using (var ins = new NpgsqlCommand(
                    @"INSERT INTO client_data (name, pid, status, server, server_map)
-                     VALUES (@name, @pid, 'ONLINE', @server, @map)", conn, tx))
+                     VALUES (@name, @pid, @status, @server, @map)", conn, tx))
         {
             var uName = upd.Parameters.Add("name", NpgsqlDbType.Text);
+            var uStatus = upd.Parameters.Add("status", NpgsqlDbType.Text);
             var uServer = upd.Parameters.Add("server", NpgsqlDbType.Text);
             var uMap = upd.Parameters.Add("map", NpgsqlDbType.Text);
             var uPid = upd.Parameters.Add("pid", NpgsqlDbType.Text);
@@ -676,17 +759,21 @@ internal static class Program
 
             var iName = ins.Parameters.Add("name", NpgsqlDbType.Text);
             var iPid = ins.Parameters.Add("pid", NpgsqlDbType.Text);
+            var iStatus = ins.Parameters.Add("status", NpgsqlDbType.Text);
             var iServer = ins.Parameters.Add("server", NpgsqlDbType.Text);
             var iMap = ins.Parameters.Add("map", NpgsqlDbType.Text);
             ins.Prepare();
 
-            foreach (var p in onlineList)
+            foreach (var kv in desired)
             {
+                var p = kv.Value.P;
+                string status = kv.Value.Status;
+
                 if (current.TryGetValue(p.Pid, out var row))
                 {
                     bool same =
                         string.Equals(row.Name, p.Name, StringComparison.Ordinal) &&
-                        string.Equals(row.Status, "ONLINE", StringComparison.Ordinal) &&
+                        string.Equals(row.Status, status, StringComparison.Ordinal) &&
                         string.Equals(row.Server ?? "", p.Server ?? "", StringComparison.Ordinal) &&
                         string.Equals(row.ServerMap ?? "", p.ServerMap ?? "", StringComparison.Ordinal);
                     if (same)
@@ -696,6 +783,7 @@ internal static class Program
                     }
 
                     uName.Value = p.Name;
+                    uStatus.Value = status;
                     uServer.Value = (object)p.Server ?? DBNull.Value;
                     uMap.Value = (object)p.ServerMap ?? DBNull.Value;
                     uPid.Value = p.Pid;
@@ -706,6 +794,7 @@ internal static class Program
                 {
                     iName.Value = p.Name;
                     iPid.Value = p.Pid;
+                    iStatus.Value = status;
                     iServer.Value = (object)p.Server ?? DBNull.Value;
                     iMap.Value = (object)p.ServerMap ?? DBNull.Value;
                     ins.ExecuteNonQuery();
@@ -714,31 +803,34 @@ internal static class Program
             }
         }
 
-        if (seenPids.Length == 0)
+        if (markOffline)
         {
-            using (var offAll = new NpgsqlCommand(
-                       @"UPDATE client_data
-                         SET status = 'OFFLINE', server = NULL, server_map = NULL
-                         WHERE status = 'ONLINE'", conn, tx))
+            if (seenPids.Length == 0)
             {
-                offlineCount = offAll.ExecuteNonQuery();
+                using (var offAll = new NpgsqlCommand(
+                           @"UPDATE client_data
+                             SET status = 'OFFLINE', server = NULL, server_map = NULL
+                             WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')", conn, tx))
+                {
+                    offlineCount = offAll.ExecuteNonQuery();
+                }
             }
-        }
-        else
-        {
-            using (var off = new NpgsqlCommand(
-                       @"UPDATE client_data
-                         SET status = 'OFFLINE', server = NULL, server_map = NULL
-                         WHERE status = 'ONLINE'
-                           AND NOT (pid = ANY(@seen))", conn, tx))
+            else
             {
-                off.Parameters.AddWithValue("seen", NpgsqlDbType.Array | NpgsqlDbType.Text, seenPids);
-                offlineCount = off.ExecuteNonQuery();
+                using (var off = new NpgsqlCommand(
+                           @"UPDATE client_data
+                             SET status = 'OFFLINE', server = NULL, server_map = NULL
+                             WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')
+                               AND NOT (pid = ANY(@seen))", conn, tx))
+                {
+                    off.Parameters.AddWithValue("seen", NpgsqlDbType.Array | NpgsqlDbType.Text, seenPids);
+                    offlineCount = off.ExecuteNonQuery();
+                }
             }
         }
 
         tx.Commit();
-        return new SyncStats(upserted, inserted, offlineCount, unchanged);
+        return new SyncStats(upserted, inserted, offlineCount, unchanged, 0, 0);
     }
 
     private static void SeedCodesFromEnv()
@@ -867,7 +959,13 @@ internal static class Program
 
     private readonly record struct PlayerPresence(string Pid, string Name, string Server, string ServerMap);
     private readonly record struct DbRow(string Pid, string Name, string Status, string Server, string ServerMap);
-    private readonly record struct SyncStats(int Upserted, int Inserted, int MarkedOffline, int Unchanged);
+    private readonly record struct SyncStats(
+        int Upserted,
+        int Inserted,
+        int MarkedOffline,
+        int Unchanged,
+        int Loading,
+        int InGame);
 
     private sealed class ScrapeSnapshot
     {

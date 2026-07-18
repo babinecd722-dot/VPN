@@ -25,5 +25,6 @@ exec env \
   SCRAPE_ONCE="${SCRAPE_ONCE:-0}" \
   FUSION_GAME_NAME="${FUSION_GAME_NAME:-BONELAB}" \
   CODE_PROBE_BUDGET="${CODE_PROBE_BUDGET:-25}" \
+  LOADING_SEC="${LOADING_SEC:-3}" \
   LOBBY_CODES="${LOBBY_CODES:-}" \
   dotnet "$ROOT/bin/Release/net8.0/EosLobbyScraper.dll"

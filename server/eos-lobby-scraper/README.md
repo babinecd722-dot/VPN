@@ -2,9 +2,14 @@
 
 Headless bot: EOS DeviceId login → bucketed `FindLobbies` (public/friends + private + locked + LobbyCode cache) → sync Postgres `client_data` presence:
 
-| column | when ONLINE | when OFFLINE |
+| `status` | meaning |
+|---|---|
+| `OFFLINE` | not in any Fusion lobby `playerList` |
+| `LOADING` | just appeared in a lobby list (~`LOADING_SEC`, default 3s) |
+| `IN GAME` | still in a lobby after loading window |
+
+| column | active (`LOADING` / `IN GAME`) | `OFFLINE` |
 |---|---|---|
-| `status` | `ONLINE` | `OFFLINE` |
 | `server` | `lobbyName` | `NULL` |
 | `server_map` | `levelTitle` | `NULL` |
 
