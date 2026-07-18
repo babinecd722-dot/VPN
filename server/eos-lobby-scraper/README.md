@@ -21,7 +21,7 @@ Private notes: Fusion hides `Privacy=PRIVATE/LOCKED` from the public browser, bu
 cd server/eos-lobby-scraper
 cp .env.example .env   # set POSTGRES_DSN
 chmod +x run.sh
-./run.sh               # loop every 60s
+./run.sh               # loop every 15s (pause between cycles)
 ```
 
 One-shot:

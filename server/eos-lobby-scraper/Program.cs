@@ -28,7 +28,7 @@ internal static class Program
 
     private static readonly string GameName = Env("FUSION_GAME_NAME", "BONELAB");
     private static readonly string PostgresDsn = ResolvePostgresDsn();
-    private static readonly int IntervalSec = int.TryParse(Env("SCRAPE_INTERVAL_SEC", "45"), out var s) ? Math.Max(15, s) : 45;
+    private static readonly int IntervalSec = int.TryParse(Env("SCRAPE_INTERVAL_SEC", "15"), out var s) ? Math.Max(5, s) : 15;
     private static readonly bool Once = Env("SCRAPE_ONCE", "0") == "1";
     private static readonly int CodeProbeBudget = int.TryParse(Env("CODE_PROBE_BUDGET", "25"), out var c) ? Math.Clamp(c, 0, 200) : 25;
     private static readonly double LoadingSec = double.TryParse(Env("LOADING_SEC", "3"), out var ls) ? Math.Clamp(ls, 0.5, 30) : 3;
