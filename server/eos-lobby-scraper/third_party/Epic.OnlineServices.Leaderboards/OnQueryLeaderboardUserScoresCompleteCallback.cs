@@ -1,3 +1,0 @@
-namespace Epic.OnlineServices.Leaderboards;
-
-public delegate void OnQueryLeaderboardUserScoresCompleteCallback(ref OnQueryLeaderboardUserScoresCompleteCallbackInfo data);

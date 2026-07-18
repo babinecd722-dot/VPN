@@ -1,6 +1,0 @@
-using System.Runtime.InteropServices;
-
-namespace Epic.OnlineServices.Leaderboards;
-
-[UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-internal delegate void OnQueryLeaderboardUserScoresCompleteCallbackInternal(ref OnQueryLeaderboardUserScoresCompleteCallbackInfoInternal data);

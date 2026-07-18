@@ -1,6 +1,0 @@
-bin/
-obj/
-*.user
-*.log
-data/
-.env

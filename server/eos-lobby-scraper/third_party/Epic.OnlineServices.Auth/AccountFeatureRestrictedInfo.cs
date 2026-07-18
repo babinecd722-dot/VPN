@@ -1,6 +1,0 @@
-namespace Epic.OnlineServices.Auth;
-
-public struct AccountFeatureRestrictedInfo
-{
-	public Utf8String VerificationURI { get; set; }
-}
