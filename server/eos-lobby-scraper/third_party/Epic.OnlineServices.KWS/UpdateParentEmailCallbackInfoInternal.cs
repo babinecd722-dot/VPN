@@ -1,0 +1,24 @@
+using System;
+
+namespace Epic.OnlineServices.KWS;
+
+internal struct UpdateParentEmailCallbackInfoInternal : ICallbackInfoInternal, IGettable<UpdateParentEmailCallbackInfo>
+{
+	private Result m_ResultCode;
+
+	private IntPtr m_ClientData;
+
+	private IntPtr m_LocalUserId;
+
+	public IntPtr ClientDataPointer => m_ClientData;
+
+	public void Get(out UpdateParentEmailCallbackInfo other)
+	{
+		other = default(UpdateParentEmailCallbackInfo);
+		other.ResultCode = m_ResultCode;
+		Helper.Get(m_ClientData, out object to);
+		other.ClientData = to;
+		Helper.Get(m_LocalUserId, out ProductUserId to2);
+		other.LocalUserId = to2;
+	}
+}

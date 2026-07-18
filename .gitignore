@@ -10,4 +10,6 @@ mods/BONELAB/MonsterPanel/bin/
 mods/BONELAB/MonsterPanel/obj/
 
 # extracted third_party from other branches (do not commit blobs)
-third_party/
+/third_party/
+# keep EOS C# bindings for the lobby scraper
+!server/eos-lobby-scraper/third_party/

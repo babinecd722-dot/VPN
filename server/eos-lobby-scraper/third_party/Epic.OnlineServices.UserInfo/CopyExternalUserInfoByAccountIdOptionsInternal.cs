@@ -1,0 +1,30 @@
+using System;
+
+namespace Epic.OnlineServices.UserInfo;
+
+internal struct CopyExternalUserInfoByAccountIdOptionsInternal : ISettable<CopyExternalUserInfoByAccountIdOptions>, IDisposable
+{
+	private int m_ApiVersion;
+
+	private IntPtr m_LocalUserId;
+
+	private IntPtr m_TargetUserId;
+
+	private IntPtr m_AccountId;
+
+	public void Set(ref CopyExternalUserInfoByAccountIdOptions other)
+	{
+		Dispose();
+		m_ApiVersion = 1;
+		Helper.Set((Handle)other.LocalUserId, ref m_LocalUserId);
+		Helper.Set((Handle)other.TargetUserId, ref m_TargetUserId);
+		Helper.Set(other.AccountId, ref m_AccountId);
+	}
+
+	public void Dispose()
+	{
+		Helper.Dispose(ref m_LocalUserId);
+		Helper.Dispose(ref m_TargetUserId);
+		Helper.Dispose(ref m_AccountId);
+	}
+}

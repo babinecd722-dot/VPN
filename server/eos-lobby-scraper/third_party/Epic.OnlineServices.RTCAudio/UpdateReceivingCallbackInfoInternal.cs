@@ -1,0 +1,36 @@
+using System;
+
+namespace Epic.OnlineServices.RTCAudio;
+
+internal struct UpdateReceivingCallbackInfoInternal : ICallbackInfoInternal, IGettable<UpdateReceivingCallbackInfo>
+{
+	private Result m_ResultCode;
+
+	private IntPtr m_ClientData;
+
+	private IntPtr m_LocalUserId;
+
+	private IntPtr m_RoomName;
+
+	private IntPtr m_ParticipantId;
+
+	private int m_AudioEnabled;
+
+	public IntPtr ClientDataPointer => m_ClientData;
+
+	public void Get(out UpdateReceivingCallbackInfo other)
+	{
+		other = default(UpdateReceivingCallbackInfo);
+		other.ResultCode = m_ResultCode;
+		Helper.Get(m_ClientData, out object to);
+		other.ClientData = to;
+		Helper.Get(m_LocalUserId, out ProductUserId to2);
+		other.LocalUserId = to2;
+		Helper.Get(m_RoomName, out Utf8String to3);
+		other.RoomName = to3;
+		Helper.Get(m_ParticipantId, out ProductUserId to4);
+		other.ParticipantId = to4;
+		Helper.Get(m_AudioEnabled, out bool to5);
+		other.AudioEnabled = to5;
+	}
+}
