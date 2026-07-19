@@ -1336,6 +1336,31 @@ internal static class Program
         {
             using var conn = new NpgsqlConnection(PostgresDsn);
             conn.Open();
+            // Collapse guard: never mass-OFFLINE the board on a scrape/ingest blip.
+            using (var cnt = new NpgsqlCommand(
+                       @"SELECT
+                           count(*) FILTER (WHERE status IN ('ONLINE','IN GAME','LOADING')) AS active,
+                           count(*) FILTER (
+                             WHERE status IN ('ONLINE','IN GAME','LOADING')
+                               AND (last_seen_at IS NULL
+                                    OR last_seen_at < NOW() - make_interval(secs => @ttl))
+                           ) AS stale
+                         FROM client_data", conn))
+            {
+                cnt.Parameters.AddWithValue("ttl", GhostTtlSec);
+                using var r = cnt.ExecuteReader();
+                if (r.Read())
+                {
+                    long active = r.IsDBNull(0) ? 0 : r.GetInt64(0);
+                    long stale = r.IsDBNull(1) ? 0 : r.GetInt64(1);
+                    if (active > 20 && stale >= (long)(active * CollapseRatio))
+                    {
+                        Console.WriteLine(
+                            $"[scraper] ghost sweep skipped collapse active={active} stale={stale} ratio<{CollapseRatio:0.##}");
+                        return 0;
+                    }
+                }
+            }
             using var ghost = new NpgsqlCommand(
                 @"UPDATE client_data
                   SET status = 'OFFLINE', server = NULL, server_map = NULL, lobby_code = NULL
