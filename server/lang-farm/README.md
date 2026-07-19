@@ -49,6 +49,8 @@ journalctl -u fusion-lobby-host -f
 
 Defaults: lobby name `www.bonelab.fun`, nick `ADMIN`, map Halfway Park, `HOST_HOLD_SEC=0` (forever), soft caps `MemoryMax=256M` / `CPUQuota=50%`.
 
+`HOST_DISPLAY_PLAYERS=7` pads **LobbyInfo only** (browser count looks full-ish, `Full=False` so Find still returns it). Zero extra processes/CPU — not real bots.
+
 ### What it does / does not
 
 Works: public Find listing, JoinLobby, P2P handshake (ConnectionResponse + SceneLoad).  

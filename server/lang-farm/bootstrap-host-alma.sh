@@ -78,5 +78,7 @@ exec env \
   HOST_HOLD_SEC="${HOST_HOLD_SEC:-0}" \
   HOST_P2P_PORT="${HOST_P2P_PORT:-17877}" \
   HOST_MAX_MEMBERS="${HOST_MAX_MEMBERS:-8}" \
+  HOST_DISPLAY_PLAYERS="${HOST_DISPLAY_PLAYERS:-7}" \
+  HOST_MARK_FULL="${HOST_MARK_FULL:-0}" \
   EOS_FORCE_NEW_ACCOUNT="${EOS_FORCE_NEW_ACCOUNT:-0}" \
   bash "$SRC/repo/server/lang-farm/install-host-vps.sh"

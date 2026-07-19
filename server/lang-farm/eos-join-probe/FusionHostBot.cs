@@ -37,6 +37,10 @@ internal static class FusionHostBot
     private static readonly int VersionMajor = int.TryParse(Env("HOST_VERSION_MAJOR", "1"), out var vma) ? vma : 1;
     private static readonly int VersionMinor = int.TryParse(Env("HOST_VERSION_MINOR", "14"), out var vmi) ? vmi : 14;
     private static readonly ushort P2pPort = ushort.TryParse(Env("HOST_P2P_PORT", "17877"), out var pp) ? pp : (ushort)17877;
+    // Cosmetic browser count only (LobbyInfo). 0 = real peers. Default max-1 so Full stays False.
+    private static readonly int DisplayPlayers = int.TryParse(Env("HOST_DISPLAY_PLAYERS", "7"), out var dp)
+        ? Math.Clamp(dp, 0, 32) : 7;
+    private static readonly bool MarkFull = Env("HOST_MARK_FULL", "0") == "1";
     private static volatile bool _stop;
 
     private static PlatformInterface _platform;
@@ -73,7 +77,7 @@ internal static class FusionHostBot
         string holdLabel = HoldSec <= 0 ? "forever" : $"{HoldSec}s";
         Console.WriteLine(
             $"[host] name={LobbyName} map={LevelTitle} nick={BotNick} hold={holdLabel} " +
-            $"p2pPort={P2pPort} data={data}");
+            $"p2pPort={P2pPort} displayPlayers={DisplayPlayers} data={data}");
 
         Console.CancelKeyPress += (_, e) =>
         {
@@ -259,14 +263,17 @@ internal static class FusionHostBot
                 else ok++;
             }
 
+            int shown = ShownPlayerCount();
+            bool full = MarkFull || shown >= MaxMembers;
             // Matchmaking keys Fusion scrapers/browsers filter on.
             Attr("Game", GameName);
             Attr("Privacy", "0");
-            Attr("Full", "False");
+            // Keep Full=False by default so Find(Full=False) still returns us while count looks packed.
+            Attr("Full", full ? "True" : "False");
             Attr("VersionMajor", VersionMajor.ToString());
             Attr("VersionMinor", VersionMinor.ToString());
             Attr("LobbyCode", _lobbyCode);
-            Attr("HasLobbyOpen", "True");
+            Attr("HasLobbyOpen", full ? "False" : "True");
             Attr("MarrowFusion", "True");
             Attr("LobbyName", LobbyName);
             Attr("LevelTitle", LevelTitle);
@@ -274,7 +281,9 @@ internal static class FusionHostBot
             Attr("HostName", BotNick);
 
             string lobbyInfo = BuildLobbyInfoJson(pulse);
-            Console.WriteLine($"[host] LobbyInfo bytes={Encoding.UTF8.GetByteCount(lobbyInfo)} attrs_ok_so_far={ok}");
+            Console.WriteLine(
+                $"[host] LobbyInfo bytes={Encoding.UTF8.GetByteCount(lobbyInfo)} " +
+                $"shown={shown}/{MaxMembers} full={full} attrs_ok_so_far={ok}");
             Attr("LobbyInfo", lobbyInfo);
             Console.WriteLine($"[host] attributes ok={ok} fail={fail}");
 
@@ -310,7 +319,7 @@ internal static class FusionHostBot
             ["lobbyVersion"] = LobbyVersion,
             ["lobbyHostName"] = BotNick,
             ["lobbyHostID"] = puid,
-            ["playerCount"] = 1 + PeerSmallIds.Count,
+            ["playerCount"] = ShownPlayerCount(),
             ["playerList"] = new Dictionary<string, object>
             {
                 ["players"] = BuildPlayerListObjects(puid),
@@ -449,6 +458,12 @@ internal static class FusionHostBot
         var cloOpts = new AddNotifyPeerConnectionClosedOptions { LocalUserId = _localUser, SocketId = FusionSocket };
         p2p.AddNotifyPeerConnectionClosed(ref cloOpts, null, (ref OnRemoteConnectionClosedInfo info) =>
         {
+            string pid = info.RemoteUserId?.ToString();
+            if (!string.IsNullOrEmpty(pid))
+            {
+                PeerSmallIds.TryRemove(pid, out _);
+                PeerNames.TryRemove(pid, out _);
+            }
             Console.WriteLine($"[host] P2P closed with {info.RemoteUserId} reason={info.Reason}");
         });
     }
@@ -488,6 +503,15 @@ internal static class FusionHostBot
         }
     }
 
+    private static int RealPlayerCount() => 1 + PeerSmallIds.Count;
+
+    private static int ShownPlayerCount()
+    {
+        int real = RealPlayerCount();
+        if (DisplayPlayers <= 0) return real;
+        return Math.Clamp(Math.Max(real, DisplayPlayers), 1, MaxMembers);
+    }
+
     private static object[] BuildPlayerListObjects(string hostPuid)
     {
         var list = new List<object>
@@ -517,7 +541,46 @@ internal static class FusionHostBot
                 ["avatarModID"] = -1,
             });
         }
+        // Pad LobbyInfo only — no EOS members, no P2P, no CPU. Stable fake IDs per lobby code.
+        int need = ShownPlayerCount() - list.Count;
+        for (int i = 0; i < need; i++)
+        {
+            string fakeId = FakePlatformId(_lobbyCode, i);
+            string fakeName = FakeDisplayName(i);
+            list.Add(new Dictionary<string, object>
+            {
+                ["platformID"] = fakeId,
+                ["username"] = fakeName,
+                ["nickname"] = fakeName,
+                ["description"] = "",
+                ["permissionLevel"] = 0,
+                ["avatarTitle"] = "Strong",
+                ["avatarModID"] = -1,
+            });
+        }
         return list.ToArray();
+    }
+
+    private static string FakePlatformId(string seed, int index)
+    {
+        // 32-hex ProductUserId-shaped id, stable across pulses.
+        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes($"pad|{seed}|{index}"));
+        var sb = new StringBuilder(32);
+        sb.Append("0002");
+        for (int i = 0; i < 14; i++)
+            sb.Append(hash[i].ToString("x2"));
+        return sb.ToString()[..32];
+    }
+
+    private static string FakeDisplayName(int index)
+    {
+        // Quiet filler nicks — browser padding only, not real sessions.
+        string[] pool =
+        {
+            "visitor", "parkgoer", "halfway", "quietone", "spectate",
+            "rookie", "regular", "passerby",
+        };
+        return pool[index % pool.Length] + (index >= pool.Length ? (index + 1).ToString() : "");
     }
 
     private static void HandleHostPacket(P2PInterface p2p, ProductUserId peer, byte[] buf, int len)
@@ -534,7 +597,9 @@ internal static class FusionHostBot
         }
         if (tag != TagConnectionRequest)
         {
-            Console.WriteLine($"[host] pkt tag={tag} len={len} ← {peer}");
+            // Pose/etc. spam is normal after a real client handshake — don't flood journal.
+            if (tag is not (4 or 17 or 67))
+                Console.WriteLine($"[host] pkt tag={tag} len={len} ← {peer}");
             return;
         }
         Interlocked.Increment(ref _connRequests);
