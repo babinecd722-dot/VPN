@@ -1029,17 +1029,18 @@ internal static class Program
         string map,
         string lobbyCode)
     {
+        // Always apply this lobby's code (including null) so a move to a
+        // public / no-code session clears the previous private LobbyCode.
         string code = NormalizeCode(lobbyCode);
         if (players.TryGetValue(pid, out var existing))
         {
             if (!string.IsNullOrWhiteSpace(name) && !name.StartsWith("pid:", StringComparison.Ordinal))
                 existing = existing with { Name = name };
-            if (string.IsNullOrWhiteSpace(existing.Server) && !string.IsNullOrWhiteSpace(server))
+            if (!string.IsNullOrWhiteSpace(server))
                 existing = existing with { Server = server };
-            if (string.IsNullOrWhiteSpace(existing.ServerMap) && !string.IsNullOrWhiteSpace(map))
+            if (!string.IsNullOrWhiteSpace(map))
                 existing = existing with { ServerMap = map };
-            if (!string.IsNullOrWhiteSpace(code))
-                existing = existing with { LobbyCode = code };
+            existing = existing with { LobbyCode = code };
             players[pid] = existing;
             return;
         }
