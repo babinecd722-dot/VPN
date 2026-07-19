@@ -608,11 +608,18 @@ internal static class FusionHostBot
         }
         // Pad LobbyInfo only — no EOS members, no P2P, no CPU. Stable fake IDs per lobby code.
         int need = ShownPlayerCount() - list.Count;
+        var usedNicks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var o in list)
+        {
+            if (o is Dictionary<string, object> d && d.TryGetValue("username", out var u) && u is string s)
+                usedNicks.Add(s);
+        }
         // ~40% vanilla Ford/PolyBlank/Strong, ~60% popular mod.io avatars.
         for (int i = 0; i < need; i++)
         {
             string fakeId = FakePlatformId(_lobbyCode, i);
-            string fakeName = FakeDisplayName(_lobbyCode, i);
+            string fakeName = FakeDisplayName(_lobbyCode, i, usedNicks);
+            usedNicks.Add(fakeName);
             var av = PickAvatar(_lobbyCode, i);
             list.Add(new Dictionary<string, object>
             {
@@ -639,11 +646,17 @@ internal static class FusionHostBot
         return sb.ToString()[..32];
     }
 
-    private static string FakeDisplayName(string seed, int index)
+    private static string FakeDisplayName(string seed, int index, HashSet<string> used)
     {
-        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes($"nick|{seed}|{index}"));
-        int pick = hash[0] | (hash[1] << 8);
-        return FakeNickPool[pick % FakeNickPool.Length];
+        for (int attempt = 0; attempt < FakeNickPool.Length; attempt++)
+        {
+            byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes($"nick|{seed}|{index}|{attempt}"));
+            int pick = hash[0] | (hash[1] << 8);
+            string name = FakeNickPool[(pick + attempt) % FakeNickPool.Length];
+            if (used.Add(name))
+                return name;
+        }
+        return "player" + (index + 2);
     }
 
     private static (string Title, int ModId) PickAvatar(string seed, int index)
