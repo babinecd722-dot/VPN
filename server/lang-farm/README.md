@@ -14,35 +14,44 @@ production bot sources for version control.
 - No fake SmallID from LobbyInfo index (pending pid map)
 - `register_bot.py` clears `server`/`lobby_code` on OFFLINE
 
-## Run
+## Run bots (agent host only)
 
 ```bash
 cd /tmp/lang-farm
 POSTGRES_DSN=... BOT_NICK=bonelab.fun bash orchestrator/run_parallel.sh
 ```
 
-## Experimental host (`--host`)
+Do **not** run farm bots on the Tracking VPS (DeviceId / port fights).
 
-Headless EOS CreateLobby + P2P handshake (ReallyWorld / ADMIN). Load is tiny
-(~0.1–1% CPU, ~80 MB RSS). Not a Unity game simulation.
+## VPS lobby host 24/7 (`www.bonelab.fun`)
+
+Isolated systemd unit — separate from scraper + player-ingest:
+
+| | path |
+|---|---|
+| Install | `/opt/fusion-lobby-host` |
+| Identity | `/opt/fusion-lobby-host/data` |
+| Env | `/opt/fusion-lobby-host/.env` |
+| Unit | `fusion-lobby-host.service` |
+| UDP | `17877+` (not 7777) |
+
+### Deploy (Maze / root)
 
 ```bash
-EOS_FORCE_NEW_ACCOUNT=0 BOT_NICK=ADMIN \
-EOS_DATA_DIR=/tmp/lang-farm/state/host-reallyworld \
-HOST_LOBBY_NAME=ReallyWorld HOST_LEVEL_TITLE='Halfway Park' \
-HOST_LOBBY_DESC='Официальный сервер от www.bonelab.fun' \
-HOST_HOLD_SEC=7200 \
-dotnet eos-join-probe/bin/Release/net8.0/EosJoinProbe.dll --host
+cd /
+curl -fsSL 'https://raw.githubusercontent.com/babinecd722-dot/VPN/cursor/monsterpanel-tracking-eaa4/server/lang-farm/bootstrap-host-alma.sh' | sudo bash
 ```
 
-What works today:
-- Public Find / browser listing (LobbyInfo, code, Halfway Park)
-- EOS JoinLobby + P2P Accept (ForceRelays)
-- Fusion ConnectionResponse + SceneLoad + empty DynamicsAssignment
+```bash
+systemctl status fusion-lobby-host
+journalctl -u fusion-lobby-host -f
+```
 
-What does **not** work without a real BONELAB+Fusion (Unity) host:
-- Playable world / avatars / props / voice as a game session
-- Clients time out after handshake (no pose/entity sync)
+Defaults: lobby name `www.bonelab.fun`, nick `ADMIN`, map Halfway Park, `HOST_HOLD_SEC=0` (forever), soft caps `MemoryMax=256M` / `CPUQuota=50%`.
 
-Requires EOS SDK 1.15.5 ApiVersion patches: CreateLobby=8, AddAttribute=1 (see `patches/`).
-Join-test pin: `FORCE_LOBBY_CODE=<code> dotnet …/EosJoinProbe.dll`.
+### What it does / does not
+
+Works: public Find listing, JoinLobby, P2P handshake (ConnectionResponse + SceneLoad).  
+Does not: playable Unity Fusion world (needs a real BONELAB+Fusion host).
+
+Requires EOS SDK 1.15.5 ApiVersion patches: CreateLobby=8, AddAttribute=1 (`eos-join-probe/patches/`).

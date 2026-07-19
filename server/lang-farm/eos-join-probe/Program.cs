@@ -41,7 +41,7 @@ internal static class Program
     private static int Main(string[] args)
     {
         // Default: full Fusion P2P voice path.
-        // --host = headless CreateLobby listing (ReallyWorld experiment)
+        // --host = headless CreateLobby listing (www.bonelab.fun)
         // --rtc-only = old Lobby-RTC probe
         if (args.Any(a => a == "--host") || Env("FUSION_HOST_MODE", "0") == "1")
             return FusionHostBot.Run();

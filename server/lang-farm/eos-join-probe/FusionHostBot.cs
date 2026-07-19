@@ -13,16 +13,16 @@ using Epic.OnlineServices.Platform;
 namespace EosJoinProbe;
 
 /// <summary>
-/// Experimental headless Fusion "host": CreateLobby + Fusion matchmaking attributes
-/// so ReallyWorld appears in the public browser (not a full Unity/Fusion game host).
+/// Headless Fusion lobby host: CreateLobby + matchmaking attrs + P2P handshake.
+/// Listing/handshake only — not a Unity game simulation.
 /// </summary>
 internal static class FusionHostBot
 {
     private static readonly string GameName = Env("FUSION_GAME_NAME", "BONELAB");
-    private static readonly string LobbyName = Env("HOST_LOBBY_NAME", "ReallyWorld");
+    private static readonly string LobbyName = Env("HOST_LOBBY_NAME", "www.bonelab.fun");
     private static readonly string LobbyDesc = Env(
         "HOST_LOBBY_DESC",
-        "Официальный сервер от www.bonelab.fun");
+        "Официальный сервер www.bonelab.fun");
     private static readonly string LevelTitle = Env("HOST_LEVEL_TITLE", "Halfway Park");
     private static readonly string LevelBarcode = Env(
         "HOST_LEVEL_BARCODE",
@@ -31,10 +31,13 @@ internal static class FusionHostBot
     private static readonly string LobbyVersion = Env("HOST_LOBBY_VERSION", "1.14.2");
     private static readonly int MaxMembers = int.TryParse(Env("HOST_MAX_MEMBERS", "8"), out var m)
         ? Math.Clamp(m, 2, 32) : 8;
-    private static readonly int HoldSec = int.TryParse(Env("HOST_HOLD_SEC", "600"), out var h)
-        ? Math.Clamp(h, 30, 86400) : 600;
+    // 0 = run forever (systemd 24/7). Otherwise hold N seconds then exit.
+    private static readonly int HoldSec = int.TryParse(Env("HOST_HOLD_SEC", "0"), out var h)
+        ? Math.Clamp(h, 0, 86400 * 30) : 0;
     private static readonly int VersionMajor = int.TryParse(Env("HOST_VERSION_MAJOR", "1"), out var vma) ? vma : 1;
     private static readonly int VersionMinor = int.TryParse(Env("HOST_VERSION_MINOR", "14"), out var vmi) ? vmi : 14;
+    private static readonly ushort P2pPort = ushort.TryParse(Env("HOST_P2P_PORT", "17877"), out var pp) ? pp : (ushort)17877;
+    private static volatile bool _stop;
 
     private static PlatformInterface _platform;
     private static ProductUserId _localUser;
@@ -61,17 +64,27 @@ internal static class FusionHostBot
     public static int Run()
     {
         InstallNativeResolver();
-        string data = Env("EOS_DATA_DIR", "/tmp/lang-farm/state/host-reallyworld");
+        string data = Env("EOS_DATA_DIR", "/opt/fusion-lobby-host/data");
         Directory.CreateDirectory(data);
-        bool forceNew = Env("EOS_FORCE_NEW_ACCOUNT", "1") == "1";
+        // Reuse identity by default so VPS listing stays stable across restarts.
+        bool forceNew = Env("EOS_FORCE_NEW_ACCOUNT", "0") == "1";
 
-        Console.WriteLine("[host] Fusion headless lobby host (matchmaking listing)");
-        Console.WriteLine($"[host] name={LobbyName} map={LevelTitle} nick={BotNick} hold={HoldSec}s data={data}");
+        Console.WriteLine("[host] Fusion headless lobby host (listing + P2P handshake)");
+        string holdLabel = HoldSec <= 0 ? "forever" : $"{HoldSec}s";
+        Console.WriteLine(
+            $"[host] name={LobbyName} map={LevelTitle} nick={BotNick} hold={holdLabel} " +
+            $"p2pPort={P2pPort} data={data}");
+
+        Console.CancelKeyPress += (_, e) =>
+        {
+            e.Cancel = true;
+            _stop = true;
+            Console.WriteLine("[host] stop requested");
+        };
 
         try
         {
             _identity = EosIdentity.LoadOrMint(data, forceNew: forceNew);
-            // Force ADMIN display name for this host identity.
             _identity.DisplayName = BotNick;
             EosIdentity.Persist(_identity, EosIdentity.IdentityPath(data));
             _platform = EosIdentity.CreatePlatform(_identity);
@@ -80,7 +93,6 @@ internal static class FusionHostBot
                 _identity,
                 forceNew: forceNew || _identity.FreshMint,
                 tick: () => _platform?.Tick());
-            // Login uses UserLoginInfo.DisplayName — re-login path already used BotNick if set on identity.
             _identity.DisplayName = BotNick;
             _identity.ProductUserId = _localUser.ToString();
             EosIdentity.Persist(_identity, EosIdentity.IdentityPath(data));
@@ -92,7 +104,6 @@ internal static class FusionHostBot
             return 3;
         }
 
-        // Optional: dump a real Halfway Park LobbyInfo template from browser.
         if (Env("HOST_DUMP_ONLY", "0") == "1")
         {
             DumpHalfwayTemplate();
@@ -111,30 +122,47 @@ internal static class FusionHostBot
         {
             ConfigureP2P(p2p);
             RegisterP2P(p2p);
-            Console.WriteLine("[host] P2P host hooks armed (Accept + best-effort ConnectionResponse)");
-        RegisterLobbyMemberHooks();
-
+            RegisterLobbyMemberHooks();
+            Console.WriteLine("[host] P2P host hooks armed (Accept + ConnectionResponse/SceneLoad)");
         }
         else
             Console.Error.WriteLine("[host] P2P interface null — join handshake impossible");
 
-        Console.WriteLine($"[host] LIVE lobbyId={_lobbyId} code={_lobbyCode} — holding {HoldSec}s (Ctrl+C to stop)");
-        Console.WriteLine("[host] NOTE: listing+P2P handshake only. Full join needs real BONELAB+Fusion host (Unity).");
+        Console.WriteLine($"[host] LIVE lobbyId={_lobbyId} code={_lobbyCode} — holding {holdLabel}");
+        Console.WriteLine("[host] NOTE: listing+handshake only. Playable join needs real BONELAB+Fusion (Unity).");
 
-        var until = DateTime.UtcNow.AddSeconds(HoldSec);
+        var until = HoldSec <= 0 ? DateTime.MaxValue : DateTime.UtcNow.AddSeconds(HoldSec);
         var nextPulse = DateTime.UtcNow;
-        while (DateTime.UtcNow < until)
+        int pulseFail = 0;
+        while (!_stop && DateTime.UtcNow < until)
         {
             try { _platform.Tick(); } catch { /* */ }
             if (p2p != null) DrainP2P(p2p);
             if (DateTime.UtcNow >= nextPulse)
             {
                 if (!UpdateLobbyAttributes(pulse: true))
-                    Console.Error.WriteLine("[host] pulse update failed");
+                {
+                    pulseFail++;
+                    Console.Error.WriteLine($"[host] pulse update failed ({pulseFail})");
+                    if (pulseFail >= 3)
+                    {
+                        Console.Error.WriteLine("[host] recreating lobby after pulse failures");
+                        LeaveLobby();
+                        if (!CreateAndPublishLobby())
+                        {
+                            Console.Error.WriteLine("[host] recreate failed — exiting for systemd restart");
+                            break;
+                        }
+                        pulseFail = 0;
+                    }
+                }
                 else
+                {
+                    pulseFail = 0;
                     Console.WriteLine(
                         $"[host] pulse ok {DateTime.UtcNow:HH:mm:ss}Z code={_lobbyCode} " +
                         $"p2pReq={_p2pRequests} p2pOk={_p2pEstablished} connReq={_connRequests} pkt={_packetsIn}");
+                }
                 nextPulse = DateTime.UtcNow.AddSeconds(45);
             }
             Thread.Sleep(15);
@@ -386,9 +414,9 @@ internal static class FusionHostBot
 
     private static void ConfigureP2P(P2PInterface p2p)
     {
-        // Match farm bots / Quest FusionHelper path — headless hosts rarely hole-punch cleanly.
-        var port = new SetPortRangeOptions { Port = 7777, MaxAdditionalPortsToTry = 99 };
-        Console.WriteLine("[host] SetPortRange: " + p2p.SetPortRange(ref port));
+        // Isolated UDP range (default 17877+) so we never collide with farm bots on 7777.
+        var port = new SetPortRangeOptions { Port = P2pPort, MaxAdditionalPortsToTry = 32 };
+        Console.WriteLine("[host] SetPortRange(" + P2pPort + "): " + p2p.SetPortRange(ref port));
         var relay = new SetRelayControlOptions { RelayControl = RelayControl.ForceRelays };
         Console.WriteLine("[host] SetRelayControl(ForceRelays): " + p2p.SetRelayControl(ref relay));
     }
