@@ -728,6 +728,32 @@ internal static class FusionVoiceBot
                 bool claimed = !string.IsNullOrEmpty(id) && IsLobbyClaimed(id);
                 // Heavy penalty if our nick already there or another farm bot claimed it
                 int score = players * 10 - ours * 50 - (claimed ? 100 : 0);
+                // Optional pin: FORCE_LOBBY_CODE (exact) and/or FORCE_LOBBY_NAME.
+                // When CODE is set, non-matching lobbies are discarded (avoids stale same-name ghosts).
+                string forceName = Environment.GetEnvironmentVariable("FORCE_LOBBY_NAME");
+                string forceCode = Environment.GetEnvironmentVariable("FORCE_LOBBY_CODE");
+                if (!string.IsNullOrEmpty(forceName) || !string.IsNullOrEmpty(forceCode))
+                {
+                    string json = ReadLobbyInfoJson(details) ?? "";
+                    string nameAttr = GetLobbyAttr(details, "LobbyName") ?? "";
+                    string codeAttr = GetLobbyAttr(details, "LobbyCode") ?? "";
+                    bool codePin = !string.IsNullOrEmpty(forceCode)
+                        && codeAttr.Equals(forceCode, StringComparison.OrdinalIgnoreCase);
+                    bool namePin = !string.IsNullOrEmpty(forceName)
+                        && (nameAttr.Equals(forceName, StringComparison.OrdinalIgnoreCase)
+                            || json.IndexOf(forceName, StringComparison.OrdinalIgnoreCase) >= 0);
+                    if (!string.IsNullOrEmpty(forceCode))
+                    {
+                        if (!codePin)
+                        {
+                            SafeRelease(details);
+                            continue;
+                        }
+                        score += 100000;
+                    }
+                    else if (namePin) score += 100000;
+                    else score -= 100000;
+                }
                 scored.Add((details, score, players, ours));
             }
             foreach (var item in scored.OrderByDescending(x => x.score).Take(want))
@@ -757,6 +783,18 @@ internal static class FusionVoiceBot
         try
         {
             var opts = new LobbyDetailsCopyAttributeByKeyOptions { AttrKey = "LobbyInfo" };
+            if (details.CopyAttributeByKey(ref opts, out Epic.OnlineServices.Lobby.Attribute? attr) != Result.Success || attr == null)
+                return null;
+            return attr.Value.Data?.Value.AsUtf8;
+        }
+        catch { return null; }
+    }
+
+    private static string GetLobbyAttr(LobbyDetails details, string key)
+    {
+        try
+        {
+            var opts = new LobbyDetailsCopyAttributeByKeyOptions { AttrKey = key };
             if (details.CopyAttributeByKey(ref opts, out Epic.OnlineServices.Lobby.Attribute? attr) != Result.Success || attr == null)
                 return null;
             return attr.Value.Data?.Value.AsUtf8;

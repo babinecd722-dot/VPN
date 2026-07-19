@@ -1,9 +1,13 @@
+using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using Epic.OnlineServices;
 using Epic.OnlineServices.Lobby;
+using Epic.OnlineServices.P2P;
 using Epic.OnlineServices.Platform;
 
 namespace EosJoinProbe;
@@ -37,6 +41,19 @@ internal static class FusionHostBot
     private static EosIdentity _identity;
     private static string _lobbyId = "";
     private static string _lobbyCode = "";
+    private static readonly SocketId FusionSocket = new() { SocketName = "FusionSocket" };
+    private static readonly ConcurrentDictionary<string, byte> PeerSmallIds = new(StringComparer.OrdinalIgnoreCase);
+    private static readonly ConcurrentDictionary<string, string> PeerNames = new(StringComparer.OrdinalIgnoreCase);
+    private static byte _nextSmallId = 1; // 0 = host
+    private static long _p2pRequests;
+    private static long _p2pEstablished;
+    private static long _connRequests;
+    private static long _packetsIn;
+    private const byte TagConnectionRequest = 1;
+    private const byte TagConnectionResponse = 2;
+    private const byte TagSceneLoad = 12;
+    private const byte TagDynamicsAssignment = 201;
+    private const int AvatarStatsPad = 420; // Quest Fusion SerializedAvatarStats blob size
 
     private static string Env(string k, string d)
         => Environment.GetEnvironmentVariable(k) is { Length: > 0 } v ? v : d;
@@ -89,24 +106,38 @@ internal static class FusionHostBot
             return 4;
         }
 
+        var p2p = _platform.GetP2PInterface();
+        if (p2p != null)
+        {
+            ConfigureP2P(p2p);
+            RegisterP2P(p2p);
+            Console.WriteLine("[host] P2P host hooks armed (Accept + best-effort ConnectionResponse)");
+        RegisterLobbyMemberHooks();
+
+        }
+        else
+            Console.Error.WriteLine("[host] P2P interface null — join handshake impossible");
+
         Console.WriteLine($"[host] LIVE lobbyId={_lobbyId} code={_lobbyCode} — holding {HoldSec}s (Ctrl+C to stop)");
-        Console.WriteLine($"[host] Promote tips: PUBLIC Privacy=0 Full=False, max={MaxMembers}, name starts with '!' or 'AAA' often sorts up in clients — we use ReallyWorld as requested.");
+        Console.WriteLine("[host] NOTE: listing+P2P handshake only. Full join needs real BONELAB+Fusion host (Unity).");
 
         var until = DateTime.UtcNow.AddSeconds(HoldSec);
         var nextPulse = DateTime.UtcNow;
         while (DateTime.UtcNow < until)
         {
             try { _platform.Tick(); } catch { /* */ }
+            if (p2p != null) DrainP2P(p2p);
             if (DateTime.UtcNow >= nextPulse)
             {
-                // Refresh LobbyInfo so lastUpdated stays fresh in browsers.
                 if (!UpdateLobbyAttributes(pulse: true))
                     Console.Error.WriteLine("[host] pulse update failed");
                 else
-                    Console.WriteLine($"[host] pulse ok {DateTime.UtcNow:HH:mm:ss}Z code={_lobbyCode}");
+                    Console.WriteLine(
+                        $"[host] pulse ok {DateTime.UtcNow:HH:mm:ss}Z code={_lobbyCode} " +
+                        $"p2pReq={_p2pRequests} p2pOk={_p2pEstablished} connReq={_connRequests} pkt={_packetsIn}");
                 nextPulse = DateTime.UtcNow.AddSeconds(45);
             }
-            Thread.Sleep(50);
+            Thread.Sleep(15);
         }
 
         LeaveLobby();
@@ -251,22 +282,10 @@ internal static class FusionHostBot
             ["lobbyVersion"] = LobbyVersion,
             ["lobbyHostName"] = BotNick,
             ["lobbyHostID"] = puid,
-            ["playerCount"] = 1,
+            ["playerCount"] = 1 + PeerSmallIds.Count,
             ["playerList"] = new Dictionary<string, object>
             {
-                ["players"] = new object[]
-                {
-                    new Dictionary<string, object>
-                    {
-                        ["platformID"] = puid,
-                        ["username"] = BotNick,
-                        ["nickname"] = BotNick,
-                        ["description"] = LobbyDesc,
-                        ["permissionLevel"] = 2, // host/owner
-                        ["avatarTitle"] = "Strong",
-                        ["avatarModID"] = -1,
-                    },
-                },
+                ["players"] = BuildPlayerListObjects(puid),
             },
             ["levelTitle"] = LevelTitle,
             ["levelBarcode"] = LevelBarcode,
@@ -347,6 +366,323 @@ internal static class FusionHostBot
         }
         finally { search.Release(); }
     }
+
+
+    private static void RegisterLobbyMemberHooks()
+    {
+        var lobby = _platform.GetLobbyInterface();
+        if (lobby == null) return;
+        var opts = new AddNotifyLobbyMemberStatusReceivedOptions();
+        lobby.AddNotifyLobbyMemberStatusReceived(ref opts, null, (ref LobbyMemberStatusReceivedCallbackInfo info) =>
+        {
+            if (info.TargetUserId == null || info.TargetUserId == _localUser) return;
+            if (info.CurrentStatus != LobbyMemberStatus.Joined) return;
+            var p2p = _platform.GetP2PInterface();
+            if (p2p == null) return;
+            Result ar = AcceptPeer(p2p, info.TargetUserId);
+            Console.WriteLine($"[host] lobby member joined {info.TargetUserId} accept={ar}");
+        });
+    }
+
+    private static void ConfigureP2P(P2PInterface p2p)
+    {
+        // Match farm bots / Quest FusionHelper path — headless hosts rarely hole-punch cleanly.
+        var port = new SetPortRangeOptions { Port = 7777, MaxAdditionalPortsToTry = 99 };
+        Console.WriteLine("[host] SetPortRange: " + p2p.SetPortRange(ref port));
+        var relay = new SetRelayControlOptions { RelayControl = RelayControl.ForceRelays };
+        Console.WriteLine("[host] SetRelayControl(ForceRelays): " + p2p.SetRelayControl(ref relay));
+    }
+
+    private static void RegisterP2P(P2PInterface p2p)
+    {
+        var reqOpts = new AddNotifyPeerConnectionRequestOptions { LocalUserId = _localUser, SocketId = FusionSocket };
+        p2p.AddNotifyPeerConnectionRequest(ref reqOpts, null, (ref OnIncomingConnectionRequestInfo info) =>
+        {
+            Interlocked.Increment(ref _p2pRequests);
+            if (info.RemoteUserId == null) return;
+            Result ar = AcceptPeer(p2p, info.RemoteUserId);
+            Console.WriteLine($"[host] inbound P2P request from {info.RemoteUserId} accept={ar}");
+        });
+
+        var estOpts = new AddNotifyPeerConnectionEstablishedOptions { LocalUserId = _localUser, SocketId = FusionSocket };
+        p2p.AddNotifyPeerConnectionEstablished(ref estOpts, null, (ref OnPeerConnectionEstablishedInfo info) =>
+        {
+            Interlocked.Increment(ref _p2pEstablished);
+            Console.WriteLine($"[host] P2P established with {info.RemoteUserId}");
+            // Re-accept + poke so delayed ConnectionRequest can land (same-host NAT is flaky).
+            if (info.RemoteUserId != null)
+            {
+                AcceptPeer(p2p, info.RemoteUserId);
+                Result poke = SendTo(p2p, info.RemoteUserId, BuildNetMessage(0, Array.Empty<byte>()));
+                Console.WriteLine($"[host] post-establish poke → {info.RemoteUserId}: {poke}");
+            }
+        });
+
+        var cloOpts = new AddNotifyPeerConnectionClosedOptions { LocalUserId = _localUser, SocketId = FusionSocket };
+        p2p.AddNotifyPeerConnectionClosed(ref cloOpts, null, (ref OnRemoteConnectionClosedInfo info) =>
+        {
+            Console.WriteLine($"[host] P2P closed with {info.RemoteUserId} reason={info.Reason}");
+        });
+    }
+
+    private static Result AcceptPeer(P2PInterface p2p, ProductUserId remote)
+    {
+        var acc = new AcceptConnectionOptions
+        {
+            LocalUserId = _localUser,
+            RemoteUserId = remote,
+            SocketId = FusionSocket,
+        };
+        return p2p.AcceptConnection(ref acc);
+    }
+
+    private static void DrainP2P(P2PInterface p2p)
+    {
+        for (int i = 0; i < 100; i++)
+        {
+            var sizeOpts = new GetNextReceivedPacketSizeOptions { LocalUserId = _localUser, RequestedChannel = null };
+            if (p2p.GetNextReceivedPacketSize(ref sizeOpts, out uint sz) != Result.Success || sz == 0)
+                break;
+            byte[] buf = new byte[sz];
+            var recv = new ReceivePacketOptions
+            {
+                LocalUserId = _localUser,
+                MaxDataSizeBytes = sz,
+                RequestedChannel = null,
+            };
+            ProductUserId peer = null;
+            SocketId sock = FusionSocket;
+            var data = new ArraySegment<byte>(buf);
+            if (p2p.ReceivePacket(ref recv, ref peer, ref sock, out _, data, out uint written) != Result.Success || written == 0)
+                break;
+            Interlocked.Increment(ref _packetsIn);
+            HandleHostPacket(p2p, peer, buf, (int)written);
+        }
+    }
+
+    private static object[] BuildPlayerListObjects(string hostPuid)
+    {
+        var list = new List<object>
+        {
+            new Dictionary<string, object>
+            {
+                ["platformID"] = hostPuid,
+                ["username"] = BotNick,
+                ["nickname"] = BotNick,
+                ["description"] = LobbyDesc,
+                ["permissionLevel"] = 2,
+                ["avatarTitle"] = "Strong",
+                ["avatarModID"] = -1,
+            },
+        };
+        foreach (var kv in PeerSmallIds.OrderBy(k => k.Value))
+        {
+            string name = PeerNames.TryGetValue(kv.Key, out var n) && !string.IsNullOrEmpty(n) ? n : "Player";
+            list.Add(new Dictionary<string, object>
+            {
+                ["platformID"] = kv.Key,
+                ["username"] = name,
+                ["nickname"] = name,
+                ["description"] = "",
+                ["permissionLevel"] = 0,
+                ["avatarTitle"] = "Strong",
+                ["avatarModID"] = -1,
+            });
+        }
+        return list.ToArray();
+    }
+
+    private static void HandleHostPacket(P2PInterface p2p, ProductUserId peer, byte[] buf, int len)
+    {
+        if (len < 3 || peer == null) return;
+        // skip fragments
+        if (len >= 8 && BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(0, 2)) == 62121)
+            return;
+        byte tag = buf[0];
+        if (tag == 0)
+        {
+            Console.WriteLine($"[host] poke/Unknown ← {peer}");
+            return;
+        }
+        if (tag != TagConnectionRequest)
+        {
+            Console.WriteLine($"[host] pkt tag={tag} len={len} ← {peer}");
+            return;
+        }
+        Interlocked.Increment(ref _connRequests);
+        string peerId = peer.ToString();
+        TryParseConnectionRequest(buf.AsSpan(0, len), out string reqUser, out string avatarBarcode);
+        if (string.IsNullOrEmpty(reqUser)) reqUser = "Player";
+        if (string.IsNullOrEmpty(avatarBarcode))
+            avatarBarcode = "SLZ.BONELAB.Content.Avatar.Ford";
+        PeerNames[peerId] = reqUser;
+        byte sid = PeerSmallIds.GetOrAdd(peerId, _ =>
+        {
+            byte n = _nextSmallId;
+            if (_nextSmallId < 254) _nextSmallId++;
+            return n;
+        });
+
+        // Mirror real host order: catchup host → join response → SceneLoad → empty DynamicsAssignment.
+        string hostId = _localUser.ToString();
+        Result r1 = SendTo(p2p, peer, BuildConnectionResponse(hostId, 0, BotNick, "SLZ.BONELAB.Content.Avatar.Ford", isInitialJoin: false));
+        Result r2 = SendTo(p2p, peer, BuildConnectionResponse(peerId, sid, reqUser, avatarBarcode, isInitialJoin: true));
+        Result r3 = SendTo(p2p, peer, BuildSceneLoad(LevelBarcode, ""));
+        Result r4 = SendTo(p2p, peer, BuildEmptyDynamicsAssignment());
+        Console.WriteLine(
+            $"[host] ConnectionRequest ← {peerId} user={reqUser} sid={sid} " +
+            $"catchup={r1} join={r2} scene={r3} dyn={r4}");
+        try { UpdateLobbyAttributes(pulse: true); } catch { /* */ }
+    }
+
+    private static Result SendTo(P2PInterface p2p, ProductUserId peer, byte[] msg)
+    {
+        var send = new SendPacketOptions
+        {
+            LocalUserId = _localUser,
+            RemoteUserId = peer,
+            SocketId = FusionSocket,
+            Channel = 1,
+            Data = new ArraySegment<byte>(msg),
+            AllowDelayedDelivery = true,
+            Reliability = PacketReliability.ReliableUnordered,
+            DisableAutoAcceptConnection = false,
+        };
+        return p2p.SendPacket(ref send);
+    }
+
+    private static bool TryParseConnectionRequest(ReadOnlySpan<byte> packet, out string username, out string avatarBarcode)
+    {
+        username = null;
+        avatarBarcode = null;
+        if (packet.Length < 16 || packet[0] != TagConnectionRequest) return false;
+        int off = 1;
+        byte relay = packet[off++];
+        off++; // channel
+        if (relay != 0)
+        {
+            bool hasSender = packet[off++] != 0;
+            if (hasSender) off++;
+        }
+        if (!TryReadBytes(packet, ref off, out var body)) return false;
+        int b = 0;
+        if (!TryReadString(body, ref b, out _)) return false; // platform id
+        // Version: 3 ints (major/minor/patch) as used by Quest bots / older Fusion
+        if (b + 12 > body.Length) return false;
+        b += 12;
+        if (!TryReadString(body, ref b, out avatarBarcode)) return false;
+        if (b + AvatarStatsPad > body.Length) return false;
+        b += AvatarStatsPad;
+        if (b + 4 > body.Length) return false;
+        int metaCount = BinaryPrimitives.ReadInt32BigEndian(body.AsSpan(b, 4));
+        b += 4;
+        if (metaCount < 0 || metaCount > 256) return false;
+        for (int i = 0; i < metaCount; i++)
+        {
+            if (!TryReadString(body, ref b, out var key)) return false;
+            if (!TryReadString(body, ref b, out var val)) return false;
+            if (key is "Username" or "username" or "Nickname" or "nickname")
+                username = val;
+        }
+        return true;
+    }
+
+    private static byte[] BuildConnectionResponse(
+        string platformId, byte smallId, string username, string avatarBarcode, bool isInitialJoin)
+    {
+        // Quest MarrowFusion wire: string PlatformID + SmallID + metadata (+ avatar/stats/join flag).
+        var payload = new MemoryStream();
+        void WInt(int v)
+        {
+            Span<byte> b = stackalloc byte[4];
+            BinaryPrimitives.WriteInt32BigEndian(b, v);
+            payload.Write(b);
+        }
+        void WStr(string s)
+        {
+            byte[] utf = Encoding.UTF8.GetBytes(s ?? "");
+            WInt(utf.Length);
+            payload.Write(utf, 0, utf.Length);
+        }
+        WStr(platformId);
+        payload.WriteByte(smallId);
+        WInt(2);
+        WStr("Username"); WStr(username ?? "Player");
+        WStr("Nickname"); WStr(username ?? "Player");
+        WInt(0); // equipped items
+        WStr(avatarBarcode ?? "SLZ.BONELAB.Content.Avatar.Ford");
+        payload.Write(new byte[AvatarStatsPad], 0, AvatarStatsPad);
+        payload.WriteByte(isInitialJoin ? (byte)1 : (byte)0);
+        return BuildNetMessage(TagConnectionResponse, payload.ToArray());
+    }
+
+    private static byte[] BuildSceneLoad(string levelBarcode, string loadingScreenBarcode)
+    {
+        var payload = new MemoryStream();
+        void WInt(int v)
+        {
+            Span<byte> b = stackalloc byte[4];
+            BinaryPrimitives.WriteInt32BigEndian(b, v);
+            payload.Write(b);
+        }
+        void WStr(string s)
+        {
+            byte[] utf = Encoding.UTF8.GetBytes(s ?? "");
+            WInt(utf.Length);
+            payload.Write(utf, 0, utf.Length);
+        }
+        WStr(levelBarcode);
+        WStr(loadingScreenBarcode ?? "");
+        return BuildNetMessage(TagSceneLoad, payload.ToArray());
+    }
+
+    private static byte[] BuildEmptyDynamicsAssignment()
+    {
+        // Dictionary count = 0
+        byte[] body = new byte[4];
+        BinaryPrimitives.WriteInt32BigEndian(body, 0);
+        return BuildNetMessage(TagDynamicsAssignment, body);
+    }
+
+    private static byte[] BuildNetMessage(byte tag, byte[] payload)
+    {
+        byte[] msg = new byte[3 + 4 + payload.Length];
+        msg[0] = tag;
+        msg[1] = 0; // RelayType.None
+        msg[2] = 0; // NetworkChannel.Reliable
+        BinaryPrimitives.WriteInt32BigEndian(msg.AsSpan(3, 4), payload.Length);
+        if (payload.Length > 0)
+            Buffer.BlockCopy(payload, 0, msg, 7, payload.Length);
+        return msg;
+    }
+
+    private static bool TryReadBytes(ReadOnlySpan<byte> buf, ref int off, out byte[] data)
+    {
+        data = Array.Empty<byte>();
+        if (off + 4 > buf.Length) return false;
+        int n = BinaryPrimitives.ReadInt32BigEndian(buf.Slice(off, 4));
+        off += 4;
+        if (n < 0 || off + n > buf.Length) return false;
+        data = buf.Slice(off, n).ToArray();
+        off += n;
+        return true;
+    }
+
+    private static bool TryReadString(ReadOnlySpan<byte> buf, ref int off, out string s)
+    {
+        s = null;
+        if (off + 4 > buf.Length) return false;
+        int n = BinaryPrimitives.ReadInt32BigEndian(buf.Slice(off, 4));
+        off += 4;
+        if (n < 0) { s = null; return true; }
+        if (off + n > buf.Length) return false;
+        s = Encoding.UTF8.GetString(buf.Slice(off, n));
+        off += n;
+        return true;
+    }
+
+    private static bool TryReadString(byte[] buf, ref int off, out string s)
+        => TryReadString(buf.AsSpan(), ref off, out s);
 
     private static void LeaveLobby()
     {

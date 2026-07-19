@@ -23,15 +23,26 @@ POSTGRES_DSN=... BOT_NICK=bonelab.fun bash orchestrator/run_parallel.sh
 
 ## Experimental host (`--host`)
 
-Headless EOS CreateLobby listing (not a full Unity Fusion game host):
+Headless EOS CreateLobby + P2P handshake (ReallyWorld / ADMIN). Load is tiny
+(~0.1–1% CPU, ~80 MB RSS). Not a Unity game simulation.
 
 ```bash
-BOT_NICK=ADMIN EOS_DATA_DIR=/tmp/lang-farm/state/host-reallyworld \
+EOS_FORCE_NEW_ACCOUNT=0 BOT_NICK=ADMIN \
+EOS_DATA_DIR=/tmp/lang-farm/state/host-reallyworld \
 HOST_LOBBY_NAME=ReallyWorld HOST_LEVEL_TITLE='Halfway Park' \
-HOST_LOBBY_DESC='Official server from www.bonelab.fun' \
-HOST_HOLD_SEC=3600 \
+HOST_LOBBY_DESC='Официальный сервер от www.bonelab.fun' \
+HOST_HOLD_SEC=7200 \
 dotnet eos-join-probe/bin/Release/net8.0/EosJoinProbe.dll --host
 ```
 
+What works today:
+- Public Find / browser listing (LobbyInfo, code, Halfway Park)
+- EOS JoinLobby + P2P Accept (ForceRelays)
+- Fusion ConnectionResponse + SceneLoad + empty DynamicsAssignment
+
+What does **not** work without a real BONELAB+Fusion (Unity) host:
+- Playable world / avatars / props / voice as a game session
+- Clients time out after handshake (no pose/entity sync)
+
 Requires EOS SDK 1.15.5 ApiVersion patches: CreateLobby=8, AddAttribute=1 (see `patches/`).
-Appears in public Find / browsers as matchmaking metadata; joiners may fail P2P without a real Fusion host.
+Join-test pin: `FORCE_LOBBY_CODE=<code> dotnet …/EosJoinProbe.dll`.
