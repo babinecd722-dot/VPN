@@ -14,6 +14,7 @@ using LabFusion.Marrow.Proxies;
 using LabFusion.Network;
 using LabFusion.Player;
 using LabFusion.UI.Popups;
+using LabFusion.Utilities;
 using MelonLoader;
 using UnityEngine;
 
@@ -32,12 +33,20 @@ namespace MonsterPanel
         private const float PollIntervalSec = 10f;
         private const int HttpTimeoutSeconds = 8;
         private const int MaxTracked = 32;
+        // With PID spoof: wait for spoof popup (~3.5s). Without: short settle, then notify.
+        private const float JoinNotifyDelayWithSpoofSec = 4.0f;
+        private const float JoinNotifyDelayNoSpoofSec = 0.5f;
+        private const float JoinNotifyGapSec = 0.6f;
+        private const float JoinNotifyCooldownSec = 8f;
 
         private static bool _enabled = true;
         private static bool _hooked;
         private static bool _menuHooked;
+        private static bool _joinHooked;
         private static bool _polling;
+        private static bool _joinNotifyRunning;
         private static float _pollCd;
+        private static float _joinNotifyCd;
         private static string _lastError = "";
 
         private static readonly object Gate = new object();
@@ -74,6 +83,7 @@ namespace MonsterPanel
         {
             LoadList();
             InstallFusionProfileHook(harmony);
+            InstallJoinHooks();
             if (_enabled)
                 MelonCoroutines.Start(BootRoutine());
             MelonLogger.Msg($"Tracking: enabled={_enabled} tracked={Entries.Count} api={ApiUrl}");
@@ -92,11 +102,122 @@ namespace MonsterPanel
 
         public static void Tick()
         {
+            if (_joinNotifyCd > 0f)
+                _joinNotifyCd -= Time.unscaledDeltaTime;
+
             if (!_enabled || Entries.Count == 0) return;
             _pollCd -= Time.unscaledDeltaTime;
             if (_pollCd > 0f || _polling) return;
             _pollCd = PollIntervalSec;
             MelonCoroutines.Start(PollRoutine(force: false));
+        }
+
+        private static void InstallJoinHooks()
+        {
+            if (_joinHooked) return;
+            try
+            {
+                if (AccessTools.TypeByName("LabFusion.Utilities.MultiplayerHooking") == null)
+                    return;
+                MultiplayerHooking.OnJoinedServer += OnEnteredFusion;
+                MultiplayerHooking.OnStartedServer += OnEnteredFusion;
+                _joinHooked = true;
+                MelonLogger.Msg("Tracking: hooked Fusion join/start for online alerts");
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Tracking join hook: " + e.Message);
+            }
+        }
+
+        private static void OnEnteredFusion()
+        {
+            if (!_enabled) return;
+            int count;
+            lock (Gate) { count = Entries.Count; }
+            if (count == 0) return;
+            if (_joinNotifyRunning || _joinNotifyCd > 0f) return;
+            MelonCoroutines.Start(OnlineAlertRoutine());
+        }
+
+        /// <summary>
+        /// On Fusion enter: notify each tracked player who is online.
+        /// PID spoof on → wait for spoof popup first. Spoof off → short settle, then notify.
+        /// Offline → silent. English: title = nick, message = "is online".
+        /// </summary>
+        private static IEnumerator OnlineAlertRoutine()
+        {
+            if (_joinNotifyRunning) yield break;
+            _joinNotifyRunning = true;
+            _joinNotifyCd = JoinNotifyCooldownSec;
+
+            try
+            {
+                bool spoofOn = false;
+                try { spoofOn = PidSpoof.Enabled; } catch { /* */ }
+
+                // Only delay for spoof popup; otherwise just a brief Fusion UI settle.
+                float wait = spoofOn ? JoinNotifyDelayWithSpoofSec : JoinNotifyDelayNoSpoofSec;
+                float t = 0f;
+                while (t < wait)
+                {
+                    t += Time.unscaledDeltaTime;
+                    yield return null;
+                }
+
+                yield return PollRoutine(force: true);
+
+                List<(string name, string pid)> online = new List<(string, string)>();
+                lock (Gate)
+                {
+                    foreach (var e in Entries)
+                    {
+                        if (!Snapshots.TryGetValue(e.Pid, out var snap) || snap == null)
+                            continue;
+                        if (!snap.Found || !snap.Online)
+                            continue;
+                        string nick = !string.IsNullOrWhiteSpace(snap.Name) ? snap.Name : e.Name;
+                        if (string.IsNullOrWhiteSpace(nick)) nick = ShortPid(e.Pid);
+                        online.Add((nick, e.Pid));
+                    }
+                }
+
+                if (online.Count == 0)
+                    yield break;
+
+                foreach (var row in online)
+                {
+                    NotifyOnline(SafeMenu(row.name));
+                    float g = 0f;
+                    while (g < JoinNotifyGapSec)
+                    {
+                        g += Time.unscaledDeltaTime;
+                        yield return null;
+                    }
+                }
+            }
+            finally
+            {
+                _joinNotifyRunning = false;
+            }
+        }
+
+        private static void NotifyOnline(string nick)
+        {
+            try
+            {
+                var n = new Notification();
+                n.Title = nick;
+                n.Message = "is online";
+                n.Type = NotificationType.SUCCESS;
+                n.ShowPopup = true;
+                n.PopupLength = 3.0f;
+                Notifier.Send(n);
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Msg("Tracking: " + nick + " is online (" + e.Message + ")");
+            }
         }
 
         public static bool IsTracked(string pid)
