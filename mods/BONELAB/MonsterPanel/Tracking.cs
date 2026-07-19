@@ -38,8 +38,11 @@ namespace MonsterPanel
         private static bool _hooked;
         private static bool _menuHooked;
         private static bool _polling;
+        private static bool _rebuildQueued;
+        private static bool _detailQueued;
         private static float _pollCd;
         private static string _lastError = "";
+        private static string _detailQueuedPid = "";
 
         private static readonly object Gate = new object();
         private static readonly List<TrackedEntry> Entries = new List<TrackedEntry>();
@@ -96,6 +99,7 @@ namespace MonsterPanel
                 Menu.OnPageOpened += (Action<Page>)OnPageOpened;
                 _menuHooked = true;
             }
+            // Build once at install (menu not open yet) — later rebuilds are deferred.
             RebuildMenu();
         }
 
@@ -406,16 +410,9 @@ namespace MonsterPanel
 
         private static void OnPageOpened(Page opened)
         {
-            if (opened == _rootPage)
-            {
-                RebuildMenu();
-                // First fetch when the player actually opens Tracking — never while just in a lobby.
-                if (_enabled && Entries.Count > 0 && !_polling && Time.unscaledTime >= _apiReadyAt)
-                {
-                    _pollCd = 0f;
-                    MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: true));
-                }
-            }
+            if (opened != _rootPage) return;
+            // NEVER RemoveAll inside OnPageOpened — BoneMenu is mid-draw → GUIPool NRE on Quest.
+            ScheduleRebuild(poll: true);
         }
 
         private static void RequestMenuRefresh()
@@ -423,15 +420,74 @@ namespace MonsterPanel
             if (_rootPage == null) return;
             Page cur = null;
             try { cur = Menu.CurrentPage; } catch { /* */ }
-            // Never mutate BoneMenu while the menu is closed (cur == null) — that ran in Fusion lobbies.
             if (cur == _detailPage && !string.IsNullOrEmpty(_detailPid))
             {
-                // Stay on friend card — only refresh its rows from cache (no navigation).
-                FillDetailPage(_detailPid, open: false);
+                ScheduleDetailFill(_detailPid, open: false);
                 return;
             }
             if (cur == _rootPage)
+                ScheduleRebuild(poll: false);
+        }
+
+        private static void ScheduleRebuild(bool poll)
+        {
+            if (_rebuildQueued) return;
+            _rebuildQueued = true;
+            MelonCoroutines.Start(DeferredRebuildRoutine(poll));
+        }
+
+        private static IEnumerator DeferredRebuildRoutine(bool poll)
+        {
+            // Wait until BoneMenu finishes OnPageOpened / DrawElements.
+            yield return null;
+            yield return null;
+            _rebuildQueued = false;
+            try
+            {
+                Page cur = null;
+                try { cur = Menu.CurrentPage; } catch { /* */ }
+                if (cur == _detailPage) yield break;
+                if (cur != null && cur != _rootPage) yield break;
                 RebuildMenu();
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning("Tracking deferred rebuild: " + ex.Message);
+            }
+
+            if (poll && _enabled && Entries.Count > 0 && !_polling && Time.unscaledTime >= _apiReadyAt)
+            {
+                _pollCd = 0f;
+                MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: true));
+            }
+        }
+
+        private static void ScheduleDetailFill(string pid, bool open)
+        {
+            _detailQueuedPid = pid ?? "";
+            if (_detailQueued) return;
+            _detailQueued = true;
+            MelonCoroutines.Start(DeferredDetailRoutine(open));
+        }
+
+        private static IEnumerator DeferredDetailRoutine(bool open)
+        {
+            yield return null;
+            yield return null;
+            _detailQueued = false;
+            string pid = _detailQueuedPid;
+            if (string.IsNullOrEmpty(pid)) yield break;
+            try
+            {
+                Page cur = null;
+                try { cur = Menu.CurrentPage; } catch { /* */ }
+                if (!open && cur != _detailPage) yield break;
+                FillDetailPage(pid, open);
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning("Tracking deferred detail: " + ex.Message);
+            }
         }
 
         private static void RebuildMenu()
@@ -457,6 +513,8 @@ namespace MonsterPanel
                     _pollCd = 0f;
                     MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: true));
                 }));
+
+                _rootPage.CreateFunction("Clear all friends", new Color(1f, 0.45f, 0.35f), (Action)ClearAllFriends);
 
                 lock (Gate)
                 {
@@ -504,6 +562,20 @@ namespace MonsterPanel
             }
         }
 
+        private static void ClearAllFriends()
+        {
+            lock (Gate)
+            {
+                Entries.Clear();
+                Snapshots.Clear();
+                SaveList_NoLock();
+            }
+            _detailPid = "";
+            Notify("Tracking", "List cleared");
+            MelonLogger.Msg("Tracking: clear all friends");
+            ScheduleRebuild(poll: false);
+        }
+
         /// <summary>
         /// Open friend card from cache immediately; soft-refresh that pid in background.
         /// No HTTP / Join / Disconnect on the click itself.
@@ -512,7 +584,8 @@ namespace MonsterPanel
         {
             if (string.IsNullOrWhiteSpace(pid) || _detailPage == null) return;
             _detailPid = pid;
-            FillDetailPage(pid, open: true);
+            // Defer RemoveAll so we don't fight the click that opened the row.
+            ScheduleDetailFill(pid, open: true);
             MelonCoroutines.Start(SoftRefreshFriendRoutine(pid));
         }
 
@@ -642,7 +715,7 @@ namespace MonsterPanel
             Page cur = null;
             try { cur = Menu.CurrentPage; } catch { /* */ }
             if (cur == _detailPage)
-                FillDetailPage(pid, open: false);
+                ScheduleDetailFill(pid, open: false);
         }
 
         private static Color ListColor(TrackSnapshot snap)

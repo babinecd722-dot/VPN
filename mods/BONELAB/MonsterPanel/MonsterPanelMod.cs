@@ -16,7 +16,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.16", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.17", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -664,9 +664,12 @@ namespace MonsterPanel
             private static Page _page;
             private static bool _hooked;
 
+            private static bool _rebuildQueued;
+
             public static void Install(Page root)
             {
-                _page = root.CreatePage("Kill Aura", new Color(0.7f, 0.4f, 1f), 16, true);
+                // maxElements=0 — pagination/index pages crash Quest GUIPool.
+                _page = root.CreatePage("Kill Aura", new Color(0.7f, 0.4f, 1f), 0, true);
                 if (!_hooked)
                 {
                     Menu.OnPageOpened += (Action<Page>)OnPageOpened;
@@ -677,7 +680,19 @@ namespace MonsterPanel
 
             private static void OnPageOpened(Page opened)
             {
-                if (opened == _page) Rebuild();
+                if (opened != _page) return;
+                // Defer RemoveAll — sync rebuild inside OnPageOpened → GUIPool NRE.
+                if (_rebuildQueued) return;
+                _rebuildQueued = true;
+                MelonCoroutines.Start(DeferredRebuild());
+            }
+
+            private static System.Collections.IEnumerator DeferredRebuild()
+            {
+                yield return null;
+                yield return null;
+                _rebuildQueued = false;
+                Rebuild();
             }
 
             private static void Rebuild()
@@ -1584,10 +1599,13 @@ namespace MonsterPanel
             /// <summary>LabFusion загружен? (тип резолвится только если сборка в игре есть.)</summary>
             public static bool FusionLoaded => AccessTools.TypeByName("LabFusion.Entities.NetworkPlayer") != null;
 
+            private static bool _rebuildQueued;
+
             /// <summary>Создаёт подстраницу Teleport в корне панели и вешает авто-обновление списка.</summary>
             public static void Install(Page root)
             {
-                _page = root.CreatePage("Teleport", new Color(0.3f, 0.7f, 1f), 16, true);
+                // Flat list only — CreatePage-per-player + pagination crashed Quest GUIPool.
+                _page = root.CreatePage("Teleport", new Color(0.3f, 0.7f, 1f), 0, true);
                 if (!_hooked)
                 {
                     Menu.OnPageOpened += (Action<Page>)OnPageOpened;   // при каждом открытии — свежий список
@@ -1598,17 +1616,33 @@ namespace MonsterPanel
 
             private static void OnPageOpened(Page opened)
             {
-                if (opened == _page) Rebuild();
+                if (opened != _page) return;
+                if (_rebuildQueued) return;
+                _rebuildQueued = true;
+                MelonCoroutines.Start(DeferredRebuild());
             }
 
-            /// <summary>Пересобираем список: под каждого игрока — подстраница с выбором направления телепорта.</summary>
+            private static System.Collections.IEnumerator DeferredRebuild()
+            {
+                yield return null;
+                yield return null;
+                _rebuildQueued = false;
+                Rebuild();
+            }
+
+            /// <summary>Flat list: TP / Bring / Tracking per player — no nested pages.</summary>
             private static void Rebuild()
             {
                 if (_page == null) return;
                 try
                 {
                     _page.RemoveAll();
-                    _page.CreateFunction("Refresh", new Color(0.7f, 0.7f, 0.7f), (Action)Rebuild);
+                    _page.CreateFunction("Refresh", new Color(0.7f, 0.7f, 0.7f), (Action)(() =>
+                    {
+                        if (_rebuildQueued) return;
+                        _rebuildQueued = true;
+                        MelonCoroutines.Start(DeferredRebuild());
+                    }));
 
                     int count = 0;
                     foreach (var np in NetworkPlayer.Players)
@@ -1618,11 +1652,11 @@ namespace MonsterPanel
 
                         byte sid = np.PlayerID.SmallID;
                         string name = SafeName(np.Username, sid);   // без rich-text тегов и не-ASCII: шрифт BoneMenu только латиница
+                        string shortName = name.Length > 14 ? name.Substring(0, 14) : name;
 
-                        Page sub = _page.CreatePage(name, new Color(0.6f, 0.85f, 1f), 16, true);
-                        sub.CreateFunction("Teleport to player", new Color(0.3f, 1f, 0.5f), (Action)(() => TeleportSelfTo(sid)));
-                        sub.CreateFunction("Bring player to me", new Color(1f, 0.6f, 0.2f), (Action)(() => BringToMe(sid)));
-                        // Capture pid/name for Tracking (PlatformID is EOS ProductUserId string).
+                        _page.CreateFunction("TP  " + shortName, new Color(0.3f, 1f, 0.5f), (Action)(() => TeleportSelfTo(sid)));
+                        _page.CreateFunction("Bring  " + shortName, new Color(1f, 0.6f, 0.2f), (Action)(() => BringToMe(sid)));
+
                         string trackPid = null;
                         string trackName = np.Username;
                         try { trackPid = np.PlayerID.PlatformID; } catch { /* */ }
@@ -1631,14 +1665,16 @@ namespace MonsterPanel
                             string pidCopy = trackPid.Trim();
                             string nameCopy = trackName;
                             bool tracked = Tracking.IsTracked(pidCopy);
-                            sub.CreateFunction(
-                                tracked ? "Remove from Tracking" : "Add to Tracking",
+                            _page.CreateFunction(
+                                (tracked ? "Untrack  " : "Track  ") + shortName,
                                 tracked ? new Color(1f, 0.4f, 0.35f) : new Color(0.35f, 0.9f, 1f),
                                 (Action)(() =>
                                 {
                                     if (Tracking.IsTracked(pidCopy)) Tracking.Remove(pidCopy);
                                     else Tracking.Add(pidCopy, nameCopy);
-                                    Rebuild();
+                                    if (_rebuildQueued) return;
+                                    _rebuildQueued = true;
+                                    MelonCoroutines.Start(DeferredRebuild());
                                 }));
                         }
                         count++;

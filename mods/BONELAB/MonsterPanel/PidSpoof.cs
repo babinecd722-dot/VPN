@@ -75,6 +75,27 @@ namespace MonsterPanel
         public static void InstallMenu(Page root)
         {
             root.CreateBool("Spoofing PID", new Color(0.85f, 0.55f, 0.15f), Enabled, OnToggle);
+            root.CreateFunction("Reset spoof PID", new Color(1f, 0.45f, 0.3f), (Action)ResetSpoofIdentity);
+        }
+
+        /// <summary>Wipe minted spoof ProductUserId and provision a fresh one (if spoof is ON).</summary>
+        private static void ResetSpoofIdentity()
+        {
+            MelonLogger.Msg("Spoofing PID: reset — clearing minted spoof id");
+            SpoofPlatformId = "";
+            SpoofDeviceModel = "";
+            Save();
+            _ensureStarted = false;
+            _cancel = false;
+            if (Enabled)
+            {
+                StartEnsure();
+                Notify("Spoof PID", "Reset — minting new id…");
+            }
+            else
+            {
+                Notify("Spoof PID", "Cleared (toggle ON to mint)");
+            }
         }
 
         private static void OnToggle(bool on)
