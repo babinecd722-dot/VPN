@@ -21,8 +21,8 @@ namespace MonsterPanel
 {
     /// <summary>
     /// Friend-style presence tracking for Fusion players.
-    /// Local pid list in UserData → POST /v1/track every 10s → BoneMenu + Join by lobby_code.
-    /// No Fusion join/scene hooks and no auto popups on lobby enter (those caused OOB on Quest).
+    /// Local pid list in UserData → poll /v1/track only while Tracking BoneMenu is open → Join by lobby_code.
+    /// Completely inert while sitting in a Fusion lobby with the menu closed (no join hooks, no popups, no poll).
     /// </summary>
     internal static class Tracking
     {
@@ -82,9 +82,8 @@ namespace MonsterPanel
         {
             LoadList();
             InstallFusionProfileHook(harmony);
-            if (_enabled)
-                MelonCoroutines.Start(BootRoutine());
-            MelonLogger.Msg($"Tracking: enabled={_enabled} tracked={Entries.Count} api={ApiUrl} (no join alerts)");
+            // No boot poll — stay inert until the player opens Tracking in BoneMenu.
+            MelonLogger.Msg($"Tracking: enabled={_enabled} tracked={Entries.Count} api={ApiUrl} (menu-only poll)");
         }
 
         public static void InstallMenu(Page root)
@@ -100,14 +99,30 @@ namespace MonsterPanel
             RebuildMenu();
         }
 
+        /// <summary>
+        /// Background poll ONLY while Tracking BoneMenu pages are open.
+        /// Closed menu in a Fusion lobby → zero Tracking work (no HTTP, no BoneMenu rebuild).
+        /// </summary>
         public static void Tick()
         {
             if (!_enabled || Entries.Count == 0) return;
+            if (!IsTrackingMenuOpen()) return;
             if (Time.unscaledTime < _apiReadyAt) return;
             _pollCd -= Time.unscaledDeltaTime;
             if (_pollCd > 0f || _polling) return;
             _pollCd = PollIntervalSec;
             MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: true));
+        }
+
+        private static bool IsTrackingMenuOpen()
+        {
+            if (_rootPage == null) return false;
+            try
+            {
+                Page cur = Menu.CurrentPage;
+                return cur == _rootPage || cur == _detailPage;
+            }
+            catch { return false; }
         }
 
         public static bool IsTracked(string pid)
@@ -188,17 +203,6 @@ namespace MonsterPanel
                 try { if (_rootPage != null) Menu.OpenPage(_rootPage); } catch { /* */ }
             }
             RequestMenuRefresh();
-        }
-
-        private static IEnumerator BootRoutine()
-        {
-            float t = 0f;
-            while (t < 3f)
-            {
-                t += Time.unscaledDeltaTime;
-                yield return null;
-            }
-            MelonCoroutines.Start(PollRoutine(force: true, refreshMenu: true));
         }
 
         private static IEnumerator PollRoutine(bool force, bool refreshMenu = true)
@@ -403,7 +407,15 @@ namespace MonsterPanel
         private static void OnPageOpened(Page opened)
         {
             if (opened == _rootPage)
+            {
                 RebuildMenu();
+                // First fetch when the player actually opens Tracking — never while just in a lobby.
+                if (_enabled && Entries.Count > 0 && !_polling && Time.unscaledTime >= _apiReadyAt)
+                {
+                    _pollCd = 0f;
+                    MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: true));
+                }
+            }
         }
 
         private static void RequestMenuRefresh()
@@ -411,13 +423,14 @@ namespace MonsterPanel
             if (_rootPage == null) return;
             Page cur = null;
             try { cur = Menu.CurrentPage; } catch { /* */ }
+            // Never mutate BoneMenu while the menu is closed (cur == null) — that ran in Fusion lobbies.
             if (cur == _detailPage && !string.IsNullOrEmpty(_detailPid))
             {
                 // Stay on friend card — only refresh its rows from cache (no navigation).
                 FillDetailPage(_detailPid, open: false);
                 return;
             }
-            if (cur == null || cur == _rootPage)
+            if (cur == _rootPage)
                 RebuildMenu();
         }
 

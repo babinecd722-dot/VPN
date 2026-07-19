@@ -16,7 +16,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.15", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.16", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -107,7 +107,7 @@ namespace MonsterPanel
                 Guards.Tick();
                 NetLightning.Tick();   // авто-удаление отживших сетевых молний
                 AdminNick.Tick();      // OWNER/dev-gold shimmer nametag (metadata @ ~10 Hz)
-                Tracking.Tick();       // presence poll every 10s
+                Tracking.Tick();       // presence poll only while Tracking menu is open
             }
             else
             {
