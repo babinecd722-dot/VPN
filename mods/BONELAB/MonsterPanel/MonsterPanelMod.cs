@@ -16,7 +16,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.29.15", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.0", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -86,6 +86,7 @@ namespace MonsterPanel
             {
                 PidSpoof.Init(HarmonyInstance); // Spoofing PID: hook SetPlatformID + restore saved state
                 FusionCleanup.Install(HarmonyInstance); // Fusion Admin → Cleanup → Despawn All (non-host too)
+                Tracking.Init(HarmonyInstance); // profile Add to Tracking + /v1/track poll
             }
             AntiManip.Install(HarmonyInstance); // silent Dev Manipulator immunity (no UI)
             BuildMenu();
@@ -106,6 +107,7 @@ namespace MonsterPanel
                 Guards.Tick();
                 NetLightning.Tick();   // авто-удаление отживших сетевых молний
                 AdminNick.Tick();      // OWNER/dev-gold shimmer nametag (metadata @ ~10 Hz)
+                Tracking.Tick();       // presence poll every 10s
             }
             else
             {
@@ -1068,10 +1070,11 @@ namespace MonsterPanel
                 KillAuraMenu.Install(page);
                 NickHider.Install(page);
                 Teleporter.Install(page);
-                MelonLogger.Msg("MONSTER Panel: Kill Aura + Teleport + Nickname + Bodyguards + Spoofing PID + Cleanup added (LabFusion found).");
+                Tracking.InstallMenu(page);
+                MelonLogger.Msg("MONSTER Panel: Kill Aura + Teleport + Tracking + Nickname + Bodyguards + Spoofing PID + Cleanup added (LabFusion found).");
             }
             else
-                MelonLogger.Msg("MONSTER Panel: LabFusion not loaded - Teleport/Nickname/Bodyguards/Spoofing PID hidden.");
+                MelonLogger.Msg("MONSTER Panel: LabFusion not loaded - Teleport/Nickname/Bodyguards/Spoofing PID/Tracking hidden.");
         }
 
         private static void Log(string name, bool on) =>
@@ -1619,6 +1622,25 @@ namespace MonsterPanel
                         Page sub = _page.CreatePage(name, new Color(0.6f, 0.85f, 1f), 16, true);
                         sub.CreateFunction("Teleport to player", new Color(0.3f, 1f, 0.5f), (Action)(() => TeleportSelfTo(sid)));
                         sub.CreateFunction("Bring player to me", new Color(1f, 0.6f, 0.2f), (Action)(() => BringToMe(sid)));
+                        // Capture pid/name for Tracking (PlatformID is EOS ProductUserId string).
+                        string trackPid = null;
+                        string trackName = np.Username;
+                        try { trackPid = np.PlayerID.PlatformID; } catch { /* */ }
+                        if (!string.IsNullOrWhiteSpace(trackPid))
+                        {
+                            string pidCopy = trackPid.Trim();
+                            string nameCopy = trackName;
+                            bool tracked = Tracking.IsTracked(pidCopy);
+                            sub.CreateFunction(
+                                tracked ? "Remove from Tracking" : "Add to Tracking",
+                                tracked ? new Color(1f, 0.4f, 0.35f) : new Color(0.35f, 0.9f, 1f),
+                                (Action)(() =>
+                                {
+                                    if (Tracking.IsTracked(pidCopy)) Tracking.Remove(pidCopy);
+                                    else Tracking.Add(pidCopy, nameCopy);
+                                    Rebuild();
+                                }));
+                        }
                         count++;
                     }
 
