@@ -1224,9 +1224,15 @@ internal static class Program
             stats = stats with { Loading = 0, InGame = desired.Count };
         }
 
-        // Always ghost-sweep after the cycle — even if advisory lock skipped the main write
-        // (another writer / old VPS binary must not leave stale IN GAME rows).
-        int ghosts = SweepGhostsStandalone(seenPids);
+        // If advisory lock skipped the main write, still touch everyone we saw this cycle.
+        // Otherwise "seen" exclusion in older sweeps protected stale IN GAME rows forever.
+        int touched = TouchSeenStandalone(seenPids);
+        if (touched > 0)
+            Console.WriteLine($"[scraper] touch last_seen standalone → {touched}");
+
+        // TTL-only ghost sweep (no seen exclusion): after touch, live players are fresh;
+        // anyone still stale is a real ghost — including bot register / skipped-lock leftovers.
+        int ghosts = SweepGhostsStandalone();
         if (ghosts > 0)
             stats = stats with { MarkedOffline = stats.MarkedOffline + ghosts };
 
@@ -1234,11 +1240,37 @@ internal static class Program
     }
 
     /// <summary>
-    /// Hard TTL offline for active rows not in this scrape. Own connection — no advisory lock.
+    /// Refresh last_seen for this scrape's PIDs without the advisory lock.
+    /// Safe when another writer owns the upsert lock.
     /// </summary>
-    private static int SweepGhostsStandalone(string[] seenPids)
+    private static int TouchSeenStandalone(string[] seenPids)
     {
-        if (GhostTtlMin <= 0 || seenPids == null || seenPids.Length == 0)
+        if (seenPids == null || seenPids.Length == 0)
+            return 0;
+        try
+        {
+            using var conn = new NpgsqlConnection(PostgresDsn);
+            conn.Open();
+            using var touch = new NpgsqlCommand(
+                @"UPDATE client_data
+                  SET last_seen_at = NOW()
+                  WHERE pid = ANY(@seen)", conn);
+            touch.Parameters.AddWithValue("seen", NpgsqlDbType.Array | NpgsqlDbType.Text, seenPids);
+            return touch.ExecuteNonQuery();
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine("[scraper] touch standalone: " + e.Message);
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Hard TTL offline for any active row with stale/null last_seen. Own connection — no lock.
+    /// </summary>
+    private static int SweepGhostsStandalone()
+    {
+        if (GhostTtlMin <= 0)
             return 0;
         try
         {
@@ -1248,12 +1280,10 @@ internal static class Program
                 @"UPDATE client_data
                   SET status = 'OFFLINE', server = NULL, server_map = NULL, lobby_code = NULL
                   WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')
-                    AND NOT (pid = ANY(@seen))
                     AND (
                           last_seen_at IS NULL
                           OR last_seen_at < NOW() - make_interval(mins => @ttl)
                         )", conn);
-            ghost.Parameters.AddWithValue("seen", NpgsqlDbType.Array | NpgsqlDbType.Text, seenPids);
             ghost.Parameters.AddWithValue("ttl", GhostTtlMin);
             int n = ghost.ExecuteNonQuery();
             if (n > 0)
@@ -1458,32 +1488,8 @@ internal static class Program
             }
         }
 
-        // Ghost sweep ALWAYS runs on a non-empty scrape — even under collapse guard.
-        // Miss-streak is soft; TTL is hard truth: not seen + stale last_seen → OFFLINE.
-        if (GhostTtlMin > 0 && seenPids != null && seenPids.Length > 0)
-        {
-            using (var ghost = new NpgsqlCommand(
-                       @"UPDATE client_data
-                         SET status = 'OFFLINE', server = NULL, server_map = NULL, lobby_code = NULL
-                         WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')
-                           AND NOT (pid = ANY(@seen))
-                           AND (
-                                 last_seen_at IS NULL
-                                 OR last_seen_at < NOW() - make_interval(mins => @ttl)
-                               )", conn, tx))
-            {
-                ghost.Parameters.AddWithValue(
-                    "seen", NpgsqlDbType.Array | NpgsqlDbType.Text, seenPids);
-                ghost.Parameters.AddWithValue("ttl", GhostTtlMin);
-                int ghosts = ghost.ExecuteNonQuery();
-                if (ghosts > 0)
-                {
-                    offlineCount += ghosts;
-                    Console.WriteLine(
-                        $"[scraper] ghost sweep ttl={GhostTtlMin}m collapse={!markOffline} → offline={ghosts}");
-                }
-            }
-        }
+        // Ghost TTL sweep is NOT done in-tx here — promote/collapse writes only touch a
+        // subset. End-of-cycle TouchSeenStandalone + SweepGhostsStandalone handles ghosts.
 
         tx.Commit();
         return new SyncStats(upserted, inserted, offlineCount, unchanged, 0, 0, Skipped: false);
