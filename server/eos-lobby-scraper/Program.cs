@@ -43,8 +43,9 @@ internal static class Program
     // If seen players collapse below this fraction of last good scrape → upsert only, no OFFLINE.
     private static readonly double CollapseRatio = double.TryParse(Env("COLLAPSE_RATIO", "0.35"), out var cr) ? Math.Clamp(cr, 0.05, 0.95) : 0.35;
     // Force-OFFLINE active rows whose last_seen_at is older than this (minutes).
-    // Catches ghosts after scraper downtime / skipped unchanged updates. 0 = disabled.
-    private static readonly int GhostTtlMin = int.TryParse(Env("GHOST_TTL_MIN", "12"), out var gttl) ? Math.Clamp(gttl, 0, 180) : 12;
+    // Runs even under collapse guard. Keep tight — presence must not lie.
+    // 0 = disabled (not recommended).
+    private static readonly int GhostTtlMin = int.TryParse(Env("GHOST_TTL_MIN", "4"), out var gttl) ? Math.Clamp(gttl, 0, 180) : 4;
     private static readonly bool UseAdvisoryLock = Env("ADVISORY_LOCK", "1") != "0";
     // Stable key for pg_try_advisory_xact_lock (two writers → one skips cycle).
     private const long PresenceLockKey = 872314659L;
@@ -1279,6 +1280,7 @@ internal static class Program
         int unchanged = 0;
         int offlineCount = 0;
         var seenSet = new HashSet<string>(seenPids ?? Array.Empty<string>(), StringComparer.Ordinal);
+        string[] desiredPids = desired.Keys.ToArray();
 
         using (var upd = new NpgsqlCommand(
                    @"UPDATE client_data
@@ -1288,10 +1290,6 @@ internal static class Program
                          server_map = @map,
                          lobby_code = @code,
                          last_seen_at = NOW()
-                     WHERE pid = @pid", conn, tx))
-        using (var touch = new NpgsqlCommand(
-                   @"UPDATE client_data
-                     SET last_seen_at = NOW()
                      WHERE pid = @pid", conn, tx))
         using (var ins = new NpgsqlCommand(
                    @"INSERT INTO client_data (name, pid, status, server, server_map, lobby_code, last_seen_at)
@@ -1304,9 +1302,6 @@ internal static class Program
             var uCode = upd.Parameters.Add("code", NpgsqlDbType.Text);
             var uPid = upd.Parameters.Add("pid", NpgsqlDbType.Text);
             upd.Prepare();
-
-            var tPid = touch.Parameters.Add("pid", NpgsqlDbType.Text);
-            touch.Prepare();
 
             var iName = ins.Parameters.Add("name", NpgsqlDbType.Text);
             var iPid = ins.Parameters.Add("pid", NpgsqlDbType.Text);
@@ -1331,9 +1326,6 @@ internal static class Program
                         string.Equals(row.LobbyCode ?? "", p.LobbyCode ?? "", StringComparison.Ordinal);
                     if (same)
                     {
-                        // Still refresh last_seen so consumers don't treat long sessions as ghosts.
-                        tPid.Value = p.Pid;
-                        touch.ExecuteNonQuery();
                         unchanged++;
                         continue;
                     }
@@ -1359,6 +1351,18 @@ internal static class Program
                     inserted++;
                 }
             }
+        }
+
+        // Batch-refresh last_seen for EVERYONE seen this cycle (including unchanged).
+        if (desiredPids.Length > 0)
+        {
+            using var touchAll = new NpgsqlCommand(
+                @"UPDATE client_data
+                  SET last_seen_at = NOW()
+                  WHERE pid = ANY(@seen)", conn, tx);
+            touchAll.Parameters.AddWithValue(
+                "seen", NpgsqlDbType.Array | NpgsqlDbType.Text, desiredPids);
+            touchAll.ExecuteNonQuery();
         }
 
         if (markOffline)
@@ -1414,9 +1418,9 @@ internal static class Program
             }
         }
 
-        // Sweep ghosts: active rows not seen this cycle whose last_seen is too old.
-        // Works even after scraper downtime (miss-streak memory is empty on restart).
-        if (GhostTtlMin > 0 && markOffline && seenPids != null && seenPids.Length > 0)
+        // Ghost sweep ALWAYS runs on a non-empty scrape — even under collapse guard.
+        // Miss-streak is soft; TTL is hard truth: not seen + stale last_seen → OFFLINE.
+        if (GhostTtlMin > 0 && seenPids != null && seenPids.Length > 0)
         {
             using (var ghost = new NpgsqlCommand(
                        @"UPDATE client_data
@@ -1435,7 +1439,8 @@ internal static class Program
                 if (ghosts > 0)
                 {
                     offlineCount += ghosts;
-                    Console.WriteLine($"[scraper] ghost sweep ttl={GhostTtlMin}m → offline={ghosts}");
+                    Console.WriteLine(
+                        $"[scraper] ghost sweep ttl={GhostTtlMin}m collapse={!markOffline} → offline={ghosts}");
                 }
             }
         }
