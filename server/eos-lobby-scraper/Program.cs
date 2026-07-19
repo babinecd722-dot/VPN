@@ -30,7 +30,7 @@ internal static class Program
 
     private static readonly string GameName = Env("FUSION_GAME_NAME", "BONELAB");
     private static readonly string PostgresDsn = ResolvePostgresDsn();
-    private static readonly int IntervalSec = int.TryParse(Env("SCRAPE_INTERVAL_SEC", "15"), out var s) ? Math.Max(5, s) : 15;
+    private static readonly int IntervalSec = int.TryParse(Env("SCRAPE_INTERVAL_SEC", "10"), out var s) ? Math.Max(5, s) : 10;
     private static readonly bool Once = Env("SCRAPE_ONCE", "0") == "1";
     private static readonly int CodeProbeBudget = int.TryParse(Env("CODE_PROBE_BUDGET", "25"), out var c) ? Math.Clamp(c, 0, 200) : 25;
     private static readonly double LoadingSec = double.TryParse(Env("LOADING_SEC", "3"), out var ls) ? Math.Clamp(ls, 0.5, 30) : 3;
@@ -38,14 +38,14 @@ internal static class Program
     private static readonly string DataDir = Env("DATA_DIR", Path.Combine(AppContext.BaseDirectory, "data"));
     private static readonly string CodeCachePath = Env("CODE_CACHE_PATH", Path.Combine(DataDir, "lobby_codes.txt"));
     private static readonly string IdentityPath = Env("EOS_IDENTITY_PATH", Path.Combine(DataDir, "eos-identity.json"));
-    // Mark OFFLINE only after N consecutive misses (avoids blink-offline on flaky Find).
-    private static readonly int OfflineMissStreak = int.TryParse(Env("OFFLINE_MISS_STREAK", "2"), out var oms) ? Math.Clamp(oms, 1, 10) : 2;
+    // Mark OFFLINE after N consecutive Find misses. 1 = leave lobby ASAP (Hohos-like).
+    private static readonly int OfflineMissStreak = int.TryParse(Env("OFFLINE_MISS_STREAK", "1"), out var oms) ? Math.Clamp(oms, 1, 10) : 1;
     // If seen players collapse below this fraction of last good scrape → upsert only, no OFFLINE.
     private static readonly double CollapseRatio = double.TryParse(Env("COLLAPSE_RATIO", "0.35"), out var cr) ? Math.Clamp(cr, 0.05, 0.95) : 0.35;
-    // Force-OFFLINE active rows whose last_seen_at is older than this (minutes).
-    // Runs even under collapse guard. Keep tight — presence must not lie.
-    // 0 = disabled (not recommended).
-    private static readonly int GhostTtlMin = int.TryParse(Env("GHOST_TTL_MIN", "4"), out var gttl) ? Math.Clamp(gttl, 0, 180) : 4;
+    // Force-OFFLINE when last_seen is older than this many seconds (hard cap even under collapse).
+    // Prefer GHOST_TTL_SEC; legacy GHOST_TTL_MIN (minutes) still accepted.
+    // 0 = disabled (not recommended). Default 90s ≈ 1 scrape miss + short EOS lag.
+    private static readonly int GhostTtlSec = ResolveGhostTtlSec();
     private static readonly bool UseAdvisoryLock = Env("ADVISORY_LOCK", "1") != "0";
     // Stable key for pg_try_advisory_xact_lock (two writers → one skips cycle).
     private const long PresenceLockKey = 872314659L;
@@ -74,6 +74,16 @@ internal static class Program
 
     private static string Env(string key, string fallback)
         => Environment.GetEnvironmentVariable(key) is { Length: > 0 } v ? v : fallback;
+
+    private static int ResolveGhostTtlSec()
+    {
+        if (int.TryParse(Env("GHOST_TTL_SEC", ""), out var sec))
+            return Math.Clamp(sec, 0, 3600);
+        // Legacy minutes → seconds (old default was 4m; new default 90s).
+        if (int.TryParse(Env("GHOST_TTL_MIN", ""), out var min) && min > 0)
+            return Math.Clamp(min * 60, 0, 3600);
+        return 90;
+    }
 
     private static string ResolvePostgresDsn()
     {
@@ -120,7 +130,7 @@ internal static class Program
             $"[scraper] game={GameName} interval={IntervalSec}s once={Once} loading_sec={LoadingSec:0.#} " +
             $"code_cache={KnownCodes.Count} probe_budget={CodeProbeBudget} " +
             $"miss_streak={OfflineMissStreak} collapse={CollapseRatio:0.##} " +
-            $"ghost_ttl_min={GhostTtlMin} advisory_lock={UseAdvisoryLock}");
+            $"ghost_ttl_sec={GhostTtlSec} advisory_lock={UseAdvisoryLock}");
 
         _identity = LoadOrMintIdentity(forceNew: ForceNewAccountEnv);
         Console.WriteLine(
@@ -1270,7 +1280,7 @@ internal static class Program
     /// </summary>
     private static int SweepGhostsStandalone()
     {
-        if (GhostTtlMin <= 0)
+        if (GhostTtlSec <= 0)
             return 0;
         try
         {
@@ -1282,12 +1292,12 @@ internal static class Program
                   WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')
                     AND (
                           last_seen_at IS NULL
-                          OR last_seen_at < NOW() - make_interval(mins => @ttl)
+                          OR last_seen_at < NOW() - make_interval(secs => @ttl)
                         )", conn);
-            ghost.Parameters.AddWithValue("ttl", GhostTtlMin);
+            ghost.Parameters.AddWithValue("ttl", GhostTtlSec);
             int n = ghost.ExecuteNonQuery();
             if (n > 0)
-                Console.WriteLine($"[scraper] ghost sweep (standalone) ttl={GhostTtlMin}m → offline={n}");
+                Console.WriteLine($"[scraper] ghost sweep (standalone) ttl={GhostTtlSec}s → offline={n}");
             return n;
         }
         catch (Exception e)

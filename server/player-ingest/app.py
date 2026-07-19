@@ -25,9 +25,10 @@ _PID_MAX = 128
 _BATCH_MAX = 64
 _TRACK_MIN_INTERVAL_SEC = 10.0
 # Presence older than this is treated as OFFLINE for clients (anti-ghost).
-_GHOST_TTL = timedelta(minutes=4)
-_GHOST_TTL_MIN = 4
-_GHOST_SWEEP_SEC = 20.0
+# Keep in sync with scraper GHOST_TTL_SEC (default 90).
+_GHOST_TTL = timedelta(seconds=90)
+_GHOST_TTL_SEC = 90
+_GHOST_SWEEP_SEC = 10.0
 
 
 class Settings(BaseSettings):
@@ -63,17 +64,16 @@ def _ghost_sweep_once() -> int:
                     WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')
                       AND (
                             last_seen_at IS NULL
-                            OR last_seen_at < NOW() - make_interval(mins => %s)
+                            OR last_seen_at < NOW() - make_interval(secs => %s)
                           )
                     """,
-                    (_GHOST_TTL_MIN,),
+                    (_GHOST_TTL_SEC,),
                 )
                 return cur.rowcount
 
 
 def _ghost_sweep_loop() -> None:
-    # Scraper on VPS has repeatedly shipped without refreshing last_seen; this loop
-    # is the hard backstop so DB presence cannot rot for more than ~TTL+interval.
+    # Hard backstop so DB presence cannot rot longer than ~TTL + sweep interval.
     while not _sweep_stop.wait(_GHOST_SWEEP_SEC):
         if pool is None:
             continue
@@ -103,7 +103,7 @@ async def lifespan(_app: FastAPI):
     _sweep_stop.clear()
     _sweep_thread = threading.Thread(target=_ghost_sweep_loop, name="ghost-sweep", daemon=True)
     _sweep_thread.start()
-    log.info("ghost sweep loop started ttl=%sm every=%ss", _GHOST_TTL_MIN, int(_GHOST_SWEEP_SEC))
+    log.info("ghost sweep loop started ttl=%ss every=%ss", _GHOST_TTL_SEC, int(_GHOST_SWEEP_SEC))
     try:
         yield
     finally:
@@ -258,18 +258,18 @@ def presence_stats(_: str = Depends(require_key)) -> dict[str, Any]:
                       count(*) FILTER (WHERE status = 'LOADING') AS loading,
                       count(*) FILTER (
                         WHERE status = 'IN GAME'
-                          AND last_seen_at >= NOW() - make_interval(mins => %s)
-                      ) AS live4,
+                          AND last_seen_at >= NOW() - make_interval(secs => %s)
+                      ) AS live,
                       count(*) FILTER (
                         WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')
                           AND (
                                 last_seen_at IS NULL
-                                OR last_seen_at < NOW() - make_interval(mins => %s)
+                                OR last_seen_at < NOW() - make_interval(secs => %s)
                               )
-                      ) AS ghost4
+                      ) AS ghost
                     FROM client_data
                     """,
-                    (_GHOST_TTL_MIN, _GHOST_TTL_MIN),
+                    (_GHOST_TTL_SEC, _GHOST_TTL_SEC),
                 )
                 row = cur.fetchone() or {}
     except psycopg.Error as e:
@@ -277,12 +277,16 @@ def presence_stats(_: str = Depends(require_key)) -> dict[str, Any]:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "db read failed") from e
     return {
         "ok": True,
-        "ttl_min": _GHOST_TTL_MIN,
+        "ttl_sec": _GHOST_TTL_SEC,
         "total": row.get("total", 0),
         "ingame": row.get("ingame", 0),
         "loading": row.get("loading", 0),
-        "live4": row.get("live4", 0),
-        "ghost4": row.get("ghost4", 0),
+        "live": row.get("live", 0),
+        "ghost": row.get("ghost", 0),
+        # Aliases for old clients/scripts
+        "live4": row.get("live", 0),
+        "ghost4": row.get("ghost", 0),
+        "ttl_min": max(1, (_GHOST_TTL_SEC + 59) // 60),
         "last_sweep": _last_sweep,
     }
 
