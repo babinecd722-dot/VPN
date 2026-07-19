@@ -20,3 +20,18 @@ production bot sources for version control.
 cd /tmp/lang-farm
 POSTGRES_DSN=... BOT_NICK=bonelab.fun bash orchestrator/run_parallel.sh
 ```
+
+## Experimental host (`--host`)
+
+Headless EOS CreateLobby listing (not a full Unity Fusion game host):
+
+```bash
+BOT_NICK=ADMIN EOS_DATA_DIR=/tmp/lang-farm/state/host-reallyworld \
+HOST_LOBBY_NAME=ReallyWorld HOST_LEVEL_TITLE='Halfway Park' \
+HOST_LOBBY_DESC='Official server from www.bonelab.fun' \
+HOST_HOLD_SEC=3600 \
+dotnet eos-join-probe/bin/Release/net8.0/EosJoinProbe.dll --host
+```
+
+Requires EOS SDK 1.15.5 ApiVersion patches: CreateLobby=8, AddAttribute=1 (see `patches/`).
+Appears in public Find / browsers as matchmaking metadata; joiners may fail P2P without a real Fusion host.

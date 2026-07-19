@@ -16,6 +16,10 @@ internal sealed class EosIdentity
 {
     public const string DefaultDisplayName = "bonelab.fun";
 
+    /// <summary>Prefer BOT_NICK env (host ADMIN / farm nick) over baked default.</summary>
+    public static string ActiveDisplayName =>
+        Environment.GetEnvironmentVariable("BOT_NICK") is { Length: > 0 } n ? n : DefaultDisplayName;
+
     public string InstallId { get; set; }
     public string EncryptionKey { get; set; }
     public string DisplayName { get; set; }
@@ -42,7 +46,7 @@ internal sealed class EosIdentity
                 var loaded = JsonSerializer.Deserialize<EosIdentity>(File.ReadAllText(path), JsonOpts);
                 if (loaded != null && !string.IsNullOrEmpty(loaded.EncryptionKey) && !string.IsNullOrEmpty(loaded.CacheDirectory))
                 {
-                    loaded.DisplayName = DefaultDisplayName; // migrate .ru → .online
+                    loaded.DisplayName = ActiveDisplayName;
                     Directory.CreateDirectory(loaded.CacheDirectory);
                     Console.WriteLine($"[identity] reuse install={loaded.InstallId} puid={loaded.ProductUserId ?? "?"} nick={loaded.DisplayName}");
                     Persist(loaded, path);
@@ -68,7 +72,7 @@ internal sealed class EosIdentity
         {
             InstallId = install,
             EncryptionKey = RandomHex(64),
-            DisplayName = DefaultDisplayName,
+            DisplayName = ActiveDisplayName,
             CacheDirectory = cache,
             CreatedUtc = DateTime.UtcNow,
             FreshMint = true,
@@ -141,7 +145,7 @@ internal sealed class EosIdentity
             return MintAndLogin(connect, id, model, tick);
         }
 
-        var (login, user, continuance) = DoLogin(connect, id.DisplayName ?? DefaultDisplayName, tick);
+        var (login, user, continuance) = DoLogin(connect, id.DisplayName ?? ActiveDisplayName, tick);
         Console.WriteLine($"[identity] Login(reuse): {login}");
 
         if (login == Result.Success && user != null)
@@ -156,7 +160,7 @@ internal sealed class EosIdentity
             id.ProductUserId = got;
             id.LastLoginUtc = DateTime.UtcNow;
             id.FreshMint = false;
-            id.DisplayName = DefaultDisplayName;
+            id.DisplayName = ActiveDisplayName;
             return user;
         }
 
@@ -167,7 +171,7 @@ internal sealed class EosIdentity
             id.ProductUserId = user.ToString();
             id.LastLoginUtc = DateTime.UtcNow;
             id.FreshMint = false;
-            id.DisplayName = DefaultDisplayName;
+            id.DisplayName = ActiveDisplayName;
             return user;
         }
 
@@ -189,7 +193,7 @@ internal sealed class EosIdentity
         if (create != Result.Success && create != Result.DuplicateNotAllowed)
             throw new InvalidOperationException("CreateDeviceId failed: " + create);
 
-        var (login, user, continuance) = DoLogin(connect, id.DisplayName ?? DefaultDisplayName, tick);
+        var (login, user, continuance) = DoLogin(connect, id.DisplayName ?? ActiveDisplayName, tick);
         Console.WriteLine($"[identity] Login(mint): {login}");
 
         if (login == Result.InvalidUser && continuance != null)
@@ -200,7 +204,7 @@ internal sealed class EosIdentity
         id.ProductUserId = user.ToString();
         id.LastLoginUtc = DateTime.UtcNow;
         id.FreshMint = false;
-        id.DisplayName = DefaultDisplayName;
+        id.DisplayName = ActiveDisplayName;
         return user;
     }
 

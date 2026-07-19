@@ -40,7 +40,11 @@ internal static class Program
 
     private static int Main(string[] args)
     {
-        // Default: full Fusion P2P voice path. Pass --rtc-only for old Lobby-RTC probe.
+        // Default: full Fusion P2P voice path.
+        // --host = headless CreateLobby listing (ReallyWorld experiment)
+        // --rtc-only = old Lobby-RTC probe
+        if (args.Any(a => a == "--host") || Env("FUSION_HOST_MODE", "0") == "1")
+            return FusionHostBot.Run();
         if (args.Any(a => a == "--rtc-only"))
             return RunRtcOnlyProbe();
         return FusionVoiceBot.Run();
