@@ -579,8 +579,9 @@ namespace MonsterPanel
             {
                 PlayerPages.Clear();
                 _rootPage.RemoveAll();
+                _rootPage.Color = new Color(0.35f, 0.85f, 0.95f);
 
-                _rootPage.CreateFunction("Refresh now", new Color(0.7f, 0.7f, 0.7f), (Action)(() =>
+                _rootPage.CreateFunction("Refresh", new Color(0.55f, 0.78f, 0.88f), (Action)(() =>
                 {
                     if (_pollCd > 0f && !_polling)
                     {
@@ -592,16 +593,24 @@ namespace MonsterPanel
                 }));
 
                 if (!string.IsNullOrEmpty(_lastError))
-                    InfoLine(_rootPage, "Err: " + SafeMenu(_lastError, 40), new Color(1f, 0.4f, 0.3f));
+                    Field(_rootPage, "Error", SafeMenu(_lastError, 40), new Color(1f, 0.4f, 0.3f));
 
                 lock (Gate)
                 {
                     if (Entries.Count == 0)
                     {
-                        InfoLine(_rootPage, "No tracked players", new Color(0.55f, 0.55f, 0.55f));
-                        InfoLine(_rootPage, "Tip: open player profile → Add", new Color(0.55f, 0.55f, 0.55f));
+                        Field(_rootPage, "Friends", "none yet", new Color(0.65f, 0.65f, 0.7f));
+                        Field(_rootPage, "Tip", "Fusion profile → Add to Tracking", new Color(0.55f, 0.55f, 0.55f));
                         return;
                     }
+
+                    int onlineN = 0;
+                    for (int i = 0; i < Entries.Count; i++)
+                    {
+                        if (Snapshots.TryGetValue(Entries[i].Pid, out var s) && s != null && s.Online)
+                            onlineN++;
+                    }
+                    Field(_rootPage, "Online", onlineN + " / " + Entries.Count, new Color(0.45f, 0.95f, 0.55f));
 
                     var order = new List<TrackedEntry>(Entries);
                     order.Sort((a, b) =>
@@ -616,10 +625,9 @@ namespace MonsterPanel
                     {
                         Snapshots.TryGetValue(e.Pid, out var snap);
                         string title = FormatListTitle(e, snap);
-                        Color col = snap != null && snap.Online
-                            ? new Color(0.35f, 1f, 0.45f)
-                            : new Color(0.65f, 0.65f, 0.7f);
-                        Page sub = _rootPage.CreatePage(title, col, 32, true);
+                        Color col = ListColor(snap);
+                        Page sub = _rootPage.CreatePage(title, col, 0, true);
+                        sub.Color = col;
                         PlayerPages[e.Pid] = sub;
                         FillPlayerPage(sub, e, snap);
                     }
@@ -631,67 +639,102 @@ namespace MonsterPanel
             }
         }
 
-        /// <summary>Read-only BoneMenu row — clicking does nothing (avoids fake "actions").</summary>
-        private static void InfoLine(Page page, string text, Color color)
+        /// <summary>
+        /// Profile-style row: label on the left, value on the right (BoneMenu StringElement).
+        /// Not an action button — callback is null so it only displays.
+        /// </summary>
+        private static void Field(Page page, string label, string value, Color color, string tooltip = null)
         {
-            page.CreateFunction(text, color, (Action)(() => { /* display only */ }));
+            string v = string.IsNullOrWhiteSpace(value) ? "—" : value;
+            var el = page.CreateString(label, color, SafeMenu(v, 42), null);
+            if (!string.IsNullOrEmpty(tooltip))
+                el.ElementTooltip = tooltip;
+        }
+
+        private static Color ListColor(TrackSnapshot snap)
+        {
+            if (snap == null) return new Color(0.75f, 0.7f, 0.35f);
+            if (!snap.Found) return new Color(1f, 0.55f, 0.35f);
+            if (snap.Online) return new Color(0.35f, 0.95f, 0.5f);
+            return new Color(0.62f, 0.62f, 0.68f);
         }
 
         private static void FillPlayerPage(Page page, TrackedEntry e, TrackSnapshot snap)
         {
             if (page == null) return;
             page.RemoveAll();
-            string name = SafeMenu(snap != null && !string.IsNullOrEmpty(snap.Name) ? snap.Name : e.Name);
-            InfoLine(page, "Name: " + name, Color.white);
-            InfoLine(page, "PID: " + ShortPid(e.Pid), new Color(1f, 0.45f, 0.45f));
 
+            string name = SafeMenu(snap != null && !string.IsNullOrEmpty(snap.Name) ? snap.Name : e.Name, 28);
+            page.Name = name;
+            page.Color = ListColor(snap);
+
+            // Left-style identity block (label | value), then JOIN — Fusion profile vibe.
+            Field(page, "Player", name, Color.white);
+            Field(page, "Platform ID", ShortPid(e.Pid), new Color(1f, 0.5f, 0.5f), e.Pid);
+
+            string statusText;
+            Color statusCol;
             if (snap == null)
             {
-                InfoLine(page, "Status: waiting poll…", new Color(0.8f, 0.8f, 0.4f));
+                statusText = "Waiting for poll…";
+                statusCol = new Color(0.85f, 0.8f, 0.4f);
             }
             else if (!snap.Found)
             {
-                InfoLine(page, "Status: not in DB", new Color(1f, 0.5f, 0.3f));
+                statusText = "Not in database";
+                statusCol = new Color(1f, 0.55f, 0.35f);
+            }
+            else if (snap.Online)
+            {
+                statusText = string.IsNullOrWhiteSpace(snap.Status) ? "IN GAME" : SafeMenu(snap.Status, 24);
+                statusCol = new Color(0.4f, 1f, 0.55f);
             }
             else
             {
-                InfoLine(page, "Status: " + SafeMenu(snap.Status),
-                    snap.Online ? new Color(0.4f, 1f, 0.5f) : new Color(0.75f, 0.75f, 0.75f));
-                InfoLine(page, "Server: " + SafeMenu(NullDash(snap.Server), 42), Color.white);
-                InfoLine(page, "Map: " + SafeMenu(NullDash(snap.Map), 42), Color.white);
-                InfoLine(page, "Language: " + SafeMenu(NullDash(snap.Language)), Color.white);
-                InfoLine(page, "Lobby: " + SafeMenu(NullDash(snap.LobbyCode)), new Color(0.6f, 0.85f, 1f));
-                InfoLine(page, "Playing: " + FormatSession(snap), Color.white);
-                InfoLine(page, "Last seen: " + FormatLastSeen(snap), Color.white);
+                statusText = "Offline";
+                statusCol = new Color(0.7f, 0.7f, 0.75f);
+            }
+            Field(page, "Status", statusText, statusCol);
 
-                string code = snap.LobbyCode;
-                bool canJoin = snap.Online && !string.IsNullOrWhiteSpace(code);
-                page.CreateFunction(
-                    canJoin ? "Join server" : "Join (no lobby code)",
-                    canJoin ? new Color(0.25f, 0.95f, 0.55f) : new Color(0.45f, 0.45f, 0.45f),
-                    (Action)(() =>
+            string code = snap != null ? snap.LobbyCode : null;
+            bool canJoin = snap != null && snap.Online && !string.IsNullOrWhiteSpace(code);
+            page.CreateFunction(
+                canJoin ? "JOIN" : "JOIN  (no lobby)",
+                canJoin ? new Color(0.2f, 0.95f, 0.55f) : new Color(0.4f, 0.4f, 0.42f),
+                (Action)(() =>
+                {
+                    if (!canJoin)
                     {
-                        if (!canJoin)
-                        {
-                            NotifyError("Join", "No lobby code yet — wait for scraper");
-                            return;
-                        }
-                        try
-                        {
-                            NetworkHelper.JoinServerByCode(code.Trim().ToUpperInvariant());
-                            Notify("Joining", SafeMenu(name) + " / " + code);
-                            MelonLogger.Msg("Tracking: JoinServerByCode " + code);
-                        }
-                        catch (Exception ex)
-                        {
-                            NotifyError("Join failed", ex.Message);
-                        }
-                    }));
+                        NotifyError("Join", snap != null && snap.Online
+                            ? "No lobby code yet — wait for scraper"
+                            : "Player is offline");
+                        return;
+                    }
+                    try
+                    {
+                        NetworkHelper.JoinServerByCode(code.Trim().ToUpperInvariant());
+                        Notify("Joining", name + " / " + code.Trim().ToUpperInvariant());
+                        MelonLogger.Msg("Tracking: JoinServerByCode " + code);
+                    }
+                    catch (Exception ex)
+                    {
+                        NotifyError("Join failed", ex.Message);
+                    }
+                }));
+
+            if (snap != null && snap.Found)
+            {
+                Field(page, "Server", NullDash(snap.Server), new Color(0.85f, 0.9f, 1f), snap.Server);
+                Field(page, "Map", NullDash(snap.Map), new Color(0.85f, 0.9f, 1f), snap.Map);
+                Field(page, "Language", NullDash(snap.Language), new Color(0.85f, 0.9f, 1f));
+                Field(page, "Lobby", NullDash(snap.LobbyCode), new Color(0.55f, 0.88f, 1f), snap.LobbyCode);
+                Field(page, "Session", FormatSession(snap), new Color(0.85f, 0.9f, 1f));
+                Field(page, "Last seen", FormatLastSeen(snap), new Color(0.85f, 0.9f, 1f));
             }
 
             string pid = e.Pid;
-            page.CreateFunction("Remove from Tracking", new Color(1f, 0.35f, 0.35f), (Action)(() => Remove(pid)));
-            page.CreateFunction("Back to list", new Color(0.7f, 0.7f, 0.75f), (Action)(() =>
+            page.CreateFunction("Remove", new Color(1f, 0.38f, 0.38f), (Action)(() => Remove(pid)));
+            page.CreateFunction("Back", new Color(0.65f, 0.68f, 0.75f), (Action)(() =>
             {
                 try { Menu.OpenPage(_rootPage); } catch { /* */ }
             }));
@@ -699,11 +742,11 @@ namespace MonsterPanel
 
         private static string FormatListTitle(TrackedEntry e, TrackSnapshot snap)
         {
-            string name = SafeMenu(snap != null && !string.IsNullOrEmpty(snap.Name) ? snap.Name : e.Name, 18);
-            if (snap == null) return "? " + name;
-            if (!snap.Found) return "! " + name;
-            if (snap.Online) return "* " + name;
-            return "- " + name;
+            string name = SafeMenu(snap != null && !string.IsNullOrEmpty(snap.Name) ? snap.Name : e.Name, 20);
+            if (snap == null) return name + "  ·  …";
+            if (!snap.Found) return name + "  ·  ?";
+            if (snap.Online) return name + "  ·  ONLINE";
+            return name + "  ·  offline";
         }
 
         private static string FormatSession(TrackSnapshot snap)
