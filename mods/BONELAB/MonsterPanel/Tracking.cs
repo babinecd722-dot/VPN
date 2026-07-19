@@ -14,7 +14,6 @@ using LabFusion.Marrow.Proxies;
 using LabFusion.Network;
 using LabFusion.Player;
 using LabFusion.UI.Popups;
-using LabFusion.Utilities;
 using MelonLoader;
 using UnityEngine;
 
@@ -23,6 +22,7 @@ namespace MonsterPanel
     /// <summary>
     /// Friend-style presence tracking for Fusion players.
     /// Local pid list in UserData → POST /v1/track every 10s → BoneMenu + Join by lobby_code.
+    /// No Fusion join/scene hooks and no auto popups on lobby enter (those caused OOB on Quest).
     /// </summary>
     internal static class Tracking
     {
@@ -33,22 +33,12 @@ namespace MonsterPanel
         private const float PollIntervalSec = 10f;
         private const int HttpTimeoutSeconds = 8;
         private const int MaxTracked = 32;
-        // With PID spoof: wait for spoof popup (~3.5s). Without: short settle, then notify.
-        private const float JoinNotifyDelayWithSpoofSec = 4.0f;
-        private const float JoinNotifyDelayNoSpoofSec = 0.5f;
-        private const float JoinNotifyGapSec = 0.6f;
-        private const float JoinNotifyCooldownSec = 8f;
 
         private static bool _enabled = true;
         private static bool _hooked;
         private static bool _menuHooked;
-        private static bool _joinHooked;
         private static bool _polling;
-        private static bool _joinNotifyRunning;
-        // One online-digest popup batch per Fusion session (reset on disconnect).
-        private static bool _fusionAlertDone;
         private static float _pollCd;
-        private static float _joinNotifyCd;
         private static string _lastError = "";
 
         private static readonly object Gate = new object();
@@ -92,10 +82,9 @@ namespace MonsterPanel
         {
             LoadList();
             InstallFusionProfileHook(harmony);
-            InstallJoinHooks();
             if (_enabled)
                 MelonCoroutines.Start(BootRoutine());
-            MelonLogger.Msg($"Tracking: enabled={_enabled} tracked={Entries.Count} api={ApiUrl}");
+            MelonLogger.Msg($"Tracking: enabled={_enabled} tracked={Entries.Count} api={ApiUrl} (no join alerts)");
         }
 
         public static void InstallMenu(Page root)
@@ -113,202 +102,12 @@ namespace MonsterPanel
 
         public static void Tick()
         {
-            if (_joinNotifyCd > 0f)
-                _joinNotifyCd -= Time.unscaledDeltaTime;
-
             if (!_enabled || Entries.Count == 0) return;
             if (Time.unscaledTime < _apiReadyAt) return;
             _pollCd -= Time.unscaledDeltaTime;
             if (_pollCd > 0f || _polling) return;
             _pollCd = PollIntervalSec;
             MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: true));
-        }
-
-        private static void InstallJoinHooks()
-        {
-            if (_joinHooked) return;
-            try
-            {
-                if (AccessTools.TypeByName("LabFusion.Utilities.MultiplayerHooking") == null)
-                    return;
-                MultiplayerHooking.OnJoinedServer += OnEnteredFusion;
-                MultiplayerHooking.OnStartedServer += OnEnteredFusion;
-                MultiplayerHooking.OnDisconnected += OnLeftFusion;
-                // Join-by-code often lands after scene load; only fire if already in a server.
-                MultiplayerHooking.OnMainSceneInitialized += OnSceneWhileInServer;
-                MultiplayerHooking.OnTargetLevelLoaded += OnSceneWhileInServer;
-                _joinHooked = true;
-                MelonLogger.Msg("Tracking: hooked Fusion join/start/scene/disconnect for online alerts");
-            }
-            catch (Exception e)
-            {
-                MelonLogger.Warning("Tracking join hook: " + e.Message);
-            }
-        }
-
-        private static void OnLeftFusion()
-        {
-            _fusionAlertDone = false;
-            _joinNotifyRunning = false;
-            _joinNotifyCd = 0f;
-            MelonLogger.Msg("Tracking: Fusion left — online alert armed for next join");
-        }
-
-        private static void OnSceneWhileInServer()
-        {
-            try
-            {
-                if (!NetworkInfo.HasServer) return;
-            }
-            catch { return; }
-            OnEnteredFusion();
-        }
-
-        private static void OnEnteredFusion()
-        {
-            if (!_enabled) return;
-            if (_fusionAlertDone || _joinNotifyRunning) return;
-            int count;
-            lock (Gate) { count = Entries.Count; }
-            if (count == 0) return;
-            MelonLogger.Msg("Tracking: Fusion enter — scheduling online alerts (once)");
-            MelonCoroutines.Start(OnlineAlertRoutine());
-        }
-
-        /// <summary>
-        /// On Fusion enter: notify each tracked player who is online.
-        /// Poll is inlined (MelonCoroutines does not reliably nest yield return IEnumerator).
-        /// </summary>
-        private static IEnumerator OnlineAlertRoutine()
-        {
-            if (_joinNotifyRunning || _fusionAlertDone) yield break;
-            _joinNotifyRunning = true;
-            _fusionAlertDone = true; // lock session immediately so scene reloads don't re-fire
-
-            try
-            {
-                bool spoofOn = false;
-                try { spoofOn = PidSpoof.Enabled; } catch { /* */ }
-
-                float wait = spoofOn ? JoinNotifyDelayWithSpoofSec : JoinNotifyDelayNoSpoofSec;
-                MelonLogger.Msg("Tracking: join alert wait " + wait.ToString("0.0", CultureInfo.InvariantCulture) + "s (spoof=" + spoofOn + ")");
-                float t = 0f;
-                while (t < wait)
-                {
-                    t += Time.unscaledDeltaTime;
-                    yield return null;
-                }
-
-                // Wait for any in-flight poll + API cooldown, then fetch inline.
-                float busy = 0f;
-                while ((_polling || Time.unscaledTime < _apiReadyAt) && busy < 20f)
-                {
-                    busy += Time.unscaledDeltaTime;
-                    yield return null;
-                }
-
-                List<string> pids;
-                lock (Gate)
-                {
-                    pids = new List<string>(Entries.Count);
-                    for (int i = 0; i < Entries.Count; i++)
-                        pids.Add(Entries[i].Pid);
-                }
-
-                if (pids.Count > 0)
-                {
-                    for (int attempt = 0; attempt < 6; attempt++)
-                    {
-                        while (Time.unscaledTime < _apiReadyAt)
-                            yield return null;
-
-                        Task<string> task = Task.Run(() => FetchTrackJson(pids));
-                        while (!task.IsCompleted) yield return null;
-                        try
-                        {
-                            string json = task.Result;
-                            if (json != null)
-                            {
-                                ApplyTrackJson(json);
-                                _lastError = "";
-                                break;
-                            }
-                        }
-                        catch (Exception e)
-                        {
-                            MelonLogger.Warning("Tracking alert poll: " + e.Message);
-                        }
-
-                        if (_lastHttpStatus == 429)
-                        {
-                            float delay = _retryAfterSec > 0.1f ? _retryAfterSec : 2.5f;
-                            _apiReadyAt = Time.unscaledTime + delay;
-                            continue;
-                        }
-                        break;
-                    }
-                }
-
-                List<string> online = new List<string>();
-                lock (Gate)
-                {
-                    foreach (var e in Entries)
-                    {
-                        if (!Snapshots.TryGetValue(e.Pid, out var snap) || snap == null)
-                            continue;
-                        if (!snap.Found || !snap.Online)
-                            continue;
-                        string nick = !string.IsNullOrWhiteSpace(snap.Name) ? snap.Name : e.Name;
-                        if (string.IsNullOrWhiteSpace(nick)) nick = ShortPid(e.Pid);
-                        online.Add(nick);
-                    }
-                }
-
-                if (online.Count == 0)
-                {
-                    MelonLogger.Msg("Tracking: join alert — no tracked players online (http=" + _lastHttpStatus + ")");
-                    yield break;
-                }
-
-                MelonLogger.Msg("Tracking: join alert — " + online.Count + " online (once this session)");
-                foreach (string nick in online)
-                {
-                    NotifyOnline(SafeMenu(nick));
-                    float g = 0f;
-                    while (g < JoinNotifyGapSec)
-                    {
-                        g += Time.unscaledDeltaTime;
-                        yield return null;
-                    }
-                }
-                _joinNotifyCd = JoinNotifyCooldownSec;
-            }
-            finally
-            {
-                _joinNotifyRunning = false;
-            }
-        }
-
-        private static void NotifyOnline(string nick)
-        {
-            MelonLogger.Msg("Tracking: " + nick + " is online");
-            // Same shape as working Notify() elsewhere — Title/Message as plain strings.
-            try
-            {
-                var n = new Notification();
-                n.Title = new NotificationText(nick, new Color(0.35f, 0.95f, 0.55f));
-                n.Message = new NotificationText("is online");
-                n.Type = NotificationType.SUCCESS;
-                n.ShowPopup = true;
-                n.SaveToMenu = true;
-                n.PopupLength = 4f;
-                Notifier.Send(n);
-            }
-            catch (Exception e)
-            {
-                MelonLogger.Warning("Tracking notify failed: " + e.Message);
-                Notify("Tracking", nick + " is online");
-            }
         }
 
         public static bool IsTracked(string pid)
@@ -923,8 +722,6 @@ namespace MonsterPanel
                         "Tracking: join OK — target=" + c +
                         " code=" + (got ?? "?") +
                         " t=" + t.ToString("0.0", CultureInfo.InvariantCulture) + "s");
-                    if (!_joinNotifyRunning && _joinNotifyCd <= 0f)
-                        MelonCoroutines.Start(OnlineAlertRoutine());
                     yield break;
                 }
                 yield return null;
