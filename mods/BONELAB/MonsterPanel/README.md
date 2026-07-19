@@ -106,20 +106,6 @@
   ресивер сработает и на входящий по тебе урон).
 - Если по какому-то врагу/объекту не сработает — скинь `Latest.log`, добавлю нужный тип.
 
-## PlayerDb (Fusion lobby → Postgres)
-
-При старте с LabFusion: popup **Database connected** / **Database not connected** (EN).
-В лобби тихо собирает `PlatformID` + ник всех **кроме себя** и пишет прямо в Postgres.
-Пароль вшит в DLL (обфускация). Отдельный ingest-сервер **не нужен**.
-
-### Установка на Quest
-
-Один файл в `MelonLoader/Mods/`:
-
-- `MonsterPanel.dll` (Npgsql уже вшит)
-
-На VPS ничего запускать не надо — только чтобы Postgres слушал `5432` снаружи (как сейчас).
-
 ## Пересборка
 
 Локальные DLL клади в `mods/BONELAB/MonsterPanel/refs/` (gitignored). См. `MonsterPanel.csproj`.

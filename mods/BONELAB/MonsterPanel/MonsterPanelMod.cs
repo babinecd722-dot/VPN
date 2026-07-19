@@ -18,7 +18,6 @@ using MHealth = Il2CppSLZ.Marrow.Health;
 
 [assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.4", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
-[assembly: MelonOptionalDependencies("Npgsql", "Microsoft.Extensions.Logging.Abstractions", "Microsoft.Extensions.DependencyInjection.Abstractions")]
 
 namespace MonsterPanel
 {
@@ -82,13 +81,11 @@ namespace MonsterPanel
 
         public override void OnInitializeMelon()
         {
-            EmbeddedDeps.Install(); // single-file: Npgsql loaded from embedded resources
             _fusionLoaded = Teleporter.FusionLoaded;
             if (_fusionLoaded)
             {
                 PidSpoof.Init(HarmonyInstance); // Spoofing PID: hook SetPlatformID + restore saved state
                 FusionCleanup.Install(HarmonyInstance); // Fusion Admin → Cleanup → Despawn All (non-host too)
-                PlayerDb.Init(); // lobby PID/name → Postgres (creds obfuscated in DLL)
             }
             AntiManip.Install(HarmonyInstance); // silent Dev Manipulator immunity (no UI)
             BuildMenu();
@@ -109,7 +106,6 @@ namespace MonsterPanel
                 Guards.Tick();
                 NetLightning.Tick();   // авто-удаление отживших сетевых молний
                 AdminNick.Tick();      // OWNER/dev-gold shimmer nametag (metadata @ ~10 Hz)
-                PlayerDb.Tick();       // silent async lobby scrape → ingest
             }
             else
             {

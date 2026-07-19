@@ -28,15 +28,4 @@
     <Reference Include="LabFusion"><HintPath>refs/LabFusion.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
 
-  <ItemGroup>
-    <PackageReference Include="Npgsql" Version="8.0.7" />
-  </ItemGroup>
-
-  <!-- Ship as one Mods/MonsterPanel.dll — deps embedded, resolved at runtime -->
-  <ItemGroup>
-    <EmbeddedResource Include="deps\Npgsql.dll" LogicalName="MonsterPanel.Embedded.Npgsql.dll" />
-    <EmbeddedResource Include="deps\Microsoft.Extensions.Logging.Abstractions.dll" LogicalName="MonsterPanel.Embedded.Microsoft.Extensions.Logging.Abstractions.dll" />
-    <EmbeddedResource Include="deps\Microsoft.Extensions.DependencyInjection.Abstractions.dll" LogicalName="MonsterPanel.Embedded.Microsoft.Extensions.DependencyInjection.Abstractions.dll" />
-  </ItemGroup>
-
 </Project>
