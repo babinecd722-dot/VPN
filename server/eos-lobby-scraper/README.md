@@ -12,6 +12,7 @@ Headless bot: EOS DeviceId login → sharded `FindLobbies` (privacy × Full, aut
 |---|---|---|
 | `server` | `lobbyName` | `NULL` |
 | `server_map` | `levelTitle` | `NULL` |
+| `lobby_code` | current lobby `LobbyCode`, or `NULL` if the lobby has none | `NULL` |
 
 Coverage: privacy buckets `PUBLIC/FRIENDS/PRIVATE/LOCKED` × `Full` true/false (+ catch-all without `Full`). If any Find returns `200` (EOS cap), that shard expands over `VersionMajor=1` + `VersionMinor=0..SHARD_VERSION_MINOR_MAX`. Private notes: Fusion hides PRIVATE/LOCKED from the browser; we still Find them. Codes are 8×`[A-Z0-9]` — not brute-forceable; harvested codes are re-probed (`CODE_PROBE_BUDGET`).
 
