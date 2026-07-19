@@ -7,6 +7,7 @@ using System.Net.Http;
 using System.Text;
 using System.Threading.Tasks;
 using BoneLib.BoneMenu;
+using BoneLib.BoneMenu.UI;
 using HarmonyLib;
 using LabFusion.Entities;
 using LabFusion.Menu;
@@ -17,6 +18,8 @@ using LabFusion.UI.Popups;
 using LabFusion.Utilities;
 using MelonLoader;
 using UnityEngine;
+using UnityEngine.Events;
+using UnityEngine.UI;
 
 namespace MonsterPanel
 {
@@ -764,25 +767,33 @@ namespace MonsterPanel
             yield return null;
             try
             {
-                Type guiMenuType = AccessTools.TypeByName("BoneLib.BoneMenu.UI.GUIMenu");
+                if (GUIMenu.Instance == null) yield break;
+                Transform root = GUIMenu.Instance.transform.Find("Dialog");
+                if (root == null || !root.gameObject.activeInHierarchy) yield break;
+
                 Type tmpType = AccessTools.TypeByName("TMPro.TextMeshProUGUI")
                     ?? AccessTools.TypeByName("Il2CppTMPro.TextMeshProUGUI");
-                if (guiMenuType == null || tmpType == null) yield break;
+                if (tmpType != null)
+                {
+                    if (!string.IsNullOrEmpty(acceptLabel))
+                        SetChildTmpText(root, "Container/ButtonGroup/Option1", tmpType, acceptLabel);
+                    if (!string.IsNullOrEmpty(denyLabel))
+                        SetChildTmpText(root, "Container/ButtonGroup/Option2", tmpType, denyLabel);
+                }
 
-                object inst = AccessTools.Property(guiMenuType, "Instance")?.GetValue(null);
-                if (inst == null) yield break;
-                object guiDlg = AccessTools.Field(guiMenuType, "_guiDialog")?.GetValue(inst);
-                if (guiDlg == null) yield break;
-
-                var goProp = AccessTools.Property(guiDlg.GetType(), "gameObject");
-                var go = goProp?.GetValue(guiDlg) as GameObject;
-                if (go == null || !go.activeInHierarchy) yield break;
-
-                Transform root = go.transform;
-                if (!string.IsNullOrEmpty(acceptLabel))
-                    SetChildTmpText(root, "Container/ButtonGroup/Option1", tmpType, acceptLabel);
-                if (!string.IsNullOrEmpty(denyLabel))
-                    SetChildTmpText(root, "Container/ButtonGroup/Option2", tmpType, denyLabel);
+                // BoneLib Close (Header/Toggle) also fired Decline (= Delete). Rewire to close only.
+                Transform closeT = root.Find("Header/Toggle");
+                Button closeBtn = closeT != null ? closeT.GetComponent<Button>() : null;
+                if (closeBtn != null)
+                {
+                    GameObject dialogGo = root.gameObject;
+                    ((UnityEventBase)(object)closeBtn.onClick).RemoveAllListeners();
+                    ((UnityEvent)(object)closeBtn.onClick).AddListener((UnityAction)(Action)(() =>
+                    {
+                        dialogGo.SetActive(false);
+                        try { GUIMenu.Instance.ShowView(); } catch { /* */ }
+                    }));
+                }
             }
             catch (Exception e)
             {
@@ -794,7 +805,6 @@ namespace MonsterPanel
         {
             Transform t = root.Find(path);
             if (t == null) return;
-            // Walk children — avoid GetComponentsInChildren(System.Type) vs Il2CppSystem.Type mismatch.
             var textProp = AccessTools.Property(tmpType, "text");
             if (textProp == null || !textProp.CanWrite) return;
             Component[] all = t.GetComponentsInChildren<Component>(true);
