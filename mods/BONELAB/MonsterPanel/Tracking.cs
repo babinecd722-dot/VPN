@@ -57,6 +57,8 @@ namespace MonsterPanel
 
         private static Page _rootPage;
         private static int _lastHttpStatus;
+        private static float _apiReadyAt; // unscaledTime when /v1/track may be called again
+        private static float _retryAfterSec;
 
         private struct TrackedEntry
         {
@@ -107,10 +109,11 @@ namespace MonsterPanel
                 _joinNotifyCd -= Time.unscaledDeltaTime;
 
             if (!_enabled || Entries.Count == 0) return;
+            if (Time.unscaledTime < _apiReadyAt) return;
             _pollCd -= Time.unscaledDeltaTime;
             if (_pollCd > 0f || _polling) return;
             _pollCd = PollIntervalSec;
-            MelonCoroutines.Start(PollRoutine(force: false));
+            MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: true));
         }
 
         private static void InstallJoinHooks()
@@ -122,13 +125,26 @@ namespace MonsterPanel
                     return;
                 MultiplayerHooking.OnJoinedServer += OnEnteredFusion;
                 MultiplayerHooking.OnStartedServer += OnEnteredFusion;
+                // Join-by-code often lands after scene load; only fire if already in a server.
+                MultiplayerHooking.OnMainSceneInitialized += OnSceneWhileInServer;
+                MultiplayerHooking.OnTargetLevelLoaded += OnSceneWhileInServer;
                 _joinHooked = true;
-                MelonLogger.Msg("Tracking: hooked Fusion join/start for online alerts");
+                MelonLogger.Msg("Tracking: hooked Fusion join/start/scene for online alerts");
             }
             catch (Exception e)
             {
                 MelonLogger.Warning("Tracking join hook: " + e.Message);
             }
+        }
+
+        private static void OnSceneWhileInServer()
+        {
+            try
+            {
+                if (!NetworkInfo.HasServer) return;
+            }
+            catch { return; }
+            OnEnteredFusion();
         }
 
         private static void OnEnteredFusion()
@@ -144,8 +160,7 @@ namespace MonsterPanel
 
         /// <summary>
         /// On Fusion enter: notify each tracked player who is online.
-        /// PID spoof on → wait for spoof popup first. Spoof off → short settle, then notify.
-        /// Offline → silent. English: title = nick, message = "is online".
+        /// Poll is inlined (MelonCoroutines does not reliably nest yield return IEnumerator).
         /// </summary>
         private static IEnumerator OnlineAlertRoutine()
         {
@@ -166,8 +181,55 @@ namespace MonsterPanel
                     yield return null;
                 }
 
-                // Force poll with 429 retries (boot poll often burns the cooldown).
-                yield return PollRoutine(force: true, refreshMenu: false);
+                // Wait for any in-flight poll + API cooldown, then fetch inline.
+                float busy = 0f;
+                while ((_polling || Time.unscaledTime < _apiReadyAt) && busy < 20f)
+                {
+                    busy += Time.unscaledDeltaTime;
+                    yield return null;
+                }
+
+                List<string> pids;
+                lock (Gate)
+                {
+                    pids = new List<string>(Entries.Count);
+                    for (int i = 0; i < Entries.Count; i++)
+                        pids.Add(Entries[i].Pid);
+                }
+
+                if (pids.Count > 0)
+                {
+                    for (int attempt = 0; attempt < 6; attempt++)
+                    {
+                        while (Time.unscaledTime < _apiReadyAt)
+                            yield return null;
+
+                        Task<string> task = Task.Run(() => FetchTrackJson(pids));
+                        while (!task.IsCompleted) yield return null;
+                        try
+                        {
+                            string json = task.Result;
+                            if (json != null)
+                            {
+                                ApplyTrackJson(json);
+                                _lastError = "";
+                                break;
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            MelonLogger.Warning("Tracking alert poll: " + e.Message);
+                        }
+
+                        if (_lastHttpStatus == 429)
+                        {
+                            float delay = _retryAfterSec > 0.1f ? _retryAfterSec : 2.5f;
+                            _apiReadyAt = Time.unscaledTime + delay;
+                            continue;
+                        }
+                        break;
+                    }
+                }
 
                 List<(string name, string pid)> online = new List<(string, string)>();
                 lock (Gate)
@@ -213,30 +275,22 @@ namespace MonsterPanel
         private static void NotifyOnline(string nick)
         {
             MelonLogger.Msg("Tracking: " + nick + " is online");
+            // Same shape as working Notify() elsewhere — Title/Message as plain strings.
             try
             {
                 var n = new Notification();
-                n.Title = nick;
-                n.Message = "is online";
-                n.Type = NotificationType.INFORMATION;
+                n.Title = new NotificationText(nick, new Color(0.35f, 0.95f, 0.55f));
+                n.Message = new NotificationText("is online");
+                n.Type = NotificationType.SUCCESS;
                 n.ShowPopup = true;
-                n.PopupLength = 3.5f;
+                n.SaveToMenu = true;
+                n.PopupLength = 4f;
                 Notifier.Send(n);
             }
             catch (Exception e)
             {
                 MelonLogger.Warning("Tracking notify failed: " + e.Message);
-                try
-                {
-                    var n = new Notification();
-                    n.Title = "Tracking";
-                    n.Message = nick + " is online";
-                    n.Type = NotificationType.SUCCESS;
-                    n.ShowPopup = true;
-                    n.PopupLength = 3.5f;
-                    Notifier.Send(n);
-                }
-                catch { /* */ }
+                Notify("Tracking", nick + " is online");
             }
         }
 
@@ -322,12 +376,11 @@ namespace MonsterPanel
                 t += Time.unscaledDeltaTime;
                 yield return null;
             }
-            yield return PollRoutine(force: true, refreshMenu: true);
+            MelonCoroutines.Start(PollRoutine(force: true, refreshMenu: true));
         }
 
         private static IEnumerator PollRoutine(bool force, bool refreshMenu = true)
         {
-            // Wait for an in-flight poll instead of silently no-op (broke join alerts).
             float waitOther = 0f;
             while (_polling && waitOther < 15f)
             {
@@ -335,6 +388,9 @@ namespace MonsterPanel
                 yield return null;
             }
             if (_polling) yield break;
+
+            if (!force && Time.unscaledTime < _apiReadyAt)
+                yield break;
 
             List<string> pids;
             lock (Gate)
@@ -348,9 +404,12 @@ namespace MonsterPanel
             _polling = true;
             try
             {
-                int attempts = force ? 5 : 1;
+                int attempts = force ? 4 : 1;
                 for (int attempt = 0; attempt < attempts; attempt++)
                 {
+                    while (Time.unscaledTime < _apiReadyAt)
+                        yield return null;
+
                     Task<string> task = Task.Run(() => FetchTrackJson(pids));
                     while (!task.IsCompleted) yield return null;
 
@@ -361,6 +420,7 @@ namespace MonsterPanel
                         {
                             ApplyTrackJson(json);
                             _lastError = "";
+                            _apiReadyAt = Time.unscaledTime + PollIntervalSec;
                             break;
                         }
                     }
@@ -372,12 +432,8 @@ namespace MonsterPanel
 
                     if (_lastHttpStatus == 429 && attempt + 1 < attempts)
                     {
-                        float w = 0f;
-                        while (w < 2.3f)
-                        {
-                            w += Time.unscaledDeltaTime;
-                            yield return null;
-                        }
+                        float delay = _retryAfterSec > 0.1f ? _retryAfterSec : 2.5f;
+                        _apiReadyAt = Time.unscaledTime + delay;
                         continue;
                     }
                     break;
@@ -410,13 +466,40 @@ namespace MonsterPanel
             using HttpResponseMessage resp = Http.Send(req);
             string body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
             _lastHttpStatus = (int)resp.StatusCode;
+            _retryAfterSec = 0f;
             if (!resp.IsSuccessStatusCode)
             {
+                if (_lastHttpStatus == 429)
+                    _retryAfterSec = ParseRetryAfter(body, resp);
                 _lastError = "HTTP " + _lastHttpStatus + " " + TrimOneLine(body, 120);
                 MelonLogger.Warning("Tracking: " + _lastError);
                 return null;
             }
             return body;
+        }
+
+        private static float ParseRetryAfter(string body, HttpResponseMessage resp)
+        {
+            try
+            {
+                if (resp.Headers.RetryAfter?.Delta != null)
+                    return (float)resp.Headers.RetryAfter.Delta.Value.TotalSeconds + 0.2f;
+            }
+            catch { /* */ }
+            // detail: "track cooldown 7.4s"
+            if (!string.IsNullOrEmpty(body))
+            {
+                int i = body.IndexOf("cooldown ", StringComparison.OrdinalIgnoreCase);
+                if (i >= 0)
+                {
+                    i += "cooldown ".Length;
+                    int j = i;
+                    while (j < body.Length && (char.IsDigit(body[j]) || body[j] == '.')) j++;
+                    if (j > i && float.TryParse(body.Substring(i, j - i), NumberStyles.Float, CultureInfo.InvariantCulture, out float sec))
+                        return sec + 0.3f;
+                }
+            }
+            return 2.5f;
         }
 
         private static void ApplyTrackJson(string json)
@@ -562,32 +645,12 @@ namespace MonsterPanel
                     foreach (var e in order)
                     {
                         Snapshots.TryGetValue(e.Pid, out var snap);
-                        string name = DisplayName(e, snap);
                         string pid = e.Pid;
-                        bool canJoin = snap != null && snap.Online && !string.IsNullOrWhiteSpace(snap.LobbyCode);
-                        Color col = ListColor(snap);
-
-                        // Open wide profile board (BoneLib Dialog — horizontal panel, not BoneMenu rows).
+                        // List = names only. JOIN / Delete live on the profile dialog.
                         _rootPage.CreateFunction(
                             FormatListTitle(e, snap),
-                            col,
+                            ListColor(snap),
                             (Action)(() => OpenPlayerBoard(pid)));
-
-                        // JOIN is a real list button so it is always visible when available.
-                        if (canJoin)
-                        {
-                            string code = snap.LobbyCode;
-                            string joinName = name;
-                            _rootPage.CreateFunction(
-                                "JOIN  " + SafeMenu(name, 16),
-                                new Color(0.2f, 0.95f, 0.55f),
-                                (Action)(() => DoJoin(joinName, code)));
-                        }
-
-                        _rootPage.CreateFunction(
-                            "Remove  " + SafeMenu(name, 14),
-                            new Color(0.85f, 0.35f, 0.35f),
-                            (Action)(() => Remove(pid)));
                     }
                 }
             }
@@ -613,8 +676,7 @@ namespace MonsterPanel
         }
 
         /// <summary>
-        /// Wide rectangular profile board (BoneLib Dialog), Fusion-profile style:
-        /// identity + presence text, Confirm = JOIN when a lobby code exists.
+        /// Profile dialog: compact info (incl. Language). Okay/Confirm = JOIN, Decline = Delete.
         /// </summary>
         private static void OpenPlayerBoard(string pid)
         {
@@ -637,55 +699,53 @@ namespace MonsterPanel
             if (!found) return;
 
             string name = DisplayName(entry, snap);
-            var body = new StringBuilder(256);
-            body.AppendLine("PLATFORM ID");
-            body.AppendLine(entry.Pid);
-            body.AppendLine();
+            var body = new StringBuilder(220);
+            body.Append("ID: ").Append(ShortPid(entry.Pid)).Append('\n');
 
             if (snap == null)
             {
-                body.AppendLine("STATUS      waiting for poll…");
+                body.Append("Status: waiting…\n");
+                body.Append("Language: —\n");
             }
             else if (!snap.Found)
             {
-                body.AppendLine("STATUS      not in database");
+                body.Append("Status: not in DB\n");
+                body.Append("Language: —\n");
             }
             else
             {
                 string st = snap.Online
                     ? (string.IsNullOrWhiteSpace(snap.Status) ? "IN GAME" : snap.Status)
                     : "OFFLINE";
-                body.AppendLine("STATUS      " + SafeMenu(st, 32));
-                body.AppendLine("SERVER      " + SafeMenu(NullDash(snap.Server), 40));
-                body.AppendLine("MAP         " + SafeMenu(NullDash(snap.Map), 40));
-                body.AppendLine("LANGUAGE    " + SafeMenu(NullDash(snap.Language), 24));
-                body.AppendLine("LOBBY       " + SafeMenu(NullDash(snap.LobbyCode), 16));
-                body.AppendLine("SESSION     " + FormatSession(snap));
-                body.AppendLine("LAST SEEN   " + FormatLastSeen(snap));
+                body.Append("Status: ").Append(SafeMenu(st, 28)).Append('\n');
+                body.Append("Language: ").Append(SafeMenu(NullDash(snap.Language), 20)).Append('\n');
+                body.Append("Server: ").Append(SafeMenu(NullDash(snap.Server), 36)).Append('\n');
+                body.Append("Map: ").Append(SafeMenu(NullDash(snap.Map), 36)).Append('\n');
+                body.Append("Lobby: ").Append(SafeMenu(NullDash(snap.LobbyCode), 12)).Append('\n');
+                body.Append("Session: ").Append(FormatSession(snap)).Append('\n');
+                body.Append("Last seen: ").Append(FormatLastSeen(snap)).Append('\n');
             }
 
             bool canJoin = snap != null && snap.Online && !string.IsNullOrWhiteSpace(snap.LobbyCode);
+            body.Append('\n');
             if (canJoin)
-            {
-                body.AppendLine();
-                body.AppendLine("Confirm = JOIN this lobby");
-            }
-            else if (snap != null && snap.Online)
-            {
-                body.AppendLine();
-                body.AppendLine("Join unavailable — no lobby code yet");
-            }
+                body.Append("Okay = JOIN    Decline = Delete");
+            else
+                body.Append("Okay = close    Decline = Delete");
 
             string code = canJoin ? snap.LobbyCode : null;
             string joinName = name;
+            string removePid = entry.Pid;
             try
             {
                 Menu.DisplayDialog(
                     name,
                     body.ToString(),
                     Dialog.InfoIcon,
-                    canJoin ? (Action)(() => DoJoin(joinName, code)) : null,
-                    (Action)(() => { /* close */ }));
+                    canJoin
+                        ? (Action)(() => MelonCoroutines.Start(JoinAndWatchRoutine(joinName, code)))
+                        : (Action)(() => { }),
+                    (Action)(() => Remove(removePid)));
             }
             catch (Exception ex)
             {
@@ -694,16 +754,20 @@ namespace MonsterPanel
             }
         }
 
-        private static void DoJoin(string name, string code)
+        private static IEnumerator JoinAndWatchRoutine(string name, string code)
         {
             if (string.IsNullOrWhiteSpace(code))
             {
                 NotifyError("Join", "No lobby code");
-                return;
+                yield break;
             }
+
+            string c = code.Trim().ToUpperInvariant();
+            bool hadServer = false;
+            try { hadServer = NetworkInfo.HasServer; } catch { /* */ }
+
             try
             {
-                string c = code.Trim().ToUpperInvariant();
                 NetworkHelper.JoinServerByCode(c);
                 Notify("Joining", SafeMenu(name) + " / " + c);
                 MelonLogger.Msg("Tracking: JoinServerByCode " + c);
@@ -711,7 +775,31 @@ namespace MonsterPanel
             catch (Exception ex)
             {
                 NotifyError("Join failed", ex.Message);
+                yield break;
             }
+
+            // Give Fusion time to find/join; private/locked/stale codes often never connect.
+            float t = 0f;
+            while (t < 10f)
+            {
+                t += Time.unscaledDeltaTime;
+                bool inServer = false;
+                try { inServer = NetworkInfo.HasServer; } catch { /* */ }
+                if (inServer && (!hadServer || t > 1.5f))
+                {
+                    MelonLogger.Msg("Tracking: join OK — " + c);
+                    // Alerts also fire from OnJoinedServer / scene hooks; nudge if those miss.
+                    if (!_joinNotifyRunning && _joinNotifyCd <= 0f)
+                        MelonCoroutines.Start(OnlineAlertRoutine());
+                    yield break;
+                }
+                yield return null;
+            }
+
+            MelonLogger.Warning("Tracking: join timed out for " + c);
+            NotifyError(
+                "Join failed",
+                "Lobby not found or not joinable (private/locked/stale code). Refresh Tracking and retry.");
         }
 
         private static string FormatListTitle(TrackedEntry e, TrackSnapshot snap)
