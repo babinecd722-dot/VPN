@@ -122,7 +122,9 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now "${SERVICE_NAME}.service"
+systemctl enable "${SERVICE_NAME}.service"
+# enable --now does NOT reload an already-running unit — force new dll into memory
+systemctl restart "${SERVICE_NAME}.service"
 sleep 1
 systemctl --no-pager --full status "${SERVICE_NAME}.service" || true
 
