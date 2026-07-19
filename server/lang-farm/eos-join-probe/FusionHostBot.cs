@@ -285,6 +285,24 @@ internal static class FusionHostBot
                 $"[host] LobbyInfo bytes={Encoding.UTF8.GetByteCount(lobbyInfo)} " +
                 $"shown={shown}/{MaxMembers} full={full} attrs_ok_so_far={ok}");
             Attr("LobbyInfo", lobbyInfo);
+            if (!pulse)
+            {
+                try
+                {
+                    using var doc = System.Text.Json.JsonDocument.Parse(lobbyInfo);
+                    var players = doc.RootElement.GetProperty("playerList").GetProperty("players");
+                    var bits = new System.Collections.Generic.List<string>();
+                    foreach (var pl in players.EnumerateArray())
+                    {
+                        string u = pl.GetProperty("username").GetString();
+                        string a = pl.GetProperty("avatarTitle").GetString();
+                        int mid = pl.GetProperty("avatarModID").GetInt32();
+                        bits.Add($"{u}|{a}|{mid}");
+                    }
+                    Console.WriteLine("[host] roster: " + string.Join(" ; ", bits));
+                }
+                catch (Exception ex) { Console.WriteLine("[host] roster parse: " + ex.Message); }
+            }
             Console.WriteLine($"[host] attributes ok={ok} fail={fail}");
 
             var apply = new UpdateLobbyOptions { LobbyModificationHandle = mod };
@@ -512,8 +530,55 @@ internal static class FusionHostBot
         return Math.Clamp(Math.Max(real, DisplayPlayers), 1, MaxMembers);
     }
 
+    // Realistic Quest-style nicks sampled from our client_data (not bots).
+    private static readonly string[] FakeNickPool =
+    {
+        "solarwalker527", "HeyGunner", "nuggetreal", "Jayvr", "gmpan",
+        "gekko", "Zeldon6367", "Glub", "friskalisk", "french",
+        "guy_010", "Chilaquiles_VR", "Linodergamer", "Zenny", "peanut",
+        "Vraptor10", "AIDEN", "Trylix", "quietone", "fzitsalex",
+        "clowny47", "nickai", "GamerKid20", "dagoat", "Biggins",
+        "veil", "Nosbik", "deftimes13", "skelly", "toast",
+        "astro", "coolguy", "DexterFetch", "dino", "bobby",
+        "ghost", "luke", "cam", "blue", "Ace",
+    };
+
+    // Vanilla content avatars (mod.io id = -1) + popular public mod.io avatar mods seen in live lobbies.
+    private static readonly (string Title, int ModId)[] VanillaAvatars =
+    {
+        ("Ford", -1),
+        ("Ford", -1),
+        ("PolyBlank", -1),
+        ("Strong", -1),
+    };
+
+    private static readonly (string Title, int ModId)[] ModAvatars =
+    {
+        ("Koffee", 4518835),
+        ("Charple Charlie", 5251392),
+        ("Ford NikeTech", 5476781),
+        ("Gunslinger Ford", 5977616),
+        ("Fat Ford", 5574456),
+        ("Ford (BlackTrey)", 5602466),
+        ("Super-Ford", 6119996),
+        ("Male Hoodie Peasant (ST1, Half Life)", 6002577),
+        ("Jason Part 6", 6114112),
+        ("Albert Wesker (The Mastermind)", 6139862),
+        ("MD Serial Designation N", 5017189),
+        ("Spider-Man (Black Suit)", 6117575),
+        ("Cardboard Buddy", 4295722),
+        ("GTAV Franklin", 4576665),
+        ("The Joker (Batman Arkham Asylum)", 5216927),
+        ("WW1 German Soldier", 5779160),
+        ("Arthur Morgan-Winter", 6160920),
+        ("Nullbody Agent (Fancy)", 3131330),
+        ("Jacket", 3417924),
+        ("Mahoraga", 5662756),
+    };
+
     private static object[] BuildPlayerListObjects(string hostPuid)
     {
+        // Host preview: vanilla Ford looks official.
         var list = new List<object>
         {
             new Dictionary<string, object>
@@ -523,7 +588,7 @@ internal static class FusionHostBot
                 ["nickname"] = BotNick,
                 ["description"] = LobbyDesc,
                 ["permissionLevel"] = 2,
-                ["avatarTitle"] = "Strong",
+                ["avatarTitle"] = "Ford",
                 ["avatarModID"] = -1,
             },
         };
@@ -537,16 +602,18 @@ internal static class FusionHostBot
                 ["nickname"] = name,
                 ["description"] = "",
                 ["permissionLevel"] = 0,
-                ["avatarTitle"] = "Strong",
+                ["avatarTitle"] = "Ford",
                 ["avatarModID"] = -1,
             });
         }
         // Pad LobbyInfo only — no EOS members, no P2P, no CPU. Stable fake IDs per lobby code.
         int need = ShownPlayerCount() - list.Count;
+        // ~40% vanilla Ford/PolyBlank/Strong, ~60% popular mod.io avatars.
         for (int i = 0; i < need; i++)
         {
             string fakeId = FakePlatformId(_lobbyCode, i);
-            string fakeName = FakeDisplayName(i);
+            string fakeName = FakeDisplayName(_lobbyCode, i);
+            var av = PickAvatar(_lobbyCode, i);
             list.Add(new Dictionary<string, object>
             {
                 ["platformID"] = fakeId,
@@ -554,8 +621,8 @@ internal static class FusionHostBot
                 ["nickname"] = fakeName,
                 ["description"] = "",
                 ["permissionLevel"] = 0,
-                ["avatarTitle"] = "Strong",
-                ["avatarModID"] = -1,
+                ["avatarTitle"] = av.Title,
+                ["avatarModID"] = av.ModId,
             });
         }
         return list.ToArray();
@@ -572,15 +639,21 @@ internal static class FusionHostBot
         return sb.ToString()[..32];
     }
 
-    private static string FakeDisplayName(int index)
+    private static string FakeDisplayName(string seed, int index)
     {
-        // Quiet filler nicks — browser padding only, not real sessions.
-        string[] pool =
-        {
-            "visitor", "parkgoer", "halfway", "quietone", "spectate",
-            "rookie", "regular", "passerby",
-        };
-        return pool[index % pool.Length] + (index >= pool.Length ? (index + 1).ToString() : "");
+        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes($"nick|{seed}|{index}"));
+        int pick = hash[0] | (hash[1] << 8);
+        return FakeNickPool[pick % FakeNickPool.Length];
+    }
+
+    private static (string Title, int ModId) PickAvatar(string seed, int index)
+    {
+        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes($"av|{seed}|{index}"));
+        // First ~2 of every 5 pads → vanilla Ford/PolyBlank/Strong; rest → mod.io.
+        bool vanilla = (hash[0] % 5) < 2;
+        if (vanilla)
+            return VanillaAvatars[hash[1] % VanillaAvatars.Length];
+        return ModAvatars[hash[1] % ModAvatars.Length];
     }
 
     private static void HandleHostPacket(P2PInterface p2p, ProductUserId peer, byte[] buf, int len)
