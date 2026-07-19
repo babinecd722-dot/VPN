@@ -48,7 +48,6 @@ namespace MonsterPanel
         private static readonly HttpClient Http = CreateHttp();
 
         private static Page _rootPage;
-        private static Page _listPage;
 
         private struct TrackedEntry
         {
@@ -341,9 +340,9 @@ namespace MonsterPanel
             }
         }
 
-        private static void OnPageOpened(Page opened)
+            private static void OnPageOpened(Page opened)
         {
-            if (opened == _rootPage || opened == _listPage)
+            if (opened == _rootPage)
                 RebuildMenu();
         }
 
@@ -549,7 +548,7 @@ namespace MonsterPanel
                 Color color = tracked ? new Color(1f, 0.4f, 0.35f) : new Color(0.35f, 0.9f, 1f);
                 string pidCopy = pid;
                 string nameCopy = username;
-                group.AddElement<FunctionElement>(label)
+                group.AddElement<LabFusion.Marrow.Proxies.FunctionElement>(label)
                     .WithColor(color)
                     .Do(() =>
                     {
