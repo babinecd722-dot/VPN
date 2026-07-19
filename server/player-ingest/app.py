@@ -29,6 +29,9 @@ _TRACK_MIN_INTERVAL_SEC = 10.0
 _GHOST_TTL = timedelta(seconds=90)
 _GHOST_TTL_SEC = 90
 _GHOST_SWEEP_SEC = 10.0
+# If a single sweep would wipe more than this fraction of active rows, skip —
+# almost always a scraper blip/restart, not a real mass logout (prevents "0 online").
+_GHOST_SWEEP_COLLAPSE_RATIO = 0.35
 
 
 class Settings(BaseSettings):
@@ -49,11 +52,39 @@ _last_sweep: dict[str, Any] = {"at": None, "offline": 0}
 
 
 def _ghost_sweep_once() -> int:
-    """Force-OFFLINE any active row with null/stale last_seen. Independent of scraper."""
+    """Force-OFFLINE stale active rows. Skip mass-wipe when scrape blip would zero the board."""
     assert pool is not None
     with pool.connection() as conn:
         with conn.transaction():
             with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                      count(*) FILTER (
+                        WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')
+                      ) AS active,
+                      count(*) FILTER (
+                        WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')
+                          AND (
+                                last_seen_at IS NULL
+                                OR last_seen_at < NOW() - make_interval(secs => %s)
+                              )
+                      ) AS stale
+                    FROM client_data
+                    """,
+                    (_GHOST_TTL_SEC,),
+                )
+                row = cur.fetchone() or {}
+                active = int(row.get("active") or 0)
+                stale = int(row.get("stale") or 0)
+                if active > 20 and stale >= max(1, int(active * _GHOST_SWEEP_COLLAPSE_RATIO)):
+                    log.warning(
+                        "ghost sweep skipped collapse active=%s stale=%s ratio>=%.2f",
+                        active,
+                        stale,
+                        _GHOST_SWEEP_COLLAPSE_RATIO,
+                    )
+                    return 0
                 cur.execute(
                     """
                     UPDATE client_data
@@ -224,10 +255,11 @@ def _normalize_presence(status: str | None, last_seen: Any, changed: Any) -> tup
             st = "OFFLINE"
             offline_sec = _elapsed_sec(ls if isinstance(ls, datetime) else changed)
             return st, online, None, offline_sec
+        # session_sec from status_changed_at (session start; survives brief OFFLINE via DB trigger)
         return st, True, _elapsed_sec(changed), None
 
-    # Truly offline: time since status flipped to OFFLINE (fallback last_seen).
-    return st, False, None, _elapsed_sec(changed if changed is not None else ls)
+    # Offline duration from last_seen (status_changed_at is session start, not offline-at).
+    return st, False, None, _elapsed_sec(ls if isinstance(ls, datetime) else changed)
 
 
 @app.get("/health")

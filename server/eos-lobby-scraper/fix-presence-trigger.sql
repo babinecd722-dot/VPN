@@ -1,6 +1,9 @@
--- Run as postgres/superuser on clientdb.
--- Old scrapers UPDATE status/lobby without last_seen_at → ghosts.
--- If presence fields change but last_seen was not refreshed in the same UPDATE, force NOW().
+-- Run as postgres/superuser on clientdb:
+--   sudo -u postgres psql -d clientdb -f fix-presence-trigger.sql
+--
+-- 1) Writers that omit last_seen_at still refresh it (anti-ghost).
+-- 2) Session timer (status_changed_at) SURVIVES brief OFFLINE blips
+--    (scraper restart / ghost sweep) so Tracking "minutes in game" does not reset.
 
 CREATE OR REPLACE FUNCTION public.fusion_sync_status_timestamps()
 RETURNS trigger
@@ -15,6 +18,8 @@ DECLARE
     new_offline BOOLEAN;
     presence_changed BOOLEAN;
     last_seen_untouched BOOLEAN;
+    -- Resume same play-session if last real sighting was within this window.
+    session_resume INTERVAL := interval '5 minutes';
 BEGIN
     new_status := UPPER(BTRIM(COALESCE(NEW.status::TEXT, 'OFFLINE')));
     new_offline := new_status = 'OFFLINE';
@@ -46,19 +51,33 @@ BEGIN
     END IF;
 
     IF new_offline THEN
-        NEW.status_changed_at := changed_at;
-        NEW.last_seen_at := COALESCE(NEW.last_seen_at, changed_at);
+        -- Keep session start; offline duration uses last_seen_at in the API.
+        NEW.status_changed_at := COALESCE(OLD.status_changed_at, changed_at);
+        NEW.last_seen_at := COALESCE(NEW.last_seen_at, OLD.last_seen_at, changed_at);
         RETURN NEW;
     END IF;
 
     IF old_offline THEN
-        NEW.status_changed_at := changed_at;
+        -- Brief scraper/ghost blackout → resume same session timer.
+        IF OLD.last_seen_at IS NOT NULL
+           AND (changed_at - OLD.last_seen_at) <= session_resume
+           AND OLD.status_changed_at IS NOT NULL THEN
+            NEW.status_changed_at := OLD.status_changed_at;
+        ELSE
+            NEW.status_changed_at := changed_at;
+        END IF;
         NEW.last_seen_at := COALESCE(NEW.last_seen_at, changed_at);
         RETURN NEW;
     END IF;
 
-    -- Active → active: keep session start timer.
+    -- Active → active (LOADING ↔ IN GAME): keep session start timer.
     NEW.status_changed_at := OLD.status_changed_at;
     RETURN NEW;
 END;
 $function$;
+
+DROP TRIGGER IF EXISTS fusion_sync_status_timestamps ON public.client_data;
+CREATE TRIGGER fusion_sync_status_timestamps
+    BEFORE INSERT OR UPDATE OF status ON public.client_data
+    FOR EACH ROW
+    EXECUTE FUNCTION public.fusion_sync_status_timestamps();
