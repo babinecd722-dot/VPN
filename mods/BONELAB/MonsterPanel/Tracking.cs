@@ -18,7 +18,6 @@ using LabFusion.UI.Popups;
 using LabFusion.Utilities;
 using MelonLoader;
 using UnityEngine;
-using UnityEngine.Events;
 using UnityEngine.UI;
 
 namespace MonsterPanel
@@ -732,16 +731,16 @@ namespace MonsterPanel
             bool canJoin = snap != null && snap.Online && !string.IsNullOrWhiteSpace(snap.LobbyCode);
             body.Append('\n');
             if (canJoin)
-                body.Append("Join = enter lobby    Delete = remove    Close = dismiss");
+                body.Append("Join / Delete / X=close");
             else
-                body.Append("Delete = remove    Close = dismiss");
+                body.Append("Delete / X=close");
 
             string code = canJoin ? snap.LobbyCode : null;
             string joinName = name;
             string removePid = entry.Pid;
             try
             {
-                // IMPORTANT: never pass Remove as denyAction — BoneLib Close (X) also calls Decline.
+                // Okay = Join, Cancel = Delete. BoneLib X also calls Decline — we rewire X after Draw.
                 Menu.DisplayDialog(
                     name,
                     body.ToString(),
@@ -749,10 +748,8 @@ namespace MonsterPanel
                     canJoin
                         ? (Action)(() => MelonCoroutines.Start(JoinAndWatchRoutine(joinName, code)))
                         : null,
-                    null);
-                MelonCoroutines.Start(SetupTrackingDialogButtonsRoutine(
-                    canJoin ? "Join" : null,
-                    removePid));
+                    () => Remove(removePid));
+                MelonCoroutines.Start(SetupTrackingDialogButtonsRoutine(canJoin));
             }
             catch (Exception ex)
             {
@@ -762,11 +759,12 @@ namespace MonsterPanel
         }
 
         /// <summary>
-        /// BoneLib: Close and Decline both called OnDeclinePressed. So Delete is wired manually
-        /// on Option2; denyAction stays null so Close only dismisses.
+        /// Prefab labels are Okay/Cancel — rename to Join/Delete.
+        /// BoneLib X calls OnDeclinePressed (Delete) — rewire X to dismiss only.
         /// </summary>
-        private static IEnumerator SetupTrackingDialogButtonsRoutine(string acceptLabel, string removePid)
+        private static IEnumerator SetupTrackingDialogButtonsRoutine(bool canJoin)
         {
+            yield return null;
             yield return null;
             try
             {
@@ -774,43 +772,38 @@ namespace MonsterPanel
                 Transform root = GUIMenu.Instance.transform.Find("Dialog");
                 if (root == null || !root.gameObject.activeInHierarchy) yield break;
 
-                GameObject dialogGo = root.gameObject;
-                Type tmpType = AccessTools.TypeByName("TMPro.TextMeshProUGUI")
-                    ?? AccessTools.TypeByName("Il2CppTMPro.TextMeshProUGUI");
+                GUIDialog gui = root.GetComponent<GUIDialog>();
+                if (gui == null)
+                {
+                    MelonLogger.Warning("Tracking dialog: GUIDialog missing");
+                    yield break;
+                }
 
-                if (!string.IsNullOrEmpty(acceptLabel) && tmpType != null)
-                    SetChildTmpText(root, "Container/ButtonGroup/Option1", tmpType, acceptLabel);
+                Button acceptBtn = AccessTools.Field(typeof(GUIDialog), "_acceptButton")?.GetValue(gui) as Button;
+                Button denyBtn = AccessTools.Field(typeof(GUIDialog), "_denyButton")?.GetValue(gui) as Button;
+                Button closeBtn = AccessTools.Field(typeof(GUIDialog), "_closeButton")?.GetValue(gui) as Button;
 
-                // Delete button (Option2) — shown and wired ourselves; not via Dialog denyAction.
-                Transform denyT = root.Find("Container/ButtonGroup/Option2");
-                Button denyBtn = denyT != null ? denyT.GetComponent<Button>() : null;
+                if (canJoin && acceptBtn != null)
+                    SetButtonLabel(acceptBtn, "Join");
                 if (denyBtn != null)
                 {
                     denyBtn.gameObject.SetActive(true);
-                    if (tmpType != null)
-                        SetChildTmpText(root, "Container/ButtonGroup/Option2", tmpType, "Delete");
-                    string pidCopy = removePid;
-                    ((UnityEventBase)(object)denyBtn.onClick).RemoveAllListeners();
-                    ((UnityEvent)(object)denyBtn.onClick).AddListener((UnityAction)(Action)(() =>
+                    SetButtonLabel(denyBtn, "Delete");
+                }
+
+                // X: close only (do not invoke Delete / OnDeclinePressed).
+                if (closeBtn != null)
+                {
+                    GameObject dialogGo = root.gameObject;
+                    closeBtn.onClick.RemoveAllListeners();
+                    closeBtn.onClick.AddListener((Action)(() =>
                     {
                         dialogGo.SetActive(false);
                         try { GUIMenu.Instance.ShowView(); } catch { /* */ }
-                        Remove(pidCopy);
                     }));
                 }
 
-                // Close (X): dismiss only — never Remove.
-                Transform closeT = root.Find("Header/Toggle");
-                Button closeBtn = closeT != null ? closeT.GetComponent<Button>() : null;
-                if (closeBtn != null)
-                {
-                    ((UnityEventBase)(object)closeBtn.onClick).RemoveAllListeners();
-                    ((UnityEvent)(object)closeBtn.onClick).AddListener((UnityAction)(Action)(() =>
-                    {
-                        dialogGo.SetActive(false);
-                        try { GUIMenu.Instance.ShowView(); } catch { /* */ }
-                    }));
-                }
+                MelonLogger.Msg("Tracking dialog: labels Join/Delete, X=close only");
             }
             catch (Exception e)
             {
@@ -818,13 +811,16 @@ namespace MonsterPanel
             }
         }
 
-        private static void SetChildTmpText(Transform root, string path, Type tmpType, string text)
+        private static void SetButtonLabel(Button btn, string text)
         {
-            Transform t = root.Find(path);
-            if (t == null) return;
+            if (btn == null || string.IsNullOrEmpty(text)) return;
+            Type tmpType = AccessTools.TypeByName("Il2CppTMPro.TextMeshProUGUI")
+                ?? AccessTools.TypeByName("TMPro.TextMeshProUGUI");
+            if (tmpType == null) return;
             var textProp = AccessTools.Property(tmpType, "text");
             if (textProp == null || !textProp.CanWrite) return;
-            Component[] all = t.GetComponentsInChildren<Component>(true);
+
+            Component[] all = btn.GetComponentsInChildren<Component>(true);
             if (all == null) return;
             for (int i = 0; i < all.Length; i++)
             {
@@ -844,8 +840,44 @@ namespace MonsterPanel
             }
 
             string c = code.Trim().ToUpperInvariant();
-            bool hadServer = false;
-            try { hadServer = NetworkInfo.HasServer; } catch { /* */ }
+
+            // Already in a lobby → leave first. Old logic reported false "join OK" after 1.5s.
+            bool inServer = false;
+            try { inServer = NetworkInfo.HasServer; } catch { /* */ }
+            if (inServer)
+            {
+                MelonLogger.Msg("Tracking: disconnect before Join " + c);
+                Notify("Joining", "Leaving current lobby…");
+                try { NetworkHelper.Disconnect("Tracking Join"); }
+                catch (Exception ex)
+                {
+                    NotifyError("Join failed", "Disconnect: " + ex.Message);
+                    yield break;
+                }
+
+                float leaveT = 0f;
+                while (leaveT < 8f)
+                {
+                    leaveT += Time.unscaledDeltaTime;
+                    bool still = false;
+                    try { still = NetworkInfo.HasServer; } catch { /* */ }
+                    if (!still) break;
+                    yield return null;
+                }
+                try { inServer = NetworkInfo.HasServer; } catch { inServer = true; }
+                if (inServer)
+                {
+                    NotifyError("Join failed", "Could not leave current lobby");
+                    yield break;
+                }
+                // Brief settle so EOS matchmaker accepts a new join.
+                float settle = 0f;
+                while (settle < 0.75f)
+                {
+                    settle += Time.unscaledDeltaTime;
+                    yield return null;
+                }
+            }
 
             try
             {
@@ -859,17 +891,21 @@ namespace MonsterPanel
                 yield break;
             }
 
-            // Give Fusion time to find/join; private/locked/stale codes often never connect.
+            // Success = transition into a server from offline (not "already was in one").
             float t = 0f;
-            while (t < 10f)
+            while (t < 12f)
             {
                 t += Time.unscaledDeltaTime;
-                bool inServer = false;
-                try { inServer = NetworkInfo.HasServer; } catch { /* */ }
-                if (inServer && (!hadServer || t > 1.5f))
+                bool nowIn = false;
+                try { nowIn = NetworkInfo.HasServer; } catch { /* */ }
+                if (nowIn)
                 {
-                    MelonLogger.Msg("Tracking: join OK — " + c);
-                    // Alerts also fire from OnJoinedServer / scene hooks; nudge if those miss.
+                    string got = null;
+                    try { got = NetworkHelper.GetServerCode(); } catch { /* */ }
+                    MelonLogger.Msg(
+                        "Tracking: join OK — target=" + c +
+                        " code=" + (got ?? "?") +
+                        " t=" + t.ToString("0.0", CultureInfo.InvariantCulture) + "s");
                     if (!_joinNotifyRunning && _joinNotifyCd <= 0f)
                         MelonCoroutines.Start(OnlineAlertRoutine());
                     yield break;
@@ -880,7 +916,7 @@ namespace MonsterPanel
             MelonLogger.Warning("Tracking: join timed out for " + c);
             NotifyError(
                 "Join failed",
-                "Lobby not found or not joinable (private/locked/stale code). Refresh Tracking and retry.");
+                "Lobby not found or not joinable (private/locked/stale). Refresh Tracking and retry.");
         }
 
         private static string FormatListTitle(TrackedEntry e, TrackSnapshot snap)
