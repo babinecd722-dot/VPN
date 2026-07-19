@@ -47,6 +47,8 @@ namespace MonsterPanel
         private static bool _joinHooked;
         private static bool _polling;
         private static bool _joinNotifyRunning;
+        // One online-digest popup batch per Fusion session (reset on disconnect).
+        private static bool _fusionAlertDone;
         private static float _pollCd;
         private static float _joinNotifyCd;
         private static string _lastError = "";
@@ -55,12 +57,6 @@ namespace MonsterPanel
         private static readonly List<TrackedEntry> Entries = new List<TrackedEntry>();
         private static readonly Dictionary<string, TrackSnapshot> Snapshots =
             new Dictionary<string, TrackSnapshot>(StringComparer.OrdinalIgnoreCase);
-        // Baseline online flags — first poll after Add/boot does not notify; only offline→online.
-        private static readonly Dictionary<string, bool> LastOnline =
-            new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
-        private static readonly Dictionary<string, float> OnlineNotifyCdUntil =
-            new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
-        private const float PresenceNotifyCooldownSec = 45f;
         private static readonly HttpClient Http = CreateHttp();
 
         private static Page _rootPage;
@@ -133,16 +129,25 @@ namespace MonsterPanel
                     return;
                 MultiplayerHooking.OnJoinedServer += OnEnteredFusion;
                 MultiplayerHooking.OnStartedServer += OnEnteredFusion;
+                MultiplayerHooking.OnDisconnected += OnLeftFusion;
                 // Join-by-code often lands after scene load; only fire if already in a server.
                 MultiplayerHooking.OnMainSceneInitialized += OnSceneWhileInServer;
                 MultiplayerHooking.OnTargetLevelLoaded += OnSceneWhileInServer;
                 _joinHooked = true;
-                MelonLogger.Msg("Tracking: hooked Fusion join/start/scene for online alerts");
+                MelonLogger.Msg("Tracking: hooked Fusion join/start/scene/disconnect for online alerts");
             }
             catch (Exception e)
             {
                 MelonLogger.Warning("Tracking join hook: " + e.Message);
             }
+        }
+
+        private static void OnLeftFusion()
+        {
+            _fusionAlertDone = false;
+            _joinNotifyRunning = false;
+            _joinNotifyCd = 0f;
+            MelonLogger.Msg("Tracking: Fusion left — online alert armed for next join");
         }
 
         private static void OnSceneWhileInServer()
@@ -158,11 +163,11 @@ namespace MonsterPanel
         private static void OnEnteredFusion()
         {
             if (!_enabled) return;
+            if (_fusionAlertDone || _joinNotifyRunning) return;
             int count;
             lock (Gate) { count = Entries.Count; }
             if (count == 0) return;
-            if (_joinNotifyRunning || _joinNotifyCd > 0f) return;
-            MelonLogger.Msg("Tracking: Fusion enter — scheduling online alerts");
+            MelonLogger.Msg("Tracking: Fusion enter — scheduling online alerts (once)");
             MelonCoroutines.Start(OnlineAlertRoutine());
         }
 
@@ -172,8 +177,9 @@ namespace MonsterPanel
         /// </summary>
         private static IEnumerator OnlineAlertRoutine()
         {
-            if (_joinNotifyRunning) yield break;
+            if (_joinNotifyRunning || _fusionAlertDone) yield break;
             _joinNotifyRunning = true;
+            _fusionAlertDone = true; // lock session immediately so scene reloads don't re-fire
 
             try
             {
@@ -239,7 +245,7 @@ namespace MonsterPanel
                     }
                 }
 
-                List<(string name, string pid)> online = new List<(string, string)>();
+                List<string> online = new List<string>();
                 lock (Gate)
                 {
                     foreach (var e in Entries)
@@ -250,28 +256,20 @@ namespace MonsterPanel
                             continue;
                         string nick = !string.IsNullOrWhiteSpace(snap.Name) ? snap.Name : e.Name;
                         if (string.IsNullOrWhiteSpace(nick)) nick = ShortPid(e.Pid);
-                        online.Add((nick, e.Pid));
+                        online.Add(nick);
                     }
                 }
 
                 if (online.Count == 0)
                 {
                     MelonLogger.Msg("Tracking: join alert — no tracked players online (http=" + _lastHttpStatus + ")");
-                    _joinNotifyCd = 3f;
                     yield break;
                 }
 
-                MelonLogger.Msg("Tracking: join alert — " + online.Count + " online");
-                float nowT = Time.unscaledTime;
-                foreach (var row in online)
+                MelonLogger.Msg("Tracking: join alert — " + online.Count + " online (once this session)");
+                foreach (string nick in online)
                 {
-                    // Avoid double popup from presence poll right after join digest.
-                    lock (Gate)
-                    {
-                        LastOnline[row.pid] = true;
-                        OnlineNotifyCdUntil[row.pid] = nowT + PresenceNotifyCooldownSec;
-                    }
-                    NotifyOnline(SafeMenu(row.name));
+                    NotifyOnline(SafeMenu(nick));
                     float g = 0f;
                     while (g < JoinNotifyGapSec)
                     {
@@ -377,8 +375,6 @@ namespace MonsterPanel
                     Entries.RemoveAt(i);
                 }
                 Snapshots.Remove(pid);
-                LastOnline.Remove(pid);
-                OnlineNotifyCdUntil.Remove(pid);
                 SaveList_NoLock();
             }
             Notify("Removed from Tracking", SafeMenu(removed));
@@ -430,20 +426,14 @@ namespace MonsterPanel
                     Task<string> task = Task.Run(() => FetchTrackJson(pids));
                     while (!task.IsCompleted) yield return null;
 
-                    List<string> cameOnline = null;
                     try
                     {
                         string json = task.Result;
                         if (json != null)
                         {
-                            cameOnline = ApplyTrackJson(json);
+                            ApplyTrackJson(json);
                             _lastError = "";
                             _apiReadyAt = Time.unscaledTime + PollIntervalSec;
-                            if (cameOnline != null && cameOnline.Count > 0)
-                            {
-                                for (int n = 0; n < cameOnline.Count; n++)
-                                    NotifyOnline(SafeMenu(cameOnline[n]));
-                            }
                             break;
                         }
                     }
@@ -525,19 +515,16 @@ namespace MonsterPanel
             return 2.5f;
         }
 
-        /// <returns>Display names that just transitioned offline→online (for popup).</returns>
-        private static List<string> ApplyTrackJson(string json)
+        private static void ApplyTrackJson(string json)
         {
-            var cameOnline = new List<string>();
             // Minimal JSON walk — avoid Newtonsoft dependency in MelonLoader.
             int playersIdx = json.IndexOf("\"players\"", StringComparison.Ordinal);
-            if (playersIdx < 0) return cameOnline;
+            if (playersIdx < 0) return;
             int arr = json.IndexOf('[', playersIdx);
-            if (arr < 0) return cameOnline;
+            if (arr < 0) return;
 
             int i = arr + 1;
             var now = DateTime.UtcNow;
-            float nowT = Time.unscaledTime;
             lock (Gate)
             {
                 while (i < json.Length)
@@ -597,26 +584,10 @@ namespace MonsterPanel
                         }
                     }
 
-                    bool nowOnline = snap.Found && snap.Online;
-                    bool hadPrev = LastOnline.TryGetValue(pid, out bool wasOnline);
-                    LastOnline[pid] = nowOnline;
-                    // First observation = baseline (no spam). Later offline→online → notify.
-                    if (hadPrev && !wasOnline && nowOnline)
-                    {
-                        bool cooled = !OnlineNotifyCdUntil.TryGetValue(pid, out float until) || nowT >= until;
-                        if (cooled)
-                        {
-                            OnlineNotifyCdUntil[pid] = nowT + PresenceNotifyCooldownSec;
-                            string nick = !string.IsNullOrWhiteSpace(snap.Name) ? snap.Name : ShortPid(pid);
-                            cameOnline.Add(nick);
-                        }
-                    }
-
                     Snapshots[pid] = snap;
                 }
                 SaveList_NoLock();
             }
-            return cameOnline;
         }
 
         private static void OnPageOpened(Page opened)
