@@ -54,6 +54,9 @@ namespace MonsterPanel
         private static readonly Dictionary<string, TrackSnapshot> Snapshots =
             new Dictionary<string, TrackSnapshot>(StringComparer.OrdinalIgnoreCase);
         private static readonly HttpClient Http = CreateHttp();
+        // pid → player detail page (so polls can refresh in-place without nuking navigation)
+        private static readonly Dictionary<string, Page> PlayerPages =
+            new Dictionary<string, Page>(StringComparer.OrdinalIgnoreCase);
 
         private static Page _rootPage;
 
@@ -249,7 +252,7 @@ namespace MonsterPanel
                     Entries[i] = e;
                     SaveList_NoLock();
                     Notify("Tracking", SafeMenu(name) + " already tracked");
-                    RebuildMenu();
+                    RequestMenuRefresh();
                     return;
                 }
 
@@ -270,7 +273,7 @@ namespace MonsterPanel
 
             Notify("Added to Tracking", SafeMenu(name));
             MelonLogger.Msg("Tracking: add " + pid + " (" + name + ")");
-            RebuildMenu();
+            RequestMenuRefresh();
             _pollCd = 0f;
         }
 
@@ -290,7 +293,15 @@ namespace MonsterPanel
                 Snapshots.Remove(pid);
                 SaveList_NoLock();
             }
+            PlayerPages.Remove(pid);
             Notify("Removed from Tracking", SafeMenu(removed));
+            // Leave the detail card before rebuilding so BoneMenu isn't left on a destroyed page.
+            try
+            {
+                if (Menu.CurrentPage != null && IsTrackingSubtree(Menu.CurrentPage))
+                    Menu.OpenPage(_rootPage);
+            }
+            catch { /* */ }
             RebuildMenu();
         }
 
@@ -344,7 +355,8 @@ namespace MonsterPanel
                 _polling = false;
                 if (!force)
                     _pollCd = PollIntervalSec;
-                RebuildMenu();
+                // Never RemoveAll while the user is inside a player card — that was freezing BoneMenu.
+                RequestMenuRefresh();
             }
         }
 
@@ -448,21 +460,129 @@ namespace MonsterPanel
             }
         }
 
-            private static void OnPageOpened(Page opened)
+        private static void OnPageOpened(Page opened)
         {
+            if (opened == null || _rootPage == null) return;
+
+            // Entering the Tracking list — rebuild if a poll marked it dirty, or always on root.
             if (opened == _rootPage)
+            {
                 RebuildMenu();
+                return;
+            }
+
+            // Opening a player card — refresh fields without destroying the page tree.
+            if (IsTrackingSubtree(opened))
+                RefreshPlayerPage(opened);
+        }
+
+        /// <summary>
+        /// Safe menu update from polls/add: if the user is inside a player card, only
+        /// refresh that card in place. Full list rebuild waits until they leave.
+        /// </summary>
+        private static void RequestMenuRefresh()
+        {
+            if (_rootPage == null) return;
+
+            Page cur = null;
+            try { cur = Menu.CurrentPage; } catch { /* */ }
+
+            if (cur != null && cur != _rootPage && IsTrackingSubtree(cur))
+            {
+                RefreshPlayerPage(cur);
+                return;
+            }
+
+            RebuildMenu();
+        }
+
+        private static bool IsTrackingSubtree(Page page)
+        {
+            for (Page p = page; p != null; p = p.Parent)
+            {
+                if (p == _rootPage)
+                    return true;
+            }
+            return false;
+        }
+
+        private static string FindPidForPage(Page page)
+        {
+            if (page == null) return null;
+            foreach (var kv in PlayerPages)
+            {
+                if (kv.Value == page)
+                    return kv.Key;
+            }
+            // Indexed overflow child of a player page
+            if (page.Parent != null)
+            {
+                foreach (var kv in PlayerPages)
+                {
+                    if (kv.Value == page.Parent)
+                        return kv.Key;
+                }
+            }
+            return null;
+        }
+
+        private static void RefreshPlayerPage(Page page)
+        {
+            string pid = FindPidForPage(page);
+            if (pid == null) return;
+
+            TrackedEntry entry = default;
+            bool found = false;
+            TrackSnapshot snap = null;
+            lock (Gate)
+            {
+                for (int i = 0; i < Entries.Count; i++)
+                {
+                    if (!string.Equals(Entries[i].Pid, pid, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    entry = Entries[i];
+                    found = true;
+                    break;
+                }
+                if (found)
+                    Snapshots.TryGetValue(pid, out snap);
+            }
+
+            if (!found)
+            {
+                PlayerPages.Remove(pid);
+                try { Menu.OpenPage(_rootPage); } catch { /* */ }
+                RebuildMenu();
+                return;
+            }
+
+            Page target = page;
+            if (PlayerPages.TryGetValue(pid, out var mapped) && mapped != null)
+                target = mapped;
+            FillPlayerPage(target, entry, snap);
         }
 
         private static void RebuildMenu()
         {
             if (_rootPage == null) return;
+
+            // Hard guard: never tear down the list while a detail page is open.
+            Page cur = null;
+            try { cur = Menu.CurrentPage; } catch { /* */ }
+            if (cur != null && cur != _rootPage && IsTrackingSubtree(cur))
+            {
+                RefreshPlayerPage(cur);
+                return;
+            }
+
             try
             {
+                PlayerPages.Clear();
                 _rootPage.RemoveAll();
+
                 _rootPage.CreateFunction("Refresh now", new Color(0.7f, 0.7f, 0.7f), (Action)(() =>
                 {
-                    if (_pollCd > 0f && _polling == false)
+                    if (_pollCd > 0f && !_polling)
                     {
                         Notify("Tracking", "Cooldown every 10s — wait " + Mathf.CeilToInt(_pollCd) + "s");
                         return;
@@ -472,18 +592,17 @@ namespace MonsterPanel
                 }));
 
                 if (!string.IsNullOrEmpty(_lastError))
-                    _rootPage.CreateFunction("Err: " + SafeMenu(_lastError, 40), new Color(1f, 0.4f, 0.3f), (Action)(() => { }));
+                    InfoLine(_rootPage, "Err: " + SafeMenu(_lastError, 40), new Color(1f, 0.4f, 0.3f));
 
                 lock (Gate)
                 {
                     if (Entries.Count == 0)
                     {
-                        _rootPage.CreateFunction("No tracked players", new Color(0.55f, 0.55f, 0.55f), (Action)(() => { }));
-                        _rootPage.CreateFunction("Tip: open player profile → Add", new Color(0.55f, 0.55f, 0.55f), (Action)(() => { }));
+                        InfoLine(_rootPage, "No tracked players", new Color(0.55f, 0.55f, 0.55f));
+                        InfoLine(_rootPage, "Tip: open player profile → Add", new Color(0.55f, 0.55f, 0.55f));
                         return;
                     }
 
-                    // Online first
                     var order = new List<TrackedEntry>(Entries);
                     order.Sort((a, b) =>
                     {
@@ -501,6 +620,7 @@ namespace MonsterPanel
                             ? new Color(0.35f, 1f, 0.45f)
                             : new Color(0.65f, 0.65f, 0.7f);
                         Page sub = _rootPage.CreatePage(title, col, 32, true);
+                        PlayerPages[e.Pid] = sub;
                         FillPlayerPage(sub, e, snap);
                     }
                 }
@@ -511,30 +631,38 @@ namespace MonsterPanel
             }
         }
 
+        /// <summary>Read-only BoneMenu row — clicking does nothing (avoids fake "actions").</summary>
+        private static void InfoLine(Page page, string text, Color color)
+        {
+            page.CreateFunction(text, color, (Action)(() => { /* display only */ }));
+        }
+
         private static void FillPlayerPage(Page page, TrackedEntry e, TrackSnapshot snap)
         {
+            if (page == null) return;
             page.RemoveAll();
             string name = SafeMenu(snap != null && !string.IsNullOrEmpty(snap.Name) ? snap.Name : e.Name);
-            page.CreateFunction("Name: " + name, Color.white, (Action)(() => { }));
-            page.CreateFunction("PID: " + ShortPid(e.Pid), new Color(1f, 0.45f, 0.45f), (Action)(() => { }));
+            InfoLine(page, "Name: " + name, Color.white);
+            InfoLine(page, "PID: " + ShortPid(e.Pid), new Color(1f, 0.45f, 0.45f));
 
             if (snap == null)
             {
-                page.CreateFunction("Status: waiting poll…", new Color(0.8f, 0.8f, 0.4f), (Action)(() => { }));
+                InfoLine(page, "Status: waiting poll…", new Color(0.8f, 0.8f, 0.4f));
             }
             else if (!snap.Found)
             {
-                page.CreateFunction("Status: not in DB", new Color(1f, 0.5f, 0.3f), (Action)(() => { }));
+                InfoLine(page, "Status: not in DB", new Color(1f, 0.5f, 0.3f));
             }
             else
             {
-                page.CreateFunction("Status: " + SafeMenu(snap.Status), snap.Online ? new Color(0.4f, 1f, 0.5f) : new Color(0.75f, 0.75f, 0.75f), (Action)(() => { }));
-                page.CreateFunction("Server: " + SafeMenu(NullDash(snap.Server), 42), Color.white, (Action)(() => { }));
-                page.CreateFunction("Map: " + SafeMenu(NullDash(snap.Map), 42), Color.white, (Action)(() => { }));
-                page.CreateFunction("Language: " + SafeMenu(NullDash(snap.Language)), Color.white, (Action)(() => { }));
-                page.CreateFunction("Lobby: " + SafeMenu(NullDash(snap.LobbyCode)), new Color(0.6f, 0.85f, 1f), (Action)(() => { }));
-                page.CreateFunction("Playing: " + FormatSession(snap), Color.white, (Action)(() => { }));
-                page.CreateFunction("Last seen: " + FormatLastSeen(snap), Color.white, (Action)(() => { }));
+                InfoLine(page, "Status: " + SafeMenu(snap.Status),
+                    snap.Online ? new Color(0.4f, 1f, 0.5f) : new Color(0.75f, 0.75f, 0.75f));
+                InfoLine(page, "Server: " + SafeMenu(NullDash(snap.Server), 42), Color.white);
+                InfoLine(page, "Map: " + SafeMenu(NullDash(snap.Map), 42), Color.white);
+                InfoLine(page, "Language: " + SafeMenu(NullDash(snap.Language)), Color.white);
+                InfoLine(page, "Lobby: " + SafeMenu(NullDash(snap.LobbyCode)), new Color(0.6f, 0.85f, 1f));
+                InfoLine(page, "Playing: " + FormatSession(snap), Color.white);
+                InfoLine(page, "Last seen: " + FormatLastSeen(snap), Color.white);
 
                 string code = snap.LobbyCode;
                 bool canJoin = snap.Online && !string.IsNullOrWhiteSpace(code);
@@ -563,6 +691,10 @@ namespace MonsterPanel
 
             string pid = e.Pid;
             page.CreateFunction("Remove from Tracking", new Color(1f, 0.35f, 0.35f), (Action)(() => Remove(pid)));
+            page.CreateFunction("Back to list", new Color(0.7f, 0.7f, 0.75f), (Action)(() =>
+            {
+                try { Menu.OpenPage(_rootPage); } catch { /* */ }
+            }));
         }
 
         private static string FormatListTitle(TrackedEntry e, TrackSnapshot snap)
