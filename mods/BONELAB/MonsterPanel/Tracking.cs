@@ -679,7 +679,7 @@ namespace MonsterPanel
         }
 
         /// <summary>
-        /// Profile dialog: compact info (incl. Language). Okay/Confirm = JOIN, Decline = Delete.
+        /// Profile dialog: compact info (incl. Language). Join / Delete / Close (Close does not delete).
         /// </summary>
         private static void OpenPlayerBoard(string pid)
         {
@@ -732,15 +732,16 @@ namespace MonsterPanel
             bool canJoin = snap != null && snap.Online && !string.IsNullOrWhiteSpace(snap.LobbyCode);
             body.Append('\n');
             if (canJoin)
-                body.Append("Join = enter lobby    Decline = Delete");
+                body.Append("Join = enter lobby    Delete = remove    Close = dismiss");
             else
-                body.Append("Decline = Delete");
+                body.Append("Delete = remove    Close = dismiss");
 
             string code = canJoin ? snap.LobbyCode : null;
             string joinName = name;
             string removePid = entry.Pid;
             try
             {
+                // IMPORTANT: never pass Remove as denyAction — BoneLib Close (X) also calls Decline.
                 Menu.DisplayDialog(
                     name,
                     body.ToString(),
@@ -748,11 +749,10 @@ namespace MonsterPanel
                     canJoin
                         ? (Action)(() => MelonCoroutines.Start(JoinAndWatchRoutine(joinName, code)))
                         : null,
-                    (Action)(() => Remove(removePid)));
-                // BoneLib hardcodes the accept label as "Okay" — rename to Join after Draw.
-                MelonCoroutines.Start(RelabelDialogButtonsRoutine(
+                    null);
+                MelonCoroutines.Start(SetupTrackingDialogButtonsRoutine(
                     canJoin ? "Join" : null,
-                    "Delete"));
+                    removePid));
             }
             catch (Exception ex)
             {
@@ -761,9 +761,12 @@ namespace MonsterPanel
             }
         }
 
-        private static IEnumerator RelabelDialogButtonsRoutine(string acceptLabel, string denyLabel)
+        /// <summary>
+        /// BoneLib: Close and Decline both called OnDeclinePressed. So Delete is wired manually
+        /// on Option2; denyAction stays null so Close only dismisses.
+        /// </summary>
+        private static IEnumerator SetupTrackingDialogButtonsRoutine(string acceptLabel, string removePid)
         {
-            // Wait one frame so GUIDialog.Draw() has applied the dialog.
             yield return null;
             try
             {
@@ -771,22 +774,36 @@ namespace MonsterPanel
                 Transform root = GUIMenu.Instance.transform.Find("Dialog");
                 if (root == null || !root.gameObject.activeInHierarchy) yield break;
 
+                GameObject dialogGo = root.gameObject;
                 Type tmpType = AccessTools.TypeByName("TMPro.TextMeshProUGUI")
                     ?? AccessTools.TypeByName("Il2CppTMPro.TextMeshProUGUI");
-                if (tmpType != null)
+
+                if (!string.IsNullOrEmpty(acceptLabel) && tmpType != null)
+                    SetChildTmpText(root, "Container/ButtonGroup/Option1", tmpType, acceptLabel);
+
+                // Delete button (Option2) — shown and wired ourselves; not via Dialog denyAction.
+                Transform denyT = root.Find("Container/ButtonGroup/Option2");
+                Button denyBtn = denyT != null ? denyT.GetComponent<Button>() : null;
+                if (denyBtn != null)
                 {
-                    if (!string.IsNullOrEmpty(acceptLabel))
-                        SetChildTmpText(root, "Container/ButtonGroup/Option1", tmpType, acceptLabel);
-                    if (!string.IsNullOrEmpty(denyLabel))
-                        SetChildTmpText(root, "Container/ButtonGroup/Option2", tmpType, denyLabel);
+                    denyBtn.gameObject.SetActive(true);
+                    if (tmpType != null)
+                        SetChildTmpText(root, "Container/ButtonGroup/Option2", tmpType, "Delete");
+                    string pidCopy = removePid;
+                    ((UnityEventBase)(object)denyBtn.onClick).RemoveAllListeners();
+                    ((UnityEvent)(object)denyBtn.onClick).AddListener((UnityAction)(Action)(() =>
+                    {
+                        dialogGo.SetActive(false);
+                        try { GUIMenu.Instance.ShowView(); } catch { /* */ }
+                        Remove(pidCopy);
+                    }));
                 }
 
-                // BoneLib Close (Header/Toggle) also fired Decline (= Delete). Rewire to close only.
+                // Close (X): dismiss only — never Remove.
                 Transform closeT = root.Find("Header/Toggle");
                 Button closeBtn = closeT != null ? closeT.GetComponent<Button>() : null;
                 if (closeBtn != null)
                 {
-                    GameObject dialogGo = root.gameObject;
                     ((UnityEventBase)(object)closeBtn.onClick).RemoveAllListeners();
                     ((UnityEvent)(object)closeBtn.onClick).AddListener((UnityAction)(Action)(() =>
                     {
@@ -797,7 +814,7 @@ namespace MonsterPanel
             }
             catch (Exception e)
             {
-                MelonLogger.Warning("Tracking dialog relabel: " + e.Message);
+                MelonLogger.Warning("Tracking dialog buttons: " + e.Message);
             }
         }
 
