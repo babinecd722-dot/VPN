@@ -1274,9 +1274,15 @@ internal static class Program
         {
             using var conn = new NpgsqlConnection(PostgresDsn);
             conn.Open();
+            // If main upsert lost the advisory lock, still revive anyone we literally saw in EOS.
+            // Otherwise last_seen moves while status stays OFFLINE → "0 online" after restarts.
             using var touch = new NpgsqlCommand(
                 @"UPDATE client_data
-                  SET last_seen_at = NOW()
+                  SET last_seen_at = NOW(),
+                      status = CASE
+                                 WHEN status = 'OFFLINE' THEN 'IN GAME'
+                                 ELSE status
+                               END
                   WHERE pid = ANY(@seen)", conn);
             touch.Parameters.AddWithValue("seen", NpgsqlDbType.Array | NpgsqlDbType.Text, seenPids);
             return touch.ExecuteNonQuery();
