@@ -729,9 +729,9 @@ namespace MonsterPanel
             bool canJoin = snap != null && snap.Online && !string.IsNullOrWhiteSpace(snap.LobbyCode);
             body.Append('\n');
             if (canJoin)
-                body.Append("Okay = JOIN    Decline = Delete");
+                body.Append("Join = enter lobby    Decline = Delete");
             else
-                body.Append("Okay = close    Decline = Delete");
+                body.Append("Decline = Delete");
 
             string code = canJoin ? snap.LobbyCode : null;
             string joinName = name;
@@ -744,13 +744,67 @@ namespace MonsterPanel
                     Dialog.InfoIcon,
                     canJoin
                         ? (Action)(() => MelonCoroutines.Start(JoinAndWatchRoutine(joinName, code)))
-                        : (Action)(() => { }),
+                        : null,
                     (Action)(() => Remove(removePid)));
+                // BoneLib hardcodes the accept label as "Okay" — rename to Join after Draw.
+                MelonCoroutines.Start(RelabelDialogButtonsRoutine(
+                    canJoin ? "Join" : null,
+                    "Delete"));
             }
             catch (Exception ex)
             {
                 MelonLogger.Warning("Tracking board: " + ex.Message);
                 Notify("Tracking", name + " — open failed");
+            }
+        }
+
+        private static IEnumerator RelabelDialogButtonsRoutine(string acceptLabel, string denyLabel)
+        {
+            // Wait one frame so GUIDialog.Draw() has applied the dialog.
+            yield return null;
+            try
+            {
+                Type guiMenuType = AccessTools.TypeByName("BoneLib.BoneMenu.UI.GUIMenu");
+                Type tmpType = AccessTools.TypeByName("TMPro.TextMeshProUGUI")
+                    ?? AccessTools.TypeByName("Il2CppTMPro.TextMeshProUGUI");
+                if (guiMenuType == null || tmpType == null) yield break;
+
+                object inst = AccessTools.Property(guiMenuType, "Instance")?.GetValue(null);
+                if (inst == null) yield break;
+                object guiDlg = AccessTools.Field(guiMenuType, "_guiDialog")?.GetValue(inst);
+                if (guiDlg == null) yield break;
+
+                var goProp = AccessTools.Property(guiDlg.GetType(), "gameObject");
+                var go = goProp?.GetValue(guiDlg) as GameObject;
+                if (go == null || !go.activeInHierarchy) yield break;
+
+                Transform root = go.transform;
+                if (!string.IsNullOrEmpty(acceptLabel))
+                    SetChildTmpText(root, "Container/ButtonGroup/Option1", tmpType, acceptLabel);
+                if (!string.IsNullOrEmpty(denyLabel))
+                    SetChildTmpText(root, "Container/ButtonGroup/Option2", tmpType, denyLabel);
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Tracking dialog relabel: " + e.Message);
+            }
+        }
+
+        private static void SetChildTmpText(Transform root, string path, Type tmpType, string text)
+        {
+            Transform t = root.Find(path);
+            if (t == null) return;
+            // Walk children — avoid GetComponentsInChildren(System.Type) vs Il2CppSystem.Type mismatch.
+            var textProp = AccessTools.Property(tmpType, "text");
+            if (textProp == null || !textProp.CanWrite) return;
+            Component[] all = t.GetComponentsInChildren<Component>(true);
+            if (all == null) return;
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i] == null) continue;
+                Type ct = all[i].GetType();
+                if (ct != tmpType && !tmpType.IsAssignableFrom(ct)) continue;
+                textProp.SetValue(all[i], text);
             }
         }
 
