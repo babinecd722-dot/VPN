@@ -1198,7 +1198,9 @@ internal static class Program
         foreach (var p in onlineList)
         {
             MissStreak.Remove(p.Pid);
-            string status = ResolveStatus(p.Pid, nowUtc);
+            // Warmup / recovery: skip LOADING flash — second locked promote was stranding
+            // everyone in LOADING when VPS held the advisory lock.
+            string status = warmingUp ? StatusInGame : ResolveStatus(p.Pid, nowUtc);
             desired[p.Pid] = (p, status);
             if (status == StatusLoading)
                 loadingPids.Add(p.Pid);
@@ -1227,6 +1229,10 @@ internal static class Program
             if (promote.Count > 0)
             {
                 var promoteStats = WritePresence(promote, seenPids, markOffline: false);
+                // Lock-skip safe promote (no advisory lock).
+                int forced = ForceInGameStandalone(seenPids);
+                if (forced > 0)
+                    Console.WriteLine($"[scraper] force IN GAME standalone → {forced}");
                 stats = new SyncStats(
                     stats.Upserted + promoteStats.Upserted,
                     stats.Inserted + promoteStats.Inserted,
@@ -1262,6 +1268,31 @@ internal static class Program
         return stats;
     }
 
+    /// <summary>Force IN GAME for seen PIDs without advisory lock (promote fallback).</summary>
+    private static int ForceInGameStandalone(string[] seenPids)
+    {
+        if (seenPids == null || seenPids.Length == 0)
+            return 0;
+        try
+        {
+            using var conn = new NpgsqlConnection(PostgresDsn);
+            conn.Open();
+            using var cmd = new NpgsqlCommand(
+                @"UPDATE client_data
+                  SET status = 'IN GAME',
+                      last_seen_at = NOW()
+                  WHERE pid = ANY(@seen)
+                    AND status IN ('OFFLINE', 'LOADING')", conn);
+            cmd.Parameters.AddWithValue("seen", NpgsqlDbType.Array | NpgsqlDbType.Text, seenPids);
+            return cmd.ExecuteNonQuery();
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine("[scraper] force IN GAME standalone: " + e.Message);
+            return 0;
+        }
+    }
+
     /// <summary>
     /// Refresh last_seen for this scrape's PIDs without the advisory lock.
     /// Safe when another writer owns the upsert lock.
@@ -1274,13 +1305,13 @@ internal static class Program
         {
             using var conn = new NpgsqlConnection(PostgresDsn);
             conn.Open();
-            // If main upsert lost the advisory lock, still revive anyone we literally saw in EOS.
-            // Otherwise last_seen moves while status stays OFFLINE → "0 online" after restarts.
+            // If main upsert/promote lost the advisory lock, still revive anyone we saw in EOS.
+            // OFFLINE and stuck LOADING both become IN GAME (LOADING flash is best-effort only).
             using var touch = new NpgsqlCommand(
                 @"UPDATE client_data
                   SET last_seen_at = NOW(),
                       status = CASE
-                                 WHEN status = 'OFFLINE' THEN 'IN GAME'
+                                 WHEN status IN ('OFFLINE', 'LOADING') THEN 'IN GAME'
                                  ELSE status
                                END
                   WHERE pid = ANY(@seen)", conn);
