@@ -1164,15 +1164,25 @@ internal static class Program
         var seenSet = new HashSet<string>(seenPids, StringComparer.Ordinal);
         DateTime nowUtc = DateTime.UtcNow;
 
+        // After process restart lastGood=0 — first Find can be partial. miss_streak=1 would
+        // otherwise mass-OFFLINE the whole DB. Warm up: upsert/touch only, no offline/TTL wipe.
+        bool warmingUp = _lastGoodPlayerCount <= 0;
         bool collapse =
             _lastGoodPlayerCount > 20 &&
             online.Count < (int)Math.Ceiling(_lastGoodPlayerCount * CollapseRatio);
-        if (collapse)
+        if (warmingUp)
+        {
+            Console.Error.WriteLine(
+                $"[scraper] warmup: seen={online.Count} — upsert only, skip OFFLINE/TTL until first good scrape");
+        }
+        else if (collapse)
         {
             Console.Error.WriteLine(
                 $"[scraper] collapse guard: seen={online.Count} last_good={_lastGoodPlayerCount} " +
                 $"ratio<{CollapseRatio:0.##} — upsert only, skip OFFLINE");
         }
+
+        bool allowOffline = !warmingUp && !collapse;
 
         // Drop first-seen for anyone who left — next reappear gets LOADING again.
         // Keep FirstSeen until they clear miss-streak / go OFFLINE so LOADING doesn't flicker.
@@ -1194,8 +1204,9 @@ internal static class Program
                 loadingPids.Add(p.Pid);
         }
 
-        SyncStats stats = WritePresence(desired, seenPids, markOffline: !collapse);
-        if (!stats.Skipped && !collapse && online.Count > 0)
+        SyncStats stats = WritePresence(desired, seenPids, markOffline: allowOffline);
+        // Treat a scrape as "good" once we see a real lobby population (avoids tiny partial Finds).
+        if (!stats.Skipped && !collapse && online.Count >= 30)
             _lastGoodPlayerCount = online.Count;
 
         // Hold LOADING briefly so DB consumers can see it, then promote to IN GAME.
@@ -1240,11 +1251,13 @@ internal static class Program
         if (touched > 0)
             Console.WriteLine($"[scraper] touch last_seen standalone → {touched}");
 
-        // TTL-only ghost sweep (no seen exclusion): after touch, live players are fresh;
-        // anyone still stale is a real ghost — including bot register / skipped-lock leftovers.
-        int ghosts = SweepGhostsStandalone();
-        if (ghosts > 0)
-            stats = stats with { MarkedOffline = stats.MarkedOffline + ghosts };
+        // TTL wipe only after warmup — otherwise a partial first Find nukes the whole roster.
+        if (allowOffline)
+        {
+            int ghosts = SweepGhostsStandalone();
+            if (ghosts > 0)
+                stats = stats with { MarkedOffline = stats.MarkedOffline + ghosts };
+        }
 
         return stats;
     }
