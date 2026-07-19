@@ -55,6 +55,12 @@ namespace MonsterPanel
         private static readonly List<TrackedEntry> Entries = new List<TrackedEntry>();
         private static readonly Dictionary<string, TrackSnapshot> Snapshots =
             new Dictionary<string, TrackSnapshot>(StringComparer.OrdinalIgnoreCase);
+        // Baseline online flags — first poll after Add/boot does not notify; only offline→online.
+        private static readonly Dictionary<string, bool> LastOnline =
+            new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, float> OnlineNotifyCdUntil =
+            new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+        private const float PresenceNotifyCooldownSec = 45f;
         private static readonly HttpClient Http = CreateHttp();
 
         private static Page _rootPage;
@@ -256,8 +262,15 @@ namespace MonsterPanel
                 }
 
                 MelonLogger.Msg("Tracking: join alert — " + online.Count + " online");
+                float nowT = Time.unscaledTime;
                 foreach (var row in online)
                 {
+                    // Avoid double popup from presence poll right after join digest.
+                    lock (Gate)
+                    {
+                        LastOnline[row.pid] = true;
+                        OnlineNotifyCdUntil[row.pid] = nowT + PresenceNotifyCooldownSec;
+                    }
                     NotifyOnline(SafeMenu(row.name));
                     float g = 0f;
                     while (g < JoinNotifyGapSec)
@@ -364,6 +377,8 @@ namespace MonsterPanel
                     Entries.RemoveAt(i);
                 }
                 Snapshots.Remove(pid);
+                LastOnline.Remove(pid);
+                OnlineNotifyCdUntil.Remove(pid);
                 SaveList_NoLock();
             }
             Notify("Removed from Tracking", SafeMenu(removed));
@@ -415,14 +430,20 @@ namespace MonsterPanel
                     Task<string> task = Task.Run(() => FetchTrackJson(pids));
                     while (!task.IsCompleted) yield return null;
 
+                    List<string> cameOnline = null;
                     try
                     {
                         string json = task.Result;
                         if (json != null)
                         {
-                            ApplyTrackJson(json);
+                            cameOnline = ApplyTrackJson(json);
                             _lastError = "";
                             _apiReadyAt = Time.unscaledTime + PollIntervalSec;
+                            if (cameOnline != null && cameOnline.Count > 0)
+                            {
+                                for (int n = 0; n < cameOnline.Count; n++)
+                                    NotifyOnline(SafeMenu(cameOnline[n]));
+                            }
                             break;
                         }
                     }
@@ -504,16 +525,19 @@ namespace MonsterPanel
             return 2.5f;
         }
 
-        private static void ApplyTrackJson(string json)
+        /// <returns>Display names that just transitioned offline→online (for popup).</returns>
+        private static List<string> ApplyTrackJson(string json)
         {
+            var cameOnline = new List<string>();
             // Minimal JSON walk — avoid Newtonsoft dependency in MelonLoader.
             int playersIdx = json.IndexOf("\"players\"", StringComparison.Ordinal);
-            if (playersIdx < 0) return;
+            if (playersIdx < 0) return cameOnline;
             int arr = json.IndexOf('[', playersIdx);
-            if (arr < 0) return;
+            if (arr < 0) return cameOnline;
 
             int i = arr + 1;
             var now = DateTime.UtcNow;
+            float nowT = Time.unscaledTime;
             lock (Gate)
             {
                 while (i < json.Length)
@@ -573,10 +597,26 @@ namespace MonsterPanel
                         }
                     }
 
+                    bool nowOnline = snap.Found && snap.Online;
+                    bool hadPrev = LastOnline.TryGetValue(pid, out bool wasOnline);
+                    LastOnline[pid] = nowOnline;
+                    // First observation = baseline (no spam). Later offline→online → notify.
+                    if (hadPrev && !wasOnline && nowOnline)
+                    {
+                        bool cooled = !OnlineNotifyCdUntil.TryGetValue(pid, out float until) || nowT >= until;
+                        if (cooled)
+                        {
+                            OnlineNotifyCdUntil[pid] = nowT + PresenceNotifyCooldownSec;
+                            string nick = !string.IsNullOrWhiteSpace(snap.Name) ? snap.Name : ShortPid(pid);
+                            cameOnline.Add(nick);
+                        }
+                    }
+
                     Snapshots[pid] = snap;
                 }
                 SaveList_NoLock();
             }
+            return cameOnline;
         }
 
         private static void OnPageOpened(Page opened)
