@@ -8,10 +8,8 @@
 - В BoneMenu → **MONSTER Panel → Tracking** — список, статус, сервер, карта, язык, lobby code, время сессии, last seen
 - **Join server** — `NetworkHelper.JoinServerByCode` (нужен `lobby_code` от VPS scraper)
 - Опрос API раз в **10 секунд** (клиент + серверный cooldown)
-- Файлы: `UserData/MonsterPanel/tracking.cfg`, `tracking.json`
-
-API: `POST http://<vps>:8787/v1/track` (Bearer = `INGEST_API_KEY`).  
-В `tracking.cfg` укажи `ApiUrl` + `ApiKey` (подхватит `ApiKey` из старого `player_db.cfg`, если есть).
+- Список: `UserData/MonsterPanel/tracking.json` (URL/ключ вшиты в DLL)
+- API на VPS: `POST http://62.109.21.131:8787/v1/track` (player-ingest)
 
 ---
 

@@ -25,15 +25,14 @@ namespace MonsterPanel
     /// </summary>
     internal static class Tracking
     {
-        private const string CfgName = "tracking.cfg";
         private const string ListName = "tracking.json";
-        private const string DefaultApiUrl = "http://62.109.21.131:8787";
+        // Baked-in presence API (VPS player-ingest). No UserData secrets required.
+        private const string ApiUrl = "http://62.109.21.131:8787";
+        private const string ApiKey = "e63d7b2ae9d5006d109712e6c3ea2592611f563e380724de";
         private const float PollIntervalSec = 10f;
         private const int HttpTimeoutSeconds = 8;
         private const int MaxTracked = 32;
 
-        private static string _apiUrl = DefaultApiUrl;
-        private static string _apiKey = "";
         private static bool _enabled = true;
         private static bool _hooked;
         private static bool _menuHooked;
@@ -73,12 +72,11 @@ namespace MonsterPanel
 
         public static void Init(HarmonyLib.Harmony harmony)
         {
-            LoadConfig();
             LoadList();
             InstallFusionProfileHook(harmony);
             if (_enabled)
                 MelonCoroutines.Start(BootRoutine());
-            MelonLogger.Msg($"Tracking: enabled={_enabled} tracked={Entries.Count} api={_apiUrl}");
+            MelonLogger.Msg($"Tracking: enabled={_enabled} tracked={Entries.Count} api={ApiUrl}");
         }
 
         public static void InstallMenu(Page root)
@@ -231,17 +229,6 @@ namespace MonsterPanel
 
         private static string FetchTrackJson(List<string> pids)
         {
-            if (string.IsNullOrEmpty(_apiUrl))
-            {
-                _lastError = "ApiUrl missing";
-                return null;
-            }
-            if (string.IsNullOrEmpty(_apiKey))
-            {
-                _lastError = "ApiKey missing — set UserData/MonsterPanel/tracking.cfg";
-                return null;
-            }
-
             var sb = new StringBuilder(128 + pids.Count * 40);
             sb.Append("{\"pids\":[");
             for (int i = 0; i < pids.Count; i++)
@@ -251,8 +238,8 @@ namespace MonsterPanel
             }
             sb.Append("]}");
 
-            using var req = new HttpRequestMessage(HttpMethod.Post, Combine(_apiUrl, "/v1/track"));
-            req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + _apiKey);
+            using var req = new HttpRequestMessage(HttpMethod.Post, Combine(ApiUrl, "/v1/track"));
+            req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + ApiKey);
             req.Content = new StringContent(sb.ToString(), Encoding.UTF8, "application/json");
             using HttpResponseMessage resp = Http.Send(req);
             string body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
@@ -568,65 +555,6 @@ namespace MonsterPanel
             c.Timeout = TimeSpan.FromSeconds(HttpTimeoutSeconds);
             c.DefaultRequestHeaders.ExpectContinue = false;
             return c;
-        }
-
-        private static void LoadConfig()
-        {
-            try
-            {
-                string path = Path.Combine(UserDataDir(), CfgName);
-                Directory.CreateDirectory(Path.GetDirectoryName(path) ?? UserDataDir());
-                if (!File.Exists(path))
-                {
-                    // Prefer existing PlayerDb key if present
-                    string inheritedKey = TryReadLegacyApiKey();
-                    File.WriteAllText(path,
-                        "# MONSTER Panel — Tracking\n" +
-                        "Enabled=true\n" +
-                        "ApiUrl=" + DefaultApiUrl + "\n" +
-                        "ApiKey=" + inheritedKey + "\n" +
-                        "# Same key as INGEST_API_KEY on VPS player-ingest.\n" +
-                        "# Poll interval fixed at 10 seconds.\n");
-                    MelonLogger.Msg("Tracking: created " + path);
-                }
-
-                foreach (string raw in File.ReadAllLines(path))
-                {
-                    string line = raw.Trim();
-                    if (line.Length == 0 || line[0] == '#' || line[0] == ';') continue;
-                    int eq = line.IndexOf('=');
-                    if (eq <= 0) continue;
-                    string key = line.Substring(0, eq).Trim();
-                    string val = line.Substring(eq + 1).Trim();
-                    if (key.Equals("Enabled", StringComparison.OrdinalIgnoreCase))
-                        _enabled = !(val.Equals("false", StringComparison.OrdinalIgnoreCase) || val == "0");
-                    else if (key.Equals("ApiUrl", StringComparison.OrdinalIgnoreCase))
-                        _apiUrl = string.IsNullOrEmpty(val) ? DefaultApiUrl : val.TrimEnd('/');
-                    else if (key.Equals("ApiKey", StringComparison.OrdinalIgnoreCase))
-                        _apiKey = val;
-                }
-            }
-            catch (Exception e)
-            {
-                MelonLogger.Warning("Tracking config: " + e.Message);
-            }
-        }
-
-        private static string TryReadLegacyApiKey()
-        {
-            try
-            {
-                string legacy = Path.Combine(UserDataDir(), "player_db.cfg");
-                if (!File.Exists(legacy)) return "";
-                foreach (string raw in File.ReadAllLines(legacy))
-                {
-                    string line = raw.Trim();
-                    if (!line.StartsWith("ApiKey=", StringComparison.OrdinalIgnoreCase)) continue;
-                    return line.Substring("ApiKey=".Length).Trim();
-                }
-            }
-            catch { /* */ }
-            return "";
         }
 
         private static void LoadList()
