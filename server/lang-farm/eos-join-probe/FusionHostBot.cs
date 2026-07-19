@@ -298,7 +298,8 @@ internal static class FusionHostBot
                         string u = pl.GetProperty("username").GetString();
                         string a = pl.GetProperty("avatarTitle").GetString();
                         int mid = pl.GetProperty("avatarModID").GetInt32();
-                        bits.Add($"{u}|{a}|{mid}");
+                        int perm = pl.GetProperty("permissionLevel").GetInt32();
+                        bits.Add($"{u}|{a}|{mid}|p{perm}");
                     }
                     Console.WriteLine("[host] roster: " + string.Join(" ; ", bits));
                 }
