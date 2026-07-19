@@ -1209,7 +1209,7 @@ internal static class Program
                 stats = new SyncStats(
                     stats.Upserted + promoteStats.Upserted,
                     stats.Inserted + promoteStats.Inserted,
-                    stats.MarkedOffline,
+                    stats.MarkedOffline + promoteStats.MarkedOffline,
                     stats.Unchanged + promoteStats.Unchanged,
                     Loading: loadingPids.Count,
                     InGame: desired.Count - loadingPids.Count + promote.Count);
@@ -1224,7 +1224,47 @@ internal static class Program
             stats = stats with { Loading = 0, InGame = desired.Count };
         }
 
+        // Always ghost-sweep after the cycle — even if advisory lock skipped the main write
+        // (another writer / old VPS binary must not leave stale IN GAME rows).
+        int ghosts = SweepGhostsStandalone(seenPids);
+        if (ghosts > 0)
+            stats = stats with { MarkedOffline = stats.MarkedOffline + ghosts };
+
         return stats;
+    }
+
+    /// <summary>
+    /// Hard TTL offline for active rows not in this scrape. Own connection — no advisory lock.
+    /// </summary>
+    private static int SweepGhostsStandalone(string[] seenPids)
+    {
+        if (GhostTtlMin <= 0 || seenPids == null || seenPids.Length == 0)
+            return 0;
+        try
+        {
+            using var conn = new NpgsqlConnection(PostgresDsn);
+            conn.Open();
+            using var ghost = new NpgsqlCommand(
+                @"UPDATE client_data
+                  SET status = 'OFFLINE', server = NULL, server_map = NULL, lobby_code = NULL
+                  WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')
+                    AND NOT (pid = ANY(@seen))
+                    AND (
+                          last_seen_at IS NULL
+                          OR last_seen_at < NOW() - make_interval(mins => @ttl)
+                        )", conn);
+            ghost.Parameters.AddWithValue("seen", NpgsqlDbType.Array | NpgsqlDbType.Text, seenPids);
+            ghost.Parameters.AddWithValue("ttl", GhostTtlMin);
+            int n = ghost.ExecuteNonQuery();
+            if (n > 0)
+                Console.WriteLine($"[scraper] ghost sweep (standalone) ttl={GhostTtlMin}m → offline={n}");
+            return n;
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine("[scraper] ghost sweep standalone: " + e.Message);
+            return 0;
+        }
     }
 
     private static SyncStats WritePresence(

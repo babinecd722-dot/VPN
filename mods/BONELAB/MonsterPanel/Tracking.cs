@@ -83,6 +83,7 @@ namespace MonsterPanel
             public string LobbyCode = "";
             public string LastSeenAt = "";
             public int? SessionSec;
+            public int? OfflineSec;
             public DateTime FetchedUtc;
         }
 
@@ -559,6 +560,7 @@ namespace MonsterPanel
                         LobbyCode = JsonString(obj, "lobby_code") ?? "",
                         LastSeenAt = JsonString(obj, "last_seen_at") ?? "",
                         SessionSec = JsonInt(obj, "session_sec"),
+                        OfflineSec = JsonInt(obj, "offline_sec"),
                         FetchedUtc = now,
                     };
 
@@ -732,11 +734,17 @@ namespace MonsterPanel
                     : "OFFLINE";
                 body.Append("Status: ").Append(SafeMenu(st, 28)).Append('\n');
                 body.Append("Language: ").Append(SafeMenu(NullDash(snap.Language), 20)).Append('\n');
-                body.Append("Server: ").Append(SafeMenu(NullDash(snap.Server), 36)).Append('\n');
-                body.Append("Map: ").Append(SafeMenu(NullDash(snap.Map), 36)).Append('\n');
-                body.Append("Lobby: ").Append(SafeMenu(NullDash(snap.LobbyCode), 12)).Append('\n');
-                body.Append("Session: ").Append(FormatSession(snap)).Append('\n');
-                body.Append("Last seen: ").Append(FormatLastSeen(snap)).Append('\n');
+                if (snap.Online)
+                {
+                    body.Append("Server: ").Append(SafeMenu(NullDash(snap.Server), 36)).Append('\n');
+                    body.Append("Map: ").Append(SafeMenu(NullDash(snap.Map), 36)).Append('\n');
+                    body.Append("Lobby: ").Append(SafeMenu(NullDash(snap.LobbyCode), 12)).Append('\n');
+                    body.Append("In game: ").Append(FormatDuration(snap.SessionSec)).Append('\n');
+                }
+                else
+                {
+                    body.Append("Offline: ").Append(FormatDuration(snap.OfflineSec)).Append('\n');
+                }
             }
 
             bool canJoin = snap != null && snap.Online && !string.IsNullOrWhiteSpace(snap.LobbyCode);
@@ -940,26 +948,13 @@ namespace MonsterPanel
             return name + "   offline";
         }
 
-        private static string FormatSession(TrackSnapshot snap)
+        private static string FormatDuration(int? sec)
         {
-            if (!snap.Online || snap.SessionSec == null) return snap.Online ? "…" : "offline";
-            int s = snap.SessionSec.Value;
+            if (sec == null) return "…";
+            int s = sec.Value;
             if (s < 60) return s + "s";
             if (s < 3600) return (s / 60) + "m " + (s % 60) + "s";
             return (s / 3600) + "h " + ((s % 3600) / 60) + "m";
-        }
-
-        private static string FormatLastSeen(TrackSnapshot snap)
-        {
-            if (snap.Online) return "now";
-            if (string.IsNullOrEmpty(snap.LastSeenAt)) return "-";
-            if (!DateTime.TryParse(snap.LastSeenAt, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var dt))
-                return SafeMenu(snap.LastSeenAt, 24);
-            var ago = DateTime.UtcNow - dt.ToUniversalTime();
-            if (ago.TotalSeconds < 90) return "just now";
-            if (ago.TotalMinutes < 60) return ((int)ago.TotalMinutes) + "m ago";
-            if (ago.TotalHours < 48) return ((int)ago.TotalHours) + "h ago";
-            return ((int)ago.TotalDays) + "d ago";
         }
 
         private static void InstallFusionProfileHook(HarmonyLib.Harmony harmony)

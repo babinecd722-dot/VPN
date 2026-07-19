@@ -6,7 +6,7 @@ import logging
 import re
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import psycopg
@@ -23,6 +23,8 @@ _NAME_MAX = 128
 _PID_MAX = 128
 _BATCH_MAX = 64
 _TRACK_MIN_INTERVAL_SEC = 10.0
+# Presence older than this is treated as OFFLINE for clients (anti-ghost).
+_GHOST_TTL = timedelta(minutes=4)
 
 
 class Settings(BaseSettings):
@@ -141,17 +143,37 @@ def _iso(dt: Any) -> str | None:
     return str(dt)
 
 
-def _session_sec(status: str | None, changed: Any) -> int | None:
-    if not status or not changed:
+def _elapsed_sec(anchor: Any) -> int | None:
+    if not isinstance(anchor, datetime):
         return None
-    st = status.strip().upper()
-    if st not in ("IN GAME", "LOADING", "ONLINE"):
-        return None
-    if not isinstance(changed, datetime):
-        return None
-    if changed.tzinfo is None:
-        changed = changed.replace(tzinfo=timezone.utc)
-    return max(0, int((datetime.now(timezone.utc) - changed.astimezone(timezone.utc)).total_seconds()))
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    return max(0, int((datetime.now(timezone.utc) - anchor.astimezone(timezone.utc)).total_seconds()))
+
+
+def _normalize_presence(status: str | None, last_seen: Any, changed: Any) -> tuple[str, bool, int | None, int | None]:
+    """Return (status, online, session_sec, offline_sec). Stale last_seen → force offline."""
+    st = (status or "OFFLINE").strip()
+    st_u = st.upper()
+    online = st_u in ("IN GAME", "LOADING", "ONLINE")
+    now = datetime.now(timezone.utc)
+
+    ls = last_seen
+    if isinstance(ls, datetime) and ls.tzinfo is None:
+        ls = ls.replace(tzinfo=timezone.utc)
+
+    if online:
+        stale = ls is None or (isinstance(ls, datetime) and (now - ls.astimezone(timezone.utc)) > _GHOST_TTL)
+        if stale:
+            # Ghost / scraper lag — do not report as online.
+            online = False
+            st = "OFFLINE"
+            offline_sec = _elapsed_sec(ls if isinstance(ls, datetime) else changed)
+            return st, online, None, offline_sec
+        return st, True, _elapsed_sec(changed), None
+
+    # Truly offline: time since status flipped to OFFLINE (fallback last_seen).
+    return st, False, None, _elapsed_sec(changed if changed is not None else ls)
 
 
 @app.get("/health")
@@ -238,25 +260,30 @@ def track(body: TrackBody, token: str = Depends(require_key)) -> dict[str, Any]:
                     "last_seen_at": None,
                     "status_changed_at": None,
                     "session_sec": None,
+                    "offline_sec": None,
                     "online": False,
                 }
             )
             continue
-        st = (row.get("status") or "OFFLINE").strip()
-        online = st.upper() in ("IN GAME", "LOADING", "ONLINE")
+        st, online, session_sec, offline_sec = _normalize_presence(
+            row.get("status"),
+            row.get("last_seen_at"),
+            row.get("status_changed_at"),
+        )
         players.append(
             {
                 "pid": pid,
                 "found": True,
                 "name": row.get("name"),
                 "status": st,
-                "server": row.get("server"),
-                "server_map": row.get("server_map"),
+                "server": None if not online else row.get("server"),
+                "server_map": None if not online else row.get("server_map"),
                 "language": row.get("language"),
-                "lobby_code": row.get("lobby_code"),
+                "lobby_code": None if not online else row.get("lobby_code"),
                 "last_seen_at": _iso(row.get("last_seen_at")),
                 "status_changed_at": _iso(row.get("status_changed_at")),
-                "session_sec": _session_sec(st, row.get("status_changed_at")),
+                "session_sec": session_sec,
+                "offline_sec": offline_sec,
                 "online": online,
             }
         )
