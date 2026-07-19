@@ -7,7 +7,7 @@
 #     | sudo bash
 #
 # Optional overrides:
-#   HOST_LOBBY_NAME=www.bonelab.fun BOT_NICK=ADMIN HOST_P2P_PORT=17877
+#   HOST_LOBBY_NAME=www.bonelab.fun BOT_NICK=coolguy HOST_P2P_PORT=17877
 set -euo pipefail
 
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -74,7 +74,7 @@ exec env \
   HOST_LOBBY_NAME="${HOST_LOBBY_NAME:-www.bonelab.fun}" \
   HOST_LOBBY_DESC="${HOST_LOBBY_DESC:-Официальный сервер www.bonelab.fun}" \
   HOST_LEVEL_TITLE="${HOST_LEVEL_TITLE:-Halfway Park}" \
-  BOT_NICK="${BOT_NICK:-ADMIN}" \
+  BOT_NICK="${BOT_NICK:-coolguy}" \
   HOST_HOLD_SEC="${HOST_HOLD_SEC:-0}" \
   HOST_P2P_PORT="${HOST_P2P_PORT:-17877}" \
   HOST_MAX_MEMBERS="${HOST_MAX_MEMBERS:-8}" \

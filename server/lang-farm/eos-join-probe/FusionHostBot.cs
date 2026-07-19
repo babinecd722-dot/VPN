@@ -27,7 +27,8 @@ internal static class FusionHostBot
     private static readonly string LevelBarcode = Env(
         "HOST_LEVEL_BARCODE",
         "fa534c5a83ee4ec6bd641fec424c4142.Level.LevelHalfwayPark");
-    private static readonly string BotNick = Env("BOT_NICK", "ADMIN");
+    // Looks like a normal Quest nick from our DB (not "ADMIN").
+    private static readonly string BotNick = Env("BOT_NICK", "coolguy");
     private static readonly string LobbyVersion = Env("HOST_LOBBY_VERSION", "1.14.2");
     private static readonly int MaxMembers = int.TryParse(Env("HOST_MAX_MEMBERS", "8"), out var m)
         ? Math.Clamp(m, 2, 32) : 8;
@@ -539,7 +540,7 @@ internal static class FusionHostBot
         "Vraptor10", "AIDEN", "Trylix", "quietone", "fzitsalex",
         "clowny47", "nickai", "GamerKid20", "dagoat", "Biggins",
         "veil", "Nosbik", "deftimes13", "skelly", "toast",
-        "astro", "coolguy", "DexterFetch", "dino", "bobby",
+        "astro", "DexterFetch", "dino", "bobby", "shadow",
         "ghost", "luke", "cam", "blue", "Ace",
     };
 
@@ -601,14 +602,14 @@ internal static class FusionHostBot
                 ["username"] = name,
                 ["nickname"] = name,
                 ["description"] = "",
-                ["permissionLevel"] = 0,
+                ["permissionLevel"] = PickNonOwnerPermission(_lobbyCode, kv.Value),
                 ["avatarTitle"] = "Ford",
                 ["avatarModID"] = -1,
             });
         }
         // Pad LobbyInfo only — no EOS members, no P2P, no CPU. Stable fake IDs per lobby code.
         int need = ShownPlayerCount() - list.Count;
-        var usedNicks = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var usedNicks = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { BotNick };
         foreach (var o in list)
         {
             if (o is Dictionary<string, object> d && d.TryGetValue("username", out var u) && u is string s)
@@ -619,7 +620,6 @@ internal static class FusionHostBot
         {
             string fakeId = FakePlatformId(_lobbyCode, i);
             string fakeName = FakeDisplayName(_lobbyCode, i, usedNicks);
-            usedNicks.Add(fakeName);
             var av = PickAvatar(_lobbyCode, i);
             list.Add(new Dictionary<string, object>
             {
@@ -627,12 +627,21 @@ internal static class FusionHostBot
                 ["username"] = fakeName,
                 ["nickname"] = fakeName,
                 ["description"] = "",
-                ["permissionLevel"] = 0,
+                // 0 = DEFAULT, 1 = OPERATOR — never 2 (OWNER); only the real host keeps owner.
+                ["permissionLevel"] = PickNonOwnerPermission(_lobbyCode, i),
                 ["avatarTitle"] = av.Title,
                 ["avatarModID"] = av.ModId,
             });
         }
         return list.ToArray();
+    }
+
+    /// <summary>Fusion: 0 DEFAULT, 1 OPERATOR, 2 OWNER. Pads never get OWNER.</summary>
+    private static int PickNonOwnerPermission(string seed, int index)
+    {
+        byte[] hash = SHA256.HashData(Encoding.UTF8.GetBytes($"perm|{seed}|{index}"));
+        // ~25% OPERATOR (1), rest DEFAULT (0).
+        return (hash[0] % 4) == 0 ? 1 : 0;
     }
 
     private static string FakePlatformId(string seed, int index)
