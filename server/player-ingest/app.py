@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -25,6 +26,8 @@ _BATCH_MAX = 64
 _TRACK_MIN_INTERVAL_SEC = 10.0
 # Presence older than this is treated as OFFLINE for clients (anti-ghost).
 _GHOST_TTL = timedelta(minutes=4)
+_GHOST_TTL_MIN = 4
+_GHOST_SWEEP_SEC = 20.0
 
 
 class Settings(BaseSettings):
@@ -39,11 +42,54 @@ class Settings(BaseSettings):
 settings = Settings()
 pool: ConnectionPool | None = None
 _track_last: dict[str, float] = {}
+_sweep_stop = threading.Event()
+_sweep_thread: threading.Thread | None = None
+_last_sweep: dict[str, Any] = {"at": None, "offline": 0}
+
+
+def _ghost_sweep_once() -> int:
+    """Force-OFFLINE any active row with null/stale last_seen. Independent of scraper."""
+    assert pool is not None
+    with pool.connection() as conn:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE client_data
+                    SET status = 'OFFLINE',
+                        server = NULL,
+                        server_map = NULL,
+                        lobby_code = NULL
+                    WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')
+                      AND (
+                            last_seen_at IS NULL
+                            OR last_seen_at < NOW() - make_interval(mins => %s)
+                          )
+                    """,
+                    (_GHOST_TTL_MIN,),
+                )
+                return cur.rowcount
+
+
+def _ghost_sweep_loop() -> None:
+    # Scraper on VPS has repeatedly shipped without refreshing last_seen; this loop
+    # is the hard backstop so DB presence cannot rot for more than ~TTL+interval.
+    while not _sweep_stop.wait(_GHOST_SWEEP_SEC):
+        if pool is None:
+            continue
+        try:
+            n = _ghost_sweep_once()
+            _last_sweep["at"] = datetime.now(timezone.utc).isoformat()
+            _last_sweep["offline"] = n
+            if n > 0:
+                log.info("ghost sweep → offline=%s", n)
+        except Exception as e:
+            log.warning("ghost sweep failed: %s", e)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    global pool
+    global pool, _sweep_thread
     pool = ConnectionPool(
         conninfo=settings.postgres_dsn,
         min_size=1,
@@ -54,14 +100,22 @@ async def lifespan(_app: FastAPI):
     with pool.connection() as conn:
         conn.execute("SELECT 1")
     log.info("postgres pool ready")
+    _sweep_stop.clear()
+    _sweep_thread = threading.Thread(target=_ghost_sweep_loop, name="ghost-sweep", daemon=True)
+    _sweep_thread.start()
+    log.info("ghost sweep loop started ttl=%sm every=%ss", _GHOST_TTL_MIN, int(_GHOST_SWEEP_SEC))
     try:
         yield
     finally:
+        _sweep_stop.set()
+        if _sweep_thread is not None:
+            _sweep_thread.join(timeout=5)
+            _sweep_thread = None
         pool.close()
         pool = None
 
 
-app = FastAPI(title="Player Ingest", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Player Ingest", version="1.2.0", lifespan=lifespan)
 
 
 def require_key(authorization: str | None = Header(default=None)) -> str:
@@ -187,6 +241,50 @@ def health() -> dict[str, Any]:
     except Exception as e:
         log.warning("health db fail: %s", e)
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "database not connected") from e
+
+
+@app.get("/v1/presence-stats")
+def presence_stats(_: str = Depends(require_key)) -> dict[str, Any]:
+    """Live vs ghost counts (ghost = active status but last_seen older than TTL)."""
+    assert pool is not None
+    try:
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                      count(*) AS total,
+                      count(*) FILTER (WHERE status = 'IN GAME') AS ingame,
+                      count(*) FILTER (WHERE status = 'LOADING') AS loading,
+                      count(*) FILTER (
+                        WHERE status = 'IN GAME'
+                          AND last_seen_at >= NOW() - make_interval(mins => %s)
+                      ) AS live4,
+                      count(*) FILTER (
+                        WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')
+                          AND (
+                                last_seen_at IS NULL
+                                OR last_seen_at < NOW() - make_interval(mins => %s)
+                              )
+                      ) AS ghost4
+                    FROM client_data
+                    """,
+                    (_GHOST_TTL_MIN, _GHOST_TTL_MIN),
+                )
+                row = cur.fetchone() or {}
+    except psycopg.Error as e:
+        log.exception("presence-stats failed")
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "db read failed") from e
+    return {
+        "ok": True,
+        "ttl_min": _GHOST_TTL_MIN,
+        "total": row.get("total", 0),
+        "ingame": row.get("ingame", 0),
+        "loading": row.get("loading", 0),
+        "live4": row.get("live4", 0),
+        "ghost4": row.get("ghost4", 0),
+        "last_sweep": _last_sweep,
+    }
 
 
 @app.post("/v1/players")
