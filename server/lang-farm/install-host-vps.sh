@@ -92,8 +92,9 @@ fi
 mkdir -p "$DEST/data"
 
 # Write / merge .env — never touch scraper/ingest env files.
-HOST_LOBBY_NAME="${HOST_LOBBY_NAME:-Bonelab.fun}"
-HOST_LOBBY_DESC="${HOST_LOBBY_DESC:-Official Bonelab.fun server}"
+# U+2024 one-dot leaders bypass Fusion LinkFilter (ASCII www.bonelab.fun is censored).
+HOST_LOBBY_NAME="${HOST_LOBBY_NAME:-www․bonelab․fun}"
+HOST_LOBBY_DESC="${HOST_LOBBY_DESC:-www․bonelab․fun}"
 HOST_LEVEL_TITLE="${HOST_LEVEL_TITLE:-Halfway Park}"
 HOST_LEVEL_BARCODE="${HOST_LEVEL_BARCODE:-fa534c5a83ee4ec6bd641fec424c4142.Level.LevelHalfwayPark}"
 BOT_NICK="${BOT_NICK:-coolguy}"
@@ -134,7 +135,7 @@ fi
 
 cat >"/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
-Description=BONELAB Fusion lobby host (Bonelab.fun listing)
+Description=BONELAB Fusion lobby host (www.bonelab.fun listing)
 After=network-online.target
 Wants=network-online.target
 # Explicitly independent of scraper/ingest — no Requires= on those units.

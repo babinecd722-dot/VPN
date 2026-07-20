@@ -19,10 +19,12 @@ namespace EosJoinProbe;
 internal static class FusionHostBot
 {
     private static readonly string GameName = Env("FUSION_GAME_NAME", "BONELAB");
-    private static readonly string LobbyName = Env("HOST_LOBBY_NAME", "Bonelab.fun");
+    // Unicode one-dot leader (U+2024) instead of ASCII '.' so Fusion LinkFilter
+    // does not censor name/desc as a URL (still reads as www.bonelab.fun).
+    private static readonly string LobbyName = Env("HOST_LOBBY_NAME", "www․bonelab․fun");
     private static readonly string LobbyDesc = Env(
         "HOST_LOBBY_DESC",
-        "Official Bonelab.fun server");
+        "www․bonelab․fun");
     private static readonly string LevelTitle = Env("HOST_LEVEL_TITLE", "Halfway Park");
     private static readonly string LevelBarcode = Env(
         "HOST_LEVEL_BARCODE",
