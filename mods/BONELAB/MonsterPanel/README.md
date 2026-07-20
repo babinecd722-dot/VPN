@@ -1,18 +1,18 @@
 # MONSTER Panel (BONELAB MelonLoader mod)
 
-## Tracking (2.30.18+)
+## Tracking (2.30.19+)
 
 Слежение за игроками Fusion по EOS `pid` (локальный список + Postgres presence).
 
-- В **профиле другого игрока** (иконка в лобби Fusion) → **Add to Tracking** / Remove
-- В BoneMenu → **MONSTER Panel → Tracking** — список, статус, сервер, карта, язык, lobby code, время сессии
-- **Join server** — `NetworkHelper.JoinServerByCode` (нужен `lobby_code` от VPS scraper)
-- Открытие меню: сначала кэш, poll через ~1.7s; UI rebuild только если данные изменились (без bounds/GUIPool краша)
-- Вне лобби: редкий idle poll (~45s) греет кэш; в лобби с закрытым меню — полностью inert
-- Список: `UserData/MonsterPanel/tracking.json` (URL/ключ вшиты в DLL)
-- API на VPS: `POST http://62.109.21.131:8787/v1/track` (player-ingest)
+- В **профиле другого игрока** → **Add to Tracking** / Remove
+- BoneMenu → **Tracking**: one-shot fetch при открытии (без live-тиков playtime → без Quest bounds crash)
+- Playtime/Offline — статично из БД на момент запроса
+- При входе в Fusion: один фоновый `/v1/track` → popup «**nick** is online»
+- **JOIN**: leave → settle → retry; код лобби без перерисовки меню
+- Список: `UserData/MonsterPanel/tracking.json`
+- API: `POST http://62.109.21.131:8787/v1/track`
 
-**Spoofing PID → Reset spoof PID**: сбрасывает заминченный zero-account и минтит новый (если старый burned/banned). Не трогает обычный PID.
+**Reset spoof PID**: минтит новый zero-account (если старый burned).
 
 ---
 
