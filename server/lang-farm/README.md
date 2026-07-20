@@ -23,7 +23,7 @@ POSTGRES_DSN=... BOT_NICK=bonelab.fun bash orchestrator/run_parallel.sh
 
 Do **not** run farm bots on the Tracking VPS (DeviceId / port fights).
 
-## VPS lobby host 24/7 (`www.bonelab.fun`)
+## VPS lobby host 24/7 (`Bonelab.fun`)
 
 Isolated systemd unit — separate from scraper + player-ingest:
 
@@ -47,7 +47,7 @@ systemctl status fusion-lobby-host
 journalctl -u fusion-lobby-host -f
 ```
 
-Defaults: lobby name `www.bonelab.fun`, nick `ADMIN`, map Halfway Park, `HOST_HOLD_SEC=0` (forever), soft caps `MemoryMax=256M` / `CPUQuota=50%`.
+Defaults: lobby name `Bonelab.fun`, nick `coolguy`, map Halfway Park, `HOST_HOLD_SEC=0` (forever), soft caps `MemoryMax=256M` / `CPUQuota=50%`.
 
 `HOST_DISPLAY_PLAYERS=7` pads **LobbyInfo only** (browser count looks full-ish, `Full=False` so Find still returns it). Zero extra processes/CPU — not real bots.
 

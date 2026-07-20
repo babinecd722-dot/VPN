@@ -19,10 +19,10 @@ namespace EosJoinProbe;
 internal static class FusionHostBot
 {
     private static readonly string GameName = Env("FUSION_GAME_NAME", "BONELAB");
-    private static readonly string LobbyName = Env("HOST_LOBBY_NAME", "www.bonelab.fun");
+    private static readonly string LobbyName = Env("HOST_LOBBY_NAME", "Bonelab.fun");
     private static readonly string LobbyDesc = Env(
         "HOST_LOBBY_DESC",
-        "Официальный сервер www.bonelab.fun");
+        "Official Bonelab.fun server");
     private static readonly string LevelTitle = Env("HOST_LEVEL_TITLE", "Halfway Park");
     private static readonly string LevelBarcode = Env(
         "HOST_LEVEL_BARCODE",

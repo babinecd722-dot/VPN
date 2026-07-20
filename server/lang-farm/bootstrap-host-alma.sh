@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot Alma/VPS bootstrap for the isolated Fusion lobby host (www.bonelab.fun).
+# One-shot Alma/VPS bootstrap for the isolated Fusion lobby host (Bonelab.fun).
 # Does NOT touch eos-lobby-scraper / player-ingest.
 #
 # Usage (as root, from any cwd — even a deleted PWD):
@@ -7,7 +7,7 @@
 #     | sudo bash
 #
 # Optional overrides:
-#   HOST_LOBBY_NAME=www.bonelab.fun BOT_NICK=coolguy HOST_P2P_PORT=17877
+#   HOST_LOBBY_NAME=Bonelab.fun BOT_NICK=coolguy HOST_P2P_PORT=17877
 set -euo pipefail
 
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -71,8 +71,8 @@ fi
 
 echo "[bootstrap-host] building + installing from $BUILD_ROOT ..."
 exec env \
-  HOST_LOBBY_NAME="${HOST_LOBBY_NAME:-www.bonelab.fun}" \
-  HOST_LOBBY_DESC="${HOST_LOBBY_DESC:-Официальный сервер www.bonelab.fun}" \
+  HOST_LOBBY_NAME="${HOST_LOBBY_NAME:-Bonelab.fun}" \
+  HOST_LOBBY_DESC="${HOST_LOBBY_DESC:-Official Bonelab.fun server}" \
   HOST_LEVEL_TITLE="${HOST_LEVEL_TITLE:-Halfway Park}" \
   BOT_NICK="${BOT_NICK:-coolguy}" \
   HOST_HOLD_SEC="${HOST_HOLD_SEC:-0}" \
