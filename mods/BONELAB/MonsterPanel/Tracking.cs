@@ -179,6 +179,8 @@ namespace MonsterPanel
             int count;
             lock (Gate) { count = Entries.Count; }
             if (count == 0) return;
+            // Lock BEFORE Start — Joined+Started can fire same frame.
+            _fusionAlertDone = true;
             MelonLogger.Msg("Tracking: Fusion enter — scheduling online alerts (once)");
             MelonCoroutines.Start(OnlineAlertRoutine());
         }
@@ -188,9 +190,9 @@ namespace MonsterPanel
         /// </summary>
         private static IEnumerator OnlineAlertRoutine()
         {
-            if (_joinNotifyRunning || _fusionAlertDone) yield break;
+            if (_joinNotifyRunning) yield break;
             _joinNotifyRunning = true;
-            _fusionAlertDone = true;
+            // _fusionAlertDone already set in OnEnteredFusion
 
             try
             {
