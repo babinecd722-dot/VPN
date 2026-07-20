@@ -8,6 +8,9 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <ItemGroup>
+    <!-- Patches are copied over third_party at install time; do not compile them as a second copy. -->
+    <Compile Remove="patches/**" />
+    <None Include="patches/**" />
     <None Update="native/libEOSSDK-Linux-Shipping.so" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
