@@ -79,7 +79,7 @@ def _ghost_sweep_once() -> int:
                 row = cur.fetchone() or {}
                 active = int(row.get("active") or 0)
                 stale = int(row.get("stale") or 0)
-                if active > 20 and stale >= max(1, int(active * _GHOST_SWEEP_COLLAPSE_RATIO)):
+                if _is_scrape_lag(active, stale):
                     log.warning(
                         "ghost sweep skipped collapse active=%s stale=%s ratio>=%.2f",
                         active,
@@ -238,8 +238,51 @@ def _elapsed_sec(anchor: Any) -> int | None:
     return max(0, int((datetime.now(timezone.utc) - anchor.astimezone(timezone.utc)).total_seconds()))
 
 
-def _normalize_presence(status: str | None, last_seen: Any, changed: Any) -> tuple[str, bool, int | None, int | None]:
-    """Return (status, online, session_sec, offline_sec). Stale last_seen → force offline."""
+def _is_scrape_lag(active: int, stale: int) -> bool:
+    """True when a huge slice of the board is TTL-stale → scraper mid-Find, not mass logout."""
+    if active <= 20:
+        return False
+    return stale >= max(1, int(active * _GHOST_SWEEP_COLLAPSE_RATIO))
+
+
+def _scrape_lag_now() -> bool:
+    """Board-wide scrape lag (same collapse guard as ghost sweep)."""
+    assert pool is not None
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                  count(*) FILTER (
+                    WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')
+                  ) AS active,
+                  count(*) FILTER (
+                    WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')
+                      AND (
+                            last_seen_at IS NULL
+                            OR last_seen_at < NOW() - make_interval(secs => %s)
+                          )
+                  ) AS stale
+                FROM client_data
+                """,
+                (_GHOST_TTL_SEC,),
+            )
+            row = cur.fetchone() or {}
+    return _is_scrape_lag(int(row.get("active") or 0), int(row.get("stale") or 0))
+
+
+def _normalize_presence(
+    status: str | None,
+    last_seen: Any,
+    changed: Any,
+    *,
+    scrape_lag: bool = False,
+) -> tuple[str, bool, int | None, int | None]:
+    """Return (status, online, session_sec, offline_sec).
+
+    Stale last_seen → force offline, unless scrape_lag (mass stale = mid-Find lag).
+    TTL stays 90s; scrape_lag only prevents board-wide track flicker.
+    """
     st = (status or "OFFLINE").strip()
     st_u = st.upper()
     online = st_u in ("IN GAME", "LOADING", "ONLINE")
@@ -251,8 +294,8 @@ def _normalize_presence(status: str | None, last_seen: Any, changed: Any) -> tup
 
     if online:
         stale = ls is None or (isinstance(ls, datetime) and (now - ls.astimezone(timezone.utc)) > _GHOST_TTL)
-        if stale:
-            # Ghost / scraper lag — do not report as online.
+        if stale and not scrape_lag:
+            # Lone ghost / true leave — do not report as online.
             online = False
             st = "OFFLINE"
             offline_sec = _elapsed_sec(ls if isinstance(ls, datetime) else changed)
@@ -309,6 +352,10 @@ def presence_stats(_: str = Depends(require_key)) -> dict[str, Any]:
     except psycopg.Error as e:
         log.exception("presence-stats failed")
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "db read failed") from e
+    try:
+        scrape_lag = _scrape_lag_now()
+    except Exception:
+        scrape_lag = False
     return {
         "ok": True,
         "ttl_sec": _GHOST_TTL_SEC,
@@ -317,6 +364,7 @@ def presence_stats(_: str = Depends(require_key)) -> dict[str, Any]:
         "loading": row.get("loading", 0),
         "live": row.get("live", 0),
         "ghost": row.get("ghost", 0),
+        "scrape_lag": scrape_lag,
         # Aliases for old clients/scripts
         "live4": row.get("live", 0),
         "ghost4": row.get("ghost", 0),
@@ -363,6 +411,7 @@ def track(body: TrackBody, token: str = Depends(require_key)) -> dict[str, Any]:
     _enforce_track_cd(token)
 
     try:
+        scrape_lag = _scrape_lag_now()
         with pool.connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -405,6 +454,7 @@ def track(body: TrackBody, token: str = Depends(require_key)) -> dict[str, Any]:
             row.get("status"),
             row.get("last_seen_at"),
             row.get("status_changed_at"),
+            scrape_lag=scrape_lag,
         )
         players.append(
             {
@@ -424,4 +474,4 @@ def track(body: TrackBody, token: str = Depends(require_key)) -> dict[str, Any]:
             }
         )
 
-    return {"ok": True, "count": len(players), "players": players}
+    return {"ok": True, "count": len(players), "players": players, "scrape_lag": scrape_lag}

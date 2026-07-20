@@ -49,9 +49,9 @@ internal static class Program
     // Mid-Find last_seen refresh for the current lease roster. Full EOS Find can run
     // ~100–130s; without this, age exceeds GHOST_TTL_SEC=90 and /v1/track flickers OFFLINE.
     // Does NOT promote OFFLINE→IN GAME — only refreshes rows still active.
-    private static readonly int LeaseHeartbeatSec = int.TryParse(Env("LEASE_HEARTBEAT_SEC", "40"), out var lh)
+    private static readonly int LeaseHeartbeatSec = int.TryParse(Env("LEASE_HEARTBEAT_SEC", "35"), out var lh)
         ? Math.Clamp(lh, 15, 120)
-        : 40;
+        : 35;
     private static readonly bool UseAdvisoryLock = Env("ADVISORY_LOCK", "1") != "0";
     // Stable key for pg_try_advisory_xact_lock (two writers → one skips cycle).
     private const long PresenceLockKey = 872314659L;
@@ -197,8 +197,6 @@ internal static class Program
                         Console.WriteLine($"  sample: {p.Pid} | {p.Name} | {p.Server ?? "-"} | {p.ServerMap ?? "-"}");
 
                     var stats = SyncPresence(snapshot.Players);
-                    if (snapshot.Players.Count > 0)
-                        SetLeasePids(snapshot.Players.Keys);
                     if (stats.Skipped)
                         Console.WriteLine("[scraper] db skipped (advisory lock held by another writer)");
                     else
@@ -916,6 +914,9 @@ internal static class Program
                 {
                     try { details.Release(); } catch { /* ignore */ }
                 }
+                // Long parse of 200-cap shards can exceed TTL without a Find wait.
+                if ((i % 40) == 39)
+                    MaybeTouchLease();
             }
         }
         finally
@@ -1278,8 +1279,17 @@ internal static class Program
             int ghosts = SweepGhostsStandalone();
             if (ghosts > 0)
                 stats = stats with { MarkedOffline = stats.MarkedOffline + ghosts };
+            // Full scrape: lease = who we saw (leavers drop off the mid-Find heartbeat).
+            SetLeasePids(seenPids);
+        }
+        else
+        {
+            // Warmup/collapse: keep previous lease ∪ seen so mid-Find refresh still covers
+            // the board while we refuse mass-OFFLINE.
+            MergeLeasePids(seenPids);
         }
 
+        MaybeTouchLease(force: true);
         return stats;
     }
 
@@ -1381,6 +1391,21 @@ internal static class Program
         lock (LeaseLock)
         {
             _leasePids = next;
+        }
+    }
+
+    private static void MergeLeasePids(IEnumerable<string> pids)
+    {
+        if (pids == null) return;
+        lock (LeaseLock)
+        {
+            var set = new HashSet<string>(_leasePids, StringComparer.Ordinal);
+            foreach (string pid in pids)
+            {
+                if (!string.IsNullOrWhiteSpace(pid))
+                    set.Add(pid);
+            }
+            _leasePids = set.ToArray();
         }
     }
 
