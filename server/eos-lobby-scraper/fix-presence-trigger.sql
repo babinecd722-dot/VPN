@@ -2,8 +2,8 @@
 --   sudo -u postgres psql -d clientdb -f fix-presence-trigger.sql
 --
 -- 1) Writers that omit last_seen_at still refresh it (anti-ghost).
--- 2) Session timer (status_changed_at) SURVIVES brief OFFLINE blips
---    (scraper restart / ghost sweep) so Tracking "minutes in game" does not reset.
+-- 2) Session timer survives only SHORT offline blips (~3 min), not all-day hops.
+-- 3) Lobby/server change while still IN GAME starts a new session timer.
 
 CREATE OR REPLACE FUNCTION public.fusion_sync_status_timestamps()
 RETURNS trigger
@@ -18,8 +18,8 @@ DECLARE
     new_offline BOOLEAN;
     presence_changed BOOLEAN;
     last_seen_untouched BOOLEAN;
-    -- Resume same play-session if last real sighting was within this window.
-    session_resume INTERVAL := interval '5 minutes';
+    -- One scrape miss / short EOS lag only — NOT multi-hour lobby hopping.
+    session_resume INTERVAL := interval '3 minutes';
 BEGIN
     new_status := UPPER(BTRIM(COALESCE(NEW.status::TEXT, 'OFFLINE')));
     new_offline := new_status = 'OFFLINE';
@@ -47,6 +47,14 @@ BEGIN
     END IF;
 
     IF new_status IS NOT DISTINCT FROM old_status THEN
+        -- Same status but moved lobby/server → new session (stops 24h "in game" lies).
+        IF (NOT new_offline)
+           AND (
+             NEW.lobby_code IS DISTINCT FROM OLD.lobby_code
+             OR NEW.server IS DISTINCT FROM OLD.server
+           ) THEN
+            NEW.status_changed_at := changed_at;
+        END IF;
         RETURN NEW;
     END IF;
 
