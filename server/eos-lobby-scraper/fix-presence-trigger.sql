@@ -2,8 +2,8 @@
 --   sudo -u postgres psql -d clientdb -f fix-presence-trigger.sql
 --
 -- 1) Writers that omit last_seen_at still refresh it (anti-ghost).
--- 2) Session timer survives only SHORT offline blips (~3 min), not all-day hops.
--- 3) Lobby/server change while still IN GAME starts a new session timer.
+-- 2) Session timer survives only SHORT offline blips (~3 min).
+--    Lobby hops while still IN GAME keep the same session (not a logout).
 
 CREATE OR REPLACE FUNCTION public.fusion_sync_status_timestamps()
 RETURNS trigger
@@ -47,14 +47,6 @@ BEGIN
     END IF;
 
     IF new_status IS NOT DISTINCT FROM old_status THEN
-        -- Same status but moved lobby/server → new session (stops 24h "in game" lies).
-        IF (NOT new_offline)
-           AND (
-             NEW.lobby_code IS DISTINCT FROM OLD.lobby_code
-             OR NEW.server IS DISTINCT FROM OLD.server
-           ) THEN
-            NEW.status_changed_at := changed_at;
-        END IF;
         RETURN NEW;
     END IF;
 
