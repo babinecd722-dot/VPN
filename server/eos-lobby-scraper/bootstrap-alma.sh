@@ -2,10 +2,10 @@
 # One-shot Alma/VPS bootstrap: clone branch → unpack EOS pack → overlay latest sources → systemd.
 # Usage (as root):
 #   curl -fsSL 'https://cdn.jsdelivr.net/gh/babinecd722-dot/VPN@cursor/monsterpanel-tracking-eaa4/server/eos-lobby-scraper/bootstrap-alma.sh' \
-#     | sudo env POSTGRES_DSN='postgresql://...' SCRAPE_INTERVAL_SEC=10 GHOST_TTL_SEC=90 OFFLINE_MISS_STREAK=1 bash
+#     | sudo env POSTGRES_DSN='postgresql://...' SCRAPE_INTERVAL_SEC=10 GHOST_TTL_SEC=90 LEASE_HEARTBEAT_SEC=40 OFFLINE_MISS_STREAK=1 bash
 # Or keep existing DSN:
 #   set -a; source /opt/eos-lobby-scraper/.env; set +a
-#   curl -fsSL '...' | sudo env POSTGRES_DSN="$POSTGRES_DSN" SCRAPE_INTERVAL_SEC=10 GHOST_TTL_SEC=90 OFFLINE_MISS_STREAK=1 bash
+#   curl -fsSL '...' | sudo env POSTGRES_DSN="$POSTGRES_DSN" SCRAPE_INTERVAL_SEC=10 GHOST_TTL_SEC=90 LEASE_HEARTBEAT_SEC=40 OFFLINE_MISS_STREAK=1 bash
 set -euo pipefail
 
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -64,6 +64,7 @@ echo "[bootstrap] building + installing from $BUILD_ROOT ..."
 exec env POSTGRES_DSN="$POSTGRES_DSN" \
   SCRAPE_INTERVAL_SEC="${SCRAPE_INTERVAL_SEC:-10}" \
   GHOST_TTL_SEC="${GHOST_TTL_SEC:-90}" \
+  LEASE_HEARTBEAT_SEC="${LEASE_HEARTBEAT_SEC:-40}" \
   OFFLINE_MISS_STREAK="${OFFLINE_MISS_STREAK:-1}" \
   LOADING_SEC="${LOADING_SEC:-3}" \
   ADVISORY_LOCK="${ADVISORY_LOCK:-1}" \

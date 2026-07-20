@@ -26,8 +26,8 @@ _PID_MAX = 128
 _BATCH_MAX = 64
 _TRACK_MIN_INTERVAL_SEC = 10.0
 # Presence older than this is treated as OFFLINE for clients (anti-ghost).
-# Keep in sync with scraper GHOST_TTL_SEC (default 90 ≈ one minute freshness).
-# last_seen is heartbeated on every EOS sighting; raise via env if Find cycles run long.
+# Keep in sync with scraper GHOST_TTL_SEC (default 90). Scraper mid-Find lease
+# heartbeat refreshes last_seen so long EOS cycles do not need a higher TTL.
 _GHOST_TTL = timedelta(seconds=int(os.environ.get("GHOST_TTL_SEC", "90") or "90"))
 _GHOST_TTL_SEC = max(30, int(_GHOST_TTL.total_seconds()))
 _GHOST_SWEEP_SEC = 10.0

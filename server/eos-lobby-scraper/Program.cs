@@ -46,6 +46,12 @@ internal static class Program
     // Prefer GHOST_TTL_SEC; legacy GHOST_TTL_MIN (minutes) still accepted.
     // 0 = disabled (not recommended). Default 90s ≈ 1 scrape miss + short EOS lag.
     private static readonly int GhostTtlSec = ResolveGhostTtlSec();
+    // Mid-Find last_seen refresh for the current lease roster. Full EOS Find can run
+    // ~100–130s; without this, age exceeds GHOST_TTL_SEC=90 and /v1/track flickers OFFLINE.
+    // Does NOT promote OFFLINE→IN GAME — only refreshes rows still active.
+    private static readonly int LeaseHeartbeatSec = int.TryParse(Env("LEASE_HEARTBEAT_SEC", "40"), out var lh)
+        ? Math.Clamp(lh, 15, 120)
+        : 40;
     private static readonly bool UseAdvisoryLock = Env("ADVISORY_LOCK", "1") != "0";
     // Stable key for pg_try_advisory_xact_lock (two writers → one skips cycle).
     private const long PresenceLockKey = 872314659L;
@@ -69,6 +75,9 @@ internal static class Program
     private static readonly Dictionary<string, DateTime> FirstSeenUtc = new(StringComparer.Ordinal);
     // pid → consecutive scrape misses while previously present
     private static readonly Dictionary<string, int> MissStreak = new(StringComparer.Ordinal);
+    private static readonly object LeaseLock = new();
+    private static string[] _leasePids = Array.Empty<string>();
+    private static DateTime _lastLeaseTouchUtc = DateTime.MinValue;
     private static int _lastGoodPlayerCount;
     private static int _authRecreates;
 
@@ -132,7 +141,8 @@ internal static class Program
             $"[scraper] game={GameName} interval={IntervalSec}s once={Once} loading_sec={LoadingSec:0.#} " +
             $"code_cache={KnownCodes.Count} probe_budget={CodeProbeBudget} " +
             $"miss_streak={OfflineMissStreak} collapse={CollapseRatio:0.##} " +
-            $"ghost_ttl_sec={GhostTtlSec} advisory_lock={UseAdvisoryLock}");
+            $"ghost_ttl_sec={GhostTtlSec} lease_heartbeat_sec={LeaseHeartbeatSec} " +
+            $"advisory_lock={UseAdvisoryLock}");
 
         _identity = LoadOrMintIdentity(forceNew: ForceNewAccountEnv);
         Console.WriteLine(
@@ -156,6 +166,7 @@ internal static class Program
         }
 
         Console.WriteLine($"[scraper] logged in as {_localUser} (install={_identity.InstallId})");
+        SeedLeaseFromDb();
 
         do
         {
@@ -186,6 +197,8 @@ internal static class Program
                         Console.WriteLine($"  sample: {p.Pid} | {p.Name} | {p.Server ?? "-"} | {p.ServerMap ?? "-"}");
 
                     var stats = SyncPresence(snapshot.Players);
+                    if (snapshot.Players.Count > 0)
+                        SetLeasePids(snapshot.Players.Keys);
                     if (stats.Skipped)
                         Console.WriteLine("[scraper] db skipped (advisory lock held by another writer)");
                     else
@@ -1328,6 +1341,91 @@ internal static class Program
     }
 
     /// <summary>
+    /// Seed the mid-Find lease from whoever is already active in Postgres so the first
+    /// long Find cycle does not let last_seen age past GHOST_TTL_SEC.
+    /// </summary>
+    private static void SeedLeaseFromDb()
+    {
+        try
+        {
+            using var conn = new NpgsqlConnection(PostgresDsn);
+            conn.Open();
+            using var cmd = new NpgsqlCommand(
+                @"SELECT pid FROM client_data
+                  WHERE status IN ('IN GAME', 'LOADING', 'ONLINE')", conn);
+            var list = new List<string>();
+            using var reader = cmd.ExecuteReader();
+            while (reader.Read())
+            {
+                string pid = reader.GetString(0);
+                if (!string.IsNullOrWhiteSpace(pid))
+                    list.Add(pid);
+            }
+            SetLeasePids(list);
+            Console.WriteLine($"[scraper] lease seeded from db → {list.Count}");
+            MaybeTouchLease(force: true);
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine("[scraper] lease seed: " + e.Message);
+        }
+    }
+
+    private static void SetLeasePids(IEnumerable<string> pids)
+    {
+        string[] next = pids == null
+            ? Array.Empty<string>()
+            : pids.Where(p => !string.IsNullOrWhiteSpace(p))
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+        lock (LeaseLock)
+        {
+            _leasePids = next;
+        }
+    }
+
+    /// <summary>
+    /// Refresh last_seen for the leased active roster during long EOS Find waits.
+    /// Never promotes OFFLINE → online (unlike TouchSeenStandalone).
+    /// </summary>
+    private static void MaybeTouchLease(bool force = false)
+    {
+        if (GhostTtlSec <= 0 || LeaseHeartbeatSec <= 0)
+            return;
+
+        string[] pids;
+        lock (LeaseLock)
+        {
+            if (_leasePids.Length == 0)
+                return;
+            var now = DateTime.UtcNow;
+            if (!force && (now - _lastLeaseTouchUtc).TotalSeconds < LeaseHeartbeatSec)
+                return;
+            _lastLeaseTouchUtc = now;
+            pids = _leasePids;
+        }
+
+        try
+        {
+            using var conn = new NpgsqlConnection(PostgresDsn);
+            conn.Open();
+            using var cmd = new NpgsqlCommand(
+                @"UPDATE client_data
+                  SET last_seen_at = NOW()
+                  WHERE pid = ANY(@pids)
+                    AND status IN ('IN GAME', 'LOADING', 'ONLINE')", conn);
+            cmd.Parameters.AddWithValue("pids", NpgsqlDbType.Array | NpgsqlDbType.Text, pids);
+            int n = cmd.ExecuteNonQuery();
+            if (n > 0)
+                Console.WriteLine($"[scraper] lease heartbeat last_seen → {n}");
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine("[scraper] lease heartbeat: " + e.Message);
+        }
+    }
+
+    /// <summary>
     /// Hard TTL offline for any active row with stale/null last_seen. Own connection — no lock.
     /// </summary>
     private static int SweepGhostsStandalone()
@@ -1689,6 +1787,7 @@ internal static class Program
             {
                 try { a(); } catch (Exception e) { Console.Error.WriteLine(e); }
             }
+            MaybeTouchLease();
             Thread.Sleep(15);
         }
     }
@@ -1699,6 +1798,7 @@ internal static class Program
         while (!done() && DateTime.UtcNow < until)
         {
             _platform?.Tick();
+            MaybeTouchLease();
             Thread.Sleep(15);
         }
         if (!done())
