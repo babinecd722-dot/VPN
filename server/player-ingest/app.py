@@ -34,6 +34,12 @@ _GHOST_SWEEP_SEC = 10.0
 # If a single sweep would wipe more than this fraction of active rows, skip —
 # almost always a scraper blip/restart, not a real mass logout (prevents "0 online").
 _GHOST_SWEEP_COLLAPSE_RATIO = 0.35
+# scrape_lag / collapse skip only while max last_seen age is within this ceiling.
+# Covers a long EOS Find (~130s) but NOT a dead scraper (would freeze ghosts forever).
+_SCRAPE_LAG_MAX_AGE_SEC = max(
+    _GHOST_TTL_SEC + 30,
+    int(os.environ.get("SCRAPE_LAG_MAX_AGE_SEC", str(_GHOST_TTL_SEC * 2)) or (_GHOST_TTL_SEC * 2)),
+)
 
 
 class Settings(BaseSettings):
@@ -71,7 +77,13 @@ def _ghost_sweep_once() -> int:
                                 last_seen_at IS NULL
                                 OR last_seen_at < NOW() - make_interval(secs => %s)
                               )
-                      ) AS stale
+                      ) AS stale,
+                      COALESCE(
+                        MAX(
+                          EXTRACT(EPOCH FROM (NOW() - last_seen_at))
+                        ) FILTER (WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')),
+                        0
+                      ) AS max_age
                     FROM client_data
                     """,
                     (_GHOST_TTL_SEC,),
@@ -79,11 +91,13 @@ def _ghost_sweep_once() -> int:
                 row = cur.fetchone() or {}
                 active = int(row.get("active") or 0)
                 stale = int(row.get("stale") or 0)
-                if _is_scrape_lag(active, stale):
+                max_age = float(row.get("max_age") or 0)
+                if _is_scrape_lag(active, stale, max_age=max_age):
                     log.warning(
-                        "ghost sweep skipped collapse active=%s stale=%s ratio>=%.2f",
+                        "ghost sweep skipped collapse active=%s stale=%s max_age=%.0f ratio>=%.2f",
                         active,
                         stale,
+                        max_age,
                         _GHOST_SWEEP_COLLAPSE_RATIO,
                     )
                     return 0
@@ -238,9 +252,15 @@ def _elapsed_sec(anchor: Any) -> int | None:
     return max(0, int((datetime.now(timezone.utc) - anchor.astimezone(timezone.utc)).total_seconds()))
 
 
-def _is_scrape_lag(active: int, stale: int) -> bool:
-    """True when a huge slice of the board is TTL-stale → scraper mid-Find, not mass logout."""
+def _is_scrape_lag(active: int, stale: int, max_age: float | None = None) -> bool:
+    """True when a huge slice of the board is TTL-stale → scraper mid-Find, not mass logout.
+
+    Hard ceiling on max_age: past SCRAPE_LAG_MAX_AGE_SEC the scraper is considered dead
+    and we must NOT keep reporting / protecting ghosts forever.
+    """
     if active <= 20:
+        return False
+    if max_age is not None and max_age > _SCRAPE_LAG_MAX_AGE_SEC:
         return False
     return stale >= max(1, int(active * _GHOST_SWEEP_COLLAPSE_RATIO))
 
@@ -262,13 +282,23 @@ def _scrape_lag_now() -> bool:
                             last_seen_at IS NULL
                             OR last_seen_at < NOW() - make_interval(secs => %s)
                           )
-                  ) AS stale
+                  ) AS stale,
+                  COALESCE(
+                    MAX(
+                      EXTRACT(EPOCH FROM (NOW() - last_seen_at))
+                    ) FILTER (WHERE status IN ('ONLINE', 'IN GAME', 'LOADING')),
+                    0
+                  ) AS max_age
                 FROM client_data
                 """,
                 (_GHOST_TTL_SEC,),
             )
             row = cur.fetchone() or {}
-    return _is_scrape_lag(int(row.get("active") or 0), int(row.get("stale") or 0))
+    return _is_scrape_lag(
+        int(row.get("active") or 0),
+        int(row.get("stale") or 0),
+        max_age=float(row.get("max_age") or 0),
+    )
 
 
 def _normalize_presence(
@@ -359,6 +389,7 @@ def presence_stats(_: str = Depends(require_key)) -> dict[str, Any]:
     return {
         "ok": True,
         "ttl_sec": _GHOST_TTL_SEC,
+        "scrape_lag_max_age_sec": _SCRAPE_LAG_MAX_AGE_SEC,
         "total": row.get("total", 0),
         "ingame": row.get("ingame", 0),
         "loading": row.get("loading", 0),

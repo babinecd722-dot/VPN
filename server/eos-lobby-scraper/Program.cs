@@ -52,6 +52,11 @@ internal static class Program
     private static readonly int LeaseHeartbeatSec = int.TryParse(Env("LEASE_HEARTBEAT_SEC", "35"), out var lh)
         ? Math.Clamp(lh, 15, 120)
         : 35;
+    // Stop mid-Find last_seen refresh if no successful sync within this window.
+    // Prevents InvalidAuth / empty-Find loops from eternally heartbeating ghosts.
+    private static readonly int LeaseMaxHoldSec = Math.Max(GhostTtlSec * 2, 180);
+    // Same ceiling as ingest SCRAPE_LAG_MAX_AGE_SEC — past this, force ghost wipe even under collapse.
+    private static readonly int ScrapeLagMaxAgeSec = Math.Max(GhostTtlSec + 30, GhostTtlSec * 2);
     private static readonly bool UseAdvisoryLock = Env("ADVISORY_LOCK", "1") != "0";
     // Stable key for pg_try_advisory_xact_lock (two writers → one skips cycle).
     private const long PresenceLockKey = 872314659L;
@@ -78,6 +83,7 @@ internal static class Program
     private static readonly object LeaseLock = new();
     private static string[] _leasePids = Array.Empty<string>();
     private static DateTime _lastLeaseTouchUtc = DateTime.MinValue;
+    private static DateTime _leaseDeadlineUtc = DateTime.MinValue;
     private static int _lastGoodPlayerCount;
     private static int _authRecreates;
 
@@ -142,7 +148,14 @@ internal static class Program
             $"code_cache={KnownCodes.Count} probe_budget={CodeProbeBudget} " +
             $"miss_streak={OfflineMissStreak} collapse={CollapseRatio:0.##} " +
             $"ghost_ttl_sec={GhostTtlSec} lease_heartbeat_sec={LeaseHeartbeatSec} " +
+            $"lease_max_hold_sec={LeaseMaxHoldSec} scrape_lag_max_age_sec={ScrapeLagMaxAgeSec} " +
             $"advisory_lock={UseAdvisoryLock}");
+        if (GhostTtlSec > 0 && LeaseHeartbeatSec * 2 >= GhostTtlSec)
+        {
+            Console.Error.WriteLine(
+                $"[scraper] WARN: LEASE_HEARTBEAT_SEC={LeaseHeartbeatSec} is too close to " +
+                $"GHOST_TTL_SEC={GhostTtlSec} — raise TTL or lower heartbeat");
+        }
 
         _identity = LoadOrMintIdentity(forceNew: ForceNewAccountEnv);
         Console.WriteLine(
@@ -1289,6 +1302,7 @@ internal static class Program
             MergeLeasePids(seenPids);
         }
 
+        ExtendLeaseDeadline();
         MaybeTouchLease(force: true);
         return stats;
     }
@@ -1372,6 +1386,7 @@ internal static class Program
                     list.Add(pid);
             }
             SetLeasePids(list);
+            ExtendLeaseDeadline();
             Console.WriteLine($"[scraper] lease seeded from db → {list.Count}");
             MaybeTouchLease(force: true);
         }
@@ -1409,9 +1424,18 @@ internal static class Program
         }
     }
 
+    private static void ExtendLeaseDeadline()
+    {
+        lock (LeaseLock)
+        {
+            _leaseDeadlineUtc = DateTime.UtcNow.AddSeconds(LeaseMaxHoldSec);
+        }
+    }
+
     /// <summary>
     /// Refresh last_seen for the leased active roster during long EOS Find waits.
     /// Never promotes OFFLINE → online (unlike TouchSeenStandalone).
+    /// Stops after LeaseMaxHoldSec without a successful sync (dead-auth / empty Find).
     /// </summary>
     private static void MaybeTouchLease(bool force = false)
     {
@@ -1424,6 +1448,8 @@ internal static class Program
             if (_leasePids.Length == 0)
                 return;
             var now = DateTime.UtcNow;
+            if (now > _leaseDeadlineUtc)
+                return;
             if (!force && (now - _lastLeaseTouchUtc).TotalSeconds < LeaseHeartbeatSec)
                 return;
             _lastLeaseTouchUtc = now;
@@ -1469,7 +1495,12 @@ internal static class Program
                              WHERE status IN ('ONLINE','IN GAME','LOADING')
                                AND (last_seen_at IS NULL
                                     OR last_seen_at < NOW() - make_interval(secs => @ttl))
-                           ) AS stale
+                           ) AS stale,
+                           COALESCE(
+                             MAX(EXTRACT(EPOCH FROM (NOW() - last_seen_at)))
+                               FILTER (WHERE status IN ('ONLINE','IN GAME','LOADING')),
+                             0
+                           ) AS max_age
                          FROM client_data", conn))
             {
                 cnt.Parameters.AddWithValue("ttl", GhostTtlSec);
@@ -1478,10 +1509,15 @@ internal static class Program
                 {
                     long active = r.IsDBNull(0) ? 0 : r.GetInt64(0);
                     long stale = r.IsDBNull(1) ? 0 : r.GetInt64(1);
-                    if (active > 20 && stale >= (long)(active * CollapseRatio))
+                    double maxAge = r.IsDBNull(2) ? 0 : r.GetDouble(2);
+                    // Mid-Find mass-stale: skip. Dead scraper (max_age past ceiling): wipe.
+                    if (active > 20 &&
+                        stale >= (long)(active * CollapseRatio) &&
+                        maxAge <= ScrapeLagMaxAgeSec)
                     {
                         Console.WriteLine(
-                            $"[scraper] ghost sweep skipped collapse active={active} stale={stale} ratio<{CollapseRatio:0.##}");
+                            $"[scraper] ghost sweep skipped collapse active={active} stale={stale} " +
+                            $"max_age={maxAge:0} ratio<{CollapseRatio:0.##}");
                         return 0;
                     }
                 }
