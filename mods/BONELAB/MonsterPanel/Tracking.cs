@@ -38,8 +38,9 @@ namespace MonsterPanel
         private const int JoinNotifyMaxNamesInDigest = 8;
         private const int HttpTimeoutSeconds = 8;
         private const int MaxTracked = 32;
-        // BoneMenu GUIPool on Quest — keep header+rows small (was 24 → OOB).
-        private const int MaxVisibleFriends = 12;
+        // BoneLib GUIPool Function prefab starts at _size=8; Grow only when inactive==0.
+        // Header uses 3 Function rows → keep friend buttons ≤4 so draw never exceeds pool.
+        private const int MaxVisibleFriends = 4;
 
         private static bool _enabled = true;
         private static bool _hooked;
@@ -913,33 +914,44 @@ namespace MonsterPanel
                 _detailPage.RemoveAll();
 
                 Color info = new Color(0.78f, 0.82f, 0.88f);
+                // Keep ≤7 FunctionElement rows — BoneLib GUIPool Function size starts at 8.
                 _detailPage.CreateFunction("ID  " + ShortPid(pid), info, (Action)(() => { }));
 
                 if (snap == null)
                 {
                     _detailPage.CreateFunction("Status  loading…", new Color(0.9f, 0.8f, 0.4f), (Action)(() => { }));
-                    _detailPage.CreateFunction("Language  —", info, (Action)(() => { }));
                 }
                 else if (!snap.Found)
                 {
                     _detailPage.CreateFunction("Status  not in DB", new Color(1f, 0.55f, 0.35f), (Action)(() => { }));
-                    _detailPage.CreateFunction("Language  —", info, (Action)(() => { }));
                 }
                 else if (snap.Online)
                 {
                     string st = string.IsNullOrWhiteSpace(snap.Status) ? "IN GAME" : snap.Status;
-                    _detailPage.CreateFunction("Status  " + SafeMenu(st, 22), new Color(0.35f, 1f, 0.5f), (Action)(() => { }));
-                    _detailPage.CreateFunction("Language  " + SafeMenu(NullDash(snap.Language), 18), info, (Action)(() => { }));
-                    _detailPage.CreateFunction("Server  " + SafeMenu(NullDash(snap.Server), 28), info, (Action)(() => { }));
-                    _detailPage.CreateFunction("Map  " + SafeMenu(NullDash(snap.Map), 28), info, (Action)(() => { }));
-                    _detailPage.CreateFunction("Lobby  " + SafeMenu(NullDash(snap.LobbyCode), 12), info, (Action)(() => { }));
-                    _detailPage.CreateFunction("Playtime  " + FormatDuration(snap.SessionSec), info, (Action)(() => { }));
+                    _detailPage.CreateFunction(
+                        "Status  " + SafeMenu(st, 14) + " · " + SafeMenu(NullDash(snap.Language), 10),
+                        new Color(0.35f, 1f, 0.5f),
+                        (Action)(() => { }));
+                    _detailPage.CreateFunction(
+                        "Server  " + SafeMenu(NullDash(snap.Server), 26),
+                        info,
+                        (Action)(() => { }));
+                    _detailPage.CreateFunction(
+                        "Map  " + SafeMenu(NullDash(snap.Map), 20) + " · " + FormatDuration(snap.SessionSec),
+                        info,
+                        (Action)(() => { }));
+                    _detailPage.CreateFunction(
+                        "Lobby  " + SafeMenu(NullDash(snap.LobbyCode), 12),
+                        info,
+                        (Action)(() => { }));
                 }
                 else
                 {
                     _detailPage.CreateFunction("Status  OFFLINE", new Color(0.7f, 0.7f, 0.75f), (Action)(() => { }));
-                    _detailPage.CreateFunction("Language  " + SafeMenu(NullDash(snap.Language), 18), info, (Action)(() => { }));
-                    _detailPage.CreateFunction("Offline  " + FormatDuration(snap.OfflineSec), info, (Action)(() => { }));
+                    _detailPage.CreateFunction(
+                        "Lang  " + SafeMenu(NullDash(snap.Language), 14) + " · off " + FormatDuration(snap.OfflineSec),
+                        info,
+                        (Action)(() => { }));
                 }
 
                 // Join if we have a lobby code (even if status lag says offline).
@@ -958,7 +970,7 @@ namespace MonsterPanel
                 {
                     _detailPage.CreateFunction("JOIN  (offline / no code)", new Color(0.4f, 0.45f, 0.5f), (Action)(() =>
                     {
-                        Notify("Tracking", "Not joinable right now");
+                        NotifyError("Can't join", "Not joinable right now");
                     }));
                 }
 
@@ -1086,15 +1098,28 @@ namespace MonsterPanel
                 }
             }
 
-            // Success signal = OnJoinedServer (same as Fusion internal), not GetServerCode
-            // (client hosts don't own ServerCode — GetServerCode is empty for clients).
+            // Success = OnJoinedServer AND we stay connected briefly.
+            // NEVER treat NetworkInfo.HasServer alone as success — that fires false
+            // "Joined" on full/private/stale lobbies (and after failed code search).
             bool joinedFlag = false;
+            bool leftDuringJoin = false;
             ServerEvent onJoined = () => { joinedFlag = true; };
+            ServerEvent onLeft = () =>
+            {
+                // Only count leave after we actually saw a join attempt complete.
+                if (joinedFlag)
+                    leftDuringJoin = true;
+            };
             try { MultiplayerHooking.OnJoinedServer += onJoined; }
             catch (Exception e)
             {
                 MelonLogger.Warning("Tracking: OnJoinedServer hook — " + e.Message);
                 onJoined = null;
+            }
+            try { MultiplayerHooking.OnDisconnected += onLeft; }
+            catch
+            {
+                onLeft = null;
             }
 
             try
@@ -1106,48 +1131,86 @@ namespace MonsterPanel
             }
             catch (Exception ex)
             {
-                if (onJoined != null)
-                {
-                    try { MultiplayerHooking.OnJoinedServer -= onJoined; } catch { /* */ }
-                }
+                UnhookJoinWatch(onJoined, onLeft);
                 NotifyError("Join failed", ex.Message);
                 yield break;
             }
 
             float t = 0f;
-            while (t < 20f)
+            while (t < 18f)
             {
                 t += Time.unscaledDeltaTime;
-                bool nowIn = joinedFlag;
-                if (!nowIn)
+                if (!joinedFlag)
                 {
-                    try { nowIn = NetworkInfo.HasServer; } catch { /* */ }
+                    yield return null;
+                    continue;
                 }
-                if (nowIn)
+
+                // Joined event fired — wait a short settle so full-lobby kick
+                // doesn't get reported as success.
+                float hold = 0f;
+                while (hold < 2.0f)
                 {
-                    MelonLogger.Msg(
-                        "Tracking: join OK — target=" + c +
-                        " via=" + (joinedFlag ? "OnJoinedServer" : "HasServer") +
-                        " t=" + t.ToString("0.0", CultureInfo.InvariantCulture) + "s");
-                    Notify("Joined", SafeMenu(name) + " / " + c);
-                    if (onJoined != null)
+                    hold += Time.unscaledDeltaTime;
+                    if (leftDuringJoin) break;
+                    bool stillIn = false;
+                    try { stillIn = NetworkInfo.HasServer; } catch { /* */ }
+                    if (!stillIn)
                     {
-                        try { MultiplayerHooking.OnJoinedServer -= onJoined; } catch { /* */ }
+                        leftDuringJoin = true;
+                        break;
                     }
+                    yield return null;
+                }
+
+                UnhookJoinWatch(onJoined, onLeft);
+
+                if (leftDuringJoin)
+                {
+                    MelonLogger.Warning(
+                        "Tracking: join rejected after OnJoinedServer — code=" + c +
+                        " (full/kick/closed)");
+                    NotifyError(
+                        "Can't join",
+                        "Lobby " + c + " is full or closed.");
                     yield break;
                 }
-                yield return null;
+
+                bool ok = false;
+                try { ok = NetworkInfo.HasServer; } catch { /* */ }
+                if (!ok)
+                {
+                    NotifyError(
+                        "Can't join",
+                        "Lobby " + c + " is full, private, or gone.");
+                    yield break;
+                }
+
+                MelonLogger.Msg(
+                    "Tracking: join OK — target=" + c +
+                    " via=OnJoinedServer t=" + t.ToString("0.0", CultureInfo.InvariantCulture) + "s");
+                Notify("Joined", SafeMenu(name) + " / " + c);
+                yield break;
             }
 
+            UnhookJoinWatch(onJoined, onLeft);
+
+            MelonLogger.Warning("Tracking: join timed out for " + c + " (no OnJoinedServer)");
+            NotifyError(
+                "Can't join",
+                "No lobby " + c + " (full / private / stale). Refresh and retry.");
+        }
+
+        private static void UnhookJoinWatch(ServerEvent onJoined, ServerEvent onLeft)
+        {
             if (onJoined != null)
             {
                 try { MultiplayerHooking.OnJoinedServer -= onJoined; } catch { /* */ }
             }
-
-            MelonLogger.Warning("Tracking: join timed out for " + c);
-            NotifyError(
-                "Join failed",
-                "No lobby with code " + c + " (private/stale/full). Refresh and retry.");
+            if (onLeft != null)
+            {
+                try { MultiplayerHooking.OnDisconnected -= onLeft; } catch { /* */ }
+            }
         }
 
         /// <summary>Match EOSMatchmaker: trim + ToUpperInvariant (LobbyCode attribute).</summary>
@@ -1210,7 +1273,8 @@ namespace MonsterPanel
         /// <summary>
         /// Fusion lobby player profile → Add / Remove Tracking.
         /// ApplyPlayerToElement runs many times per player (metadata batches) — MUST reuse
-        /// existing GroupElement via AddOrGetElement and clear old buttons (no unbounded AddElement).
+        /// existing elements via AddOrGet / first FunctionElement. Never RemoveElements /
+        /// AddElement during populate (BoneLib/Fusion pool desync → OOB/NRE).
         /// </summary>
         private static void ApplyPlayerToElementPostfix(PlayerElement element, PlayerID player)
         {
@@ -1248,24 +1312,25 @@ namespace MonsterPanel
                 GroupElement group = page.AddOrGetElement<GroupElement>("Tracking");
                 if (group == null) return;
 
-                // Card may be reused for another player — wipe previous function buttons.
-                try { group.RemoveElements(); } catch { /* */ }
-
                 bool tracked = IsTracked(pid);
                 string label = tracked ? "Remove from Tracking" : "Add to Tracking";
                 Color color = tracked ? new Color(1f, 0.4f, 0.35f) : new Color(0.35f, 0.9f, 1f);
                 string pidCopy = pid;
                 string nameCopy = username;
 
-                var btn = group.AddElement<LabFusion.Marrow.Proxies.FunctionElement>(label);
+                // Reuse existing FunctionElement if present — never RemoveElements mid-populate.
+                LabFusion.Marrow.Proxies.FunctionElement btn = FindFirstFunction(group);
+                if (btn == null)
+                    btn = group.AddElement<LabFusion.Marrow.Proxies.FunctionElement>(label);
                 if (btn == null) return;
-                btn.WithColor(color);
+
+                try { btn.Title = label; } catch { /* */ }
+                try { btn.WithColor(color); } catch { try { btn.Color = color; } catch { /* */ } }
                 // Assign (do not Do/+=) so repeated ApplyPlayerToElement cannot stack handlers.
                 btn.OnPressed = () =>
                 {
                     if (IsTracked(pidCopy)) Remove(pidCopy);
                     else Add(pidCopy, nameCopy);
-                    // Refresh label on this same button after toggle.
                     try
                     {
                         bool now = IsTracked(pidCopy);
@@ -1279,6 +1344,31 @@ namespace MonsterPanel
             {
                 MelonLogger.Warning("Tracking profile btn: " + e.Message);
             }
+        }
+
+        private static LabFusion.Marrow.Proxies.FunctionElement FindFirstFunction(GroupElement group)
+        {
+            if (group == null) return null;
+            try
+            {
+                var els = group.Elements;
+                if (els == null) return null;
+                for (int i = 0; i < els.Count; i++)
+                {
+                    var el = els[i];
+                    if (el == null) continue;
+                    var fn = el as LabFusion.Marrow.Proxies.FunctionElement;
+                    if (fn != null) return fn;
+                    try
+                    {
+                        fn = el.TryCast<LabFusion.Marrow.Proxies.FunctionElement>();
+                        if (fn != null) return fn;
+                    }
+                    catch { /* */ }
+                }
+            }
+            catch { /* */ }
+            return null;
         }
 
         private static HttpClient CreateHttp()

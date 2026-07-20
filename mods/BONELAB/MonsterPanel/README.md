@@ -1,11 +1,11 @@
 # MONSTER Panel (BONELAB MelonLoader mod)
 
-## Tracking (2.30.22+)
+## Tracking (2.30.23+)
 
-- **JOIN (Checkerb0ard EOS):** same path as Fusion menu — `NetworkHelper.JoinServerByCode` after clean leave + settle; success via `OnJoinedServer`
-- **OOB fix:** profile Tracking button `AddOrGetElement` (no duplicates)
-- Friends list max **12**; join alert = one digest, `SaveToMenu=false`
-- One-shot Tracking fetch; playtime static from DB
+- **JOIN success only after real `OnJoinedServer` + stay connected** — no more false "Joined" on full/private/stale (old bug used `HasServer`)
+- Fail → **"Can't join"** (full / closed / stale)
+- **OOB:** profile button reuses FunctionElement (no `RemoveElements` mid-populate); friends list ≤4; detail ≤7 Function rows (BoneLib pool size 8)
+- One-shot Tracking fetch; join alert = one digest, `SaveToMenu=false`
 
 Uses LabFusion from Checkerb0ard 0.0.5 (EOS), not Steam.
 
