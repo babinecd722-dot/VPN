@@ -30,7 +30,7 @@ namespace MonsterPanel
         private const string ListName = "tracking.json";
         private const string ApiUrl = "http://62.109.21.131:8787";
         private const string ApiKey = "e63d7b2ae9d5006d109712e6c3ea2592611f563e380724de";
-        private const float IdlePollIntervalSec = 60f; // warm cache only outside Fusion lobbies
+        private const float IdlePollIntervalSec = 60f; // presence watch + cache warm-up
         private const float RebuildMinIntervalSec = 2.5f;
         private const float OpenPollDelaySec = 1.5f;
         private const float JoinNotifyDelayWithSpoofSec = 4.0f;
@@ -41,6 +41,7 @@ namespace MonsterPanel
         // BoneLib GUIPool Function prefab starts at _size=8; Grow only when inactive==0.
         // Header uses 3 Function rows → keep friend buttons ≤4 so draw never exceeds pool.
         private const int MaxVisibleFriends = 4;
+        private const string NotifyTag = "Tracking";
 
         private static bool _enabled = true;
         private static bool _hooked;
@@ -52,9 +53,11 @@ namespace MonsterPanel
         private static bool _openPollQueued;
         private static bool _joinNotifyRunning;
         private static bool _fusionAlertDone;
+        private static bool _onlineWatchSeeded;
         private static float _idlePollCd;
         private static float _lastRebuildAt = -999f;
         private static string _lastError = "";
+        private static readonly HashSet<string> _alertedOnline = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static string _detailQueuedPid = "";
         private static string _snapFingerprint = "";
 
@@ -115,15 +118,13 @@ namespace MonsterPanel
         }
 
         /// <summary>
-        /// No live menu polling (that rebuilt "In game Xs" and crashed Quest).
-        /// Only slow cache warm-up while NOT in a Fusion lobby.
+        /// Slow presence watch (also inside Fusion lobbies) — popups only, no menu thrash.
         /// </summary>
         public static void Tick()
         {
             if (!_enabled || Entries.Count == 0) return;
             if (_polling || Time.unscaledTime < _apiReadyAt) return;
             if (IsTrackingMenuOpen()) return; // menu uses one-shot open poll / Refresh only
-            if (IsInFusionLobby()) return;
             _idlePollCd -= Time.unscaledDeltaTime;
             if (_idlePollCd > 0f) return;
             _idlePollCd = IdlePollIntervalSec;
@@ -282,8 +283,9 @@ namespace MonsterPanel
                 }
 
                 MelonLogger.Msg("Tracking: join alert — " + online.Count + " online");
-                // One lightweight popup — never SaveToMenu (Fusion notification menu thrash on join).
+                // Fusion-style popups (same as NetworkNotifications); mark so watch won't re-spam.
                 NotifyOnlineDigest(online);
+                MarkAlertedOnlineFromEntries();
             }
             finally
             {
@@ -291,9 +293,30 @@ namespace MonsterPanel
             }
         }
 
+        private static void MarkAlertedOnlineFromEntries()
+        {
+            lock (Gate)
+            {
+                foreach (var e in Entries)
+                {
+                    if (!Snapshots.TryGetValue(e.Pid, out var snap) || snap == null) continue;
+                    if (snap.Found && snap.Online)
+                        _alertedOnline.Add(e.Pid);
+                }
+                _onlineWatchSeeded = true;
+            }
+        }
+
         private static void NotifyOnlineDigest(List<string> online)
         {
             if (online == null || online.Count == 0) return;
+
+            // Official Fusion style: one short SUCCESS popup, Tag + SaveToMenu=false.
+            if (online.Count == 1)
+            {
+                NotifyFriendOnline(online[0]);
+                return;
+            }
 
             var sb = new StringBuilder();
             int n = Math.Min(online.Count, JoinNotifyMaxNamesInDigest);
@@ -305,34 +328,71 @@ namespace MonsterPanel
             if (online.Count > n)
                 sb.Append(" +").Append(online.Count - n).Append(" more");
 
-            string title = online.Count == 1 ? "Friend online" : (online.Count + " friends online");
-            string msg = sb.ToString();
+            string title = online.Count + " Friends Online";
+            string msg = sb.ToString() + " are online.";
             MelonLogger.Msg("Tracking: " + title + " — " + msg);
+            SendFusionNotify(title, msg, NotificationType.SUCCESS, 3.5f, cancelPrevious: true);
+        }
 
-            try
+        private static void NotifyFriendOnline(string name)
+        {
+            string nick = SafeMenu(name, 22);
+            // Mirror NetworkNotifications.SendPlayerJoinedNotification style.
+            SendFusionNotify(nick + " Online", nick + " is online.", NotificationType.SUCCESS, 2.5f, cancelPrevious: false);
+        }
+
+        /// <summary>
+        /// After a successful /v1/track apply: notify only offline→online transitions
+        /// (seed silently on first poll so we don't spam everyone already online).
+        /// </summary>
+        private static void ProcessOnlineWatchAlerts()
+        {
+            var newlyOnline = new List<string>();
+            lock (Gate)
             {
-                var notif = new Notification();
-                try
+                for (int i = 0; i < Entries.Count; i++)
                 {
-                    notif.Title = new NotificationText(title, new Color(0.35f, 0.95f, 0.55f));
-                    notif.Message = new NotificationText(msg);
+                    var e = Entries[i];
+                    bool online = Snapshots.TryGetValue(e.Pid, out var snap) && snap != null && snap.Found && snap.Online;
+                    if (!online)
+                    {
+                        _alertedOnline.Remove(e.Pid);
+                        continue;
+                    }
+                    if (!_onlineWatchSeeded)
+                    {
+                        _alertedOnline.Add(e.Pid);
+                        continue;
+                    }
+                    if (_alertedOnline.Add(e.Pid))
+                    {
+                        string nick = !string.IsNullOrWhiteSpace(snap.Name) ? snap.Name : e.Name;
+                        if (string.IsNullOrWhiteSpace(nick)) nick = ShortPid(e.Pid);
+                        newlyOnline.Add(nick);
+                    }
                 }
-                catch
+                // Drop alerts for friends no longer tracked.
+                if (_alertedOnline.Count > 0)
                 {
-                    notif.Title = title;
-                    notif.Message = msg;
+                    var drop = new List<string>();
+                    foreach (var pid in _alertedOnline)
+                    {
+                        bool tracked = false;
+                        for (int i = 0; i < Entries.Count; i++)
+                        {
+                            if (string.Equals(Entries[i].Pid, pid, StringComparison.OrdinalIgnoreCase))
+                            { tracked = true; break; }
+                        }
+                        if (!tracked) drop.Add(pid);
+                    }
+                    for (int i = 0; i < drop.Count; i++)
+                        _alertedOnline.Remove(drop[i]);
                 }
-                notif.Type = NotificationType.SUCCESS;
-                notif.ShowPopup = true;
-                try { notif.SaveToMenu = false; } catch { /* */ }
-                notif.PopupLength = 4f;
-                Notifier.Send(notif);
+                _onlineWatchSeeded = true;
             }
-            catch (Exception e)
-            {
-                MelonLogger.Warning("Tracking notify failed: " + e.Message);
-                Notify(title, msg);
-            }
+
+            for (int i = 0; i < newlyOnline.Count; i++)
+                NotifyFriendOnline(newlyOnline[i]);
         }
 
         public static bool IsTracked(string pid)
@@ -461,6 +521,10 @@ namespace MonsterPanel
                             ApplyTrackJson(json);
                             _lastError = "";
                             _apiReadyAt = Time.unscaledTime + 10f;
+                            try { ProcessOnlineWatchAlerts(); } catch (Exception ex)
+                            {
+                                MelonLogger.Warning("Tracking online watch: " + ex.Message);
+                            }
                             break;
                         }
                     }
@@ -860,6 +924,8 @@ namespace MonsterPanel
             {
                 Entries.Clear();
                 Snapshots.Clear();
+                _alertedOnline.Clear();
+                _onlineWatchSeeded = false;
                 SaveList_NoLock();
             }
             _detailPid = "";
@@ -954,23 +1020,22 @@ namespace MonsterPanel
                         (Action)(() => { }));
                 }
 
-                // Join if we have a lobby code (even if status lag says offline).
-                bool canJoin = snap != null && !string.IsNullOrWhiteSpace(snap.LobbyCode);
+                // Join only when online+code and not already together in this Fusion lobby.
+                // Offline → no Join row. Same lobby → "In lobby".
+                bool inLobbyWith = IsPlayerInCurrentLobby(pid);
+                bool canJoin = snap != null && snap.Online && !string.IsNullOrWhiteSpace(snap.LobbyCode) && !inLobbyWith;
                 string joinName = name;
-                if (canJoin)
+                if (inLobbyWith)
+                {
+                    _detailPage.CreateFunction("In lobby", new Color(0.55f, 0.75f, 0.95f), (Action)(() => { }));
+                }
+                else if (canJoin)
                 {
                     string codeCopy = snap.LobbyCode;
                     string pidCopy = pid;
                     _detailPage.CreateFunction("JOIN LOBBY", new Color(0.2f, 1f, 0.45f), (Action)(() =>
                     {
                         MelonCoroutines.Start(JoinAndWatchRoutine(joinName, codeCopy, pidCopy));
-                    }));
-                }
-                else
-                {
-                    _detailPage.CreateFunction("JOIN  (offline / no code)", new Color(0.4f, 0.45f, 0.5f), (Action)(() =>
-                    {
-                        NotifyError("Can't join", "Not joinable right now");
                     }));
                 }
 
@@ -987,6 +1052,17 @@ namespace MonsterPanel
             {
                 MelonLogger.Warning("Tracking friend page: " + ex.Message);
             }
+        }
+
+        private static bool IsPlayerInCurrentLobby(string pid)
+        {
+            if (string.IsNullOrWhiteSpace(pid)) return false;
+            try
+            {
+                if (!NetworkInfo.HasServer) return false;
+                return PlayerIDManager.HasPlayerID(pid.Trim());
+            }
+            catch { return false; }
         }
 
         private static Color ListColor(TrackSnapshot snap)
@@ -1581,32 +1657,41 @@ namespace MonsterPanel
 
         private static void Notify(string title, string message)
         {
-            try
-            {
-                var n = new Notification();
-                n.Title = title;
-                n.Message = message;
-                n.Type = NotificationType.SUCCESS;
-                n.ShowPopup = true;
-                n.PopupLength = 2.5f;
-                Notifier.Send(n);
-            }
-            catch { MelonLogger.Msg(title + ": " + message); }
+            SendFusionNotify(title, message, NotificationType.SUCCESS, 2.5f, cancelPrevious: true);
         }
 
         private static void NotifyError(string title, string message)
         {
+            SendFusionNotify(title, message, NotificationType.ERROR, 3.5f, cancelPrevious: true);
+        }
+
+        /// <summary>Same shape as LabFusion NetworkNotifications (Tag + SaveToMenu=false).</summary>
+        private static void SendFusionNotify(string title, string message, NotificationType type, float popupLength, bool cancelPrevious)
+        {
             try
             {
-                var n = new Notification();
-                n.Title = title;
-                n.Message = message;
-                n.Type = NotificationType.ERROR;
-                n.ShowPopup = true;
-                n.PopupLength = 3.5f;
-                Notifier.Send(n);
+                if (cancelPrevious)
+                {
+                    try { Notifier.Cancel(NotifyTag); } catch { /* */ }
+                }
+                Notifier.Send(new Notification
+                {
+                    Title = title ?? "",
+                    Message = message ?? "",
+                    Tag = NotifyTag,
+                    SaveToMenu = false,
+                    ShowPopup = true,
+                    PopupLength = popupLength,
+                    Type = type,
+                });
             }
-            catch { MelonLogger.Warning(title + ": " + message); }
+            catch
+            {
+                if (type == NotificationType.ERROR)
+                    MelonLogger.Warning(title + ": " + message);
+                else
+                    MelonLogger.Msg(title + ": " + message);
+            }
         }
     }
 }

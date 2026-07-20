@@ -1,11 +1,12 @@
 # MONSTER Panel (BONELAB MelonLoader mod)
 
-## Tracking (2.30.23+)
+## Tracking (2.30.24+)
 
-- **JOIN success only after real `OnJoinedServer` + stay connected** — no more false "Joined" on full/private/stale (old bug used `HasServer`)
-- Fail → **"Can't join"** (full / closed / stale)
-- **OOB:** profile button reuses FunctionElement (no `RemoveElements` mid-populate); friends list ≤4; detail ≤7 Function rows (BoneLib pool size 8)
-- One-shot Tracking fetch; join alert = one digest, `SaveToMenu=false`
+- Offline friend card: **no Join row** (removed "no code" stub)
+- Already with them in Fusion lobby → **"In lobby"** instead of Join
+- Online watch every ~60s: offline→online → Fusion-style popup (`Name Online` / `is online.`)
+- Notifications match LabFusion `NetworkNotifications` (Tag + `SaveToMenu=false`)
+- Join success logic from 2.30.23 unchanged (no false Joined on full)
 
 Uses LabFusion from Checkerb0ard 0.0.5 (EOS), not Steam.
 
