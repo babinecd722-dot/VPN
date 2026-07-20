@@ -30,7 +30,7 @@ namespace MonsterPanel
         private const string ListName = "tracking.json";
         private const string ApiUrl = "http://62.109.21.131:8787";
         private const string ApiKey = "e63d7b2ae9d5006d109712e6c3ea2592611f563e380724de";
-        private const float IdlePollIntervalSec = 60f; // presence watch + cache warm-up
+        private const float IdlePollIntervalSec = 15f; // presence watch (/v1/track cooldown is 10s)
         private const float RebuildMinIntervalSec = 2.5f;
         private const float OpenPollDelaySec = 1.5f;
         private const float JoinNotifyDelayWithSpoofSec = 4.0f;
@@ -331,14 +331,42 @@ namespace MonsterPanel
             string title = online.Count + " Friends Online";
             string msg = sb.ToString() + " are online.";
             MelonLogger.Msg("Tracking: " + title + " — " + msg);
-            SendFusionNotify(title, msg, NotificationType.SUCCESS, 3.5f, cancelPrevious: true);
+            try
+            {
+                Notifier.Send(new Notification
+                {
+                    Title = title,
+                    Message = msg,
+                    Tag = NotifyTag,
+                    SaveToMenu = false,
+                    ShowPopup = true,
+                });
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Tracking notify failed: " + e.Message);
+            }
         }
 
         private static void NotifyFriendOnline(string name)
         {
             string nick = SafeMenu(name, 22);
-            // Mirror NetworkNotifications.SendPlayerJoinedNotification style.
-            SendFusionNotify(nick + " Online", nick + " is online.", NotificationType.SUCCESS, 2.5f, cancelPrevious: false);
+            // Exact LabFusion SendPlayerJoinedNotification shape (Title/Message/Tag/SaveToMenu).
+            try
+            {
+                Notifier.Send(new Notification
+                {
+                    Title = nick + " Online",
+                    Message = nick + " is online.",
+                    Tag = NotifyTag,
+                    SaveToMenu = false,
+                    ShowPopup = true,
+                });
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Tracking notify failed: " + e.Message);
+            }
         }
 
         /// <summary>

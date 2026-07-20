@@ -1,12 +1,11 @@
 # MONSTER Panel (BONELAB MelonLoader mod)
 
-## Tracking (2.30.24+)
+## Tracking (2.30.25+)
 
-- Offline friend card: **no Join row** (removed "no code" stub)
+- Offline friend card: **no Join row**
 - Already with them in Fusion lobby → **"In lobby"** instead of Join
-- Online watch every ~60s: offline→online → Fusion-style popup (`Name Online` / `is online.`)
-- Notifications match LabFusion `NetworkNotifications` (Tag + `SaveToMenu=false`)
-- Join success logic from 2.30.23 unchanged (no false Joined on full)
+- Online watch every **~15s** (API cooldown 10s): offline→online → Fusion popup like player joined (`Name Online` / `is online.`, `SaveToMenu=false`)
+- Join success logic from 2.30.23 unchanged
 
 Uses LabFusion from Checkerb0ard 0.0.5 (EOS), not Steam.
 
