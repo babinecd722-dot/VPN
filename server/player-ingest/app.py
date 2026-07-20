@@ -26,10 +26,10 @@ _PID_MAX = 128
 _BATCH_MAX = 64
 _TRACK_MIN_INTERVAL_SEC = 10.0
 # Presence older than this is treated as OFFLINE for clients (anti-ghost).
-# Keep in sync with scraper GHOST_TTL_SEC (default 180).
-# Must exceed a full EOS Find cycle (~100s+) or Tracking flickers online↔offline mid-session.
-_GHOST_TTL = timedelta(seconds=int(os.environ.get("GHOST_TTL_SEC", "180") or "180"))
-_GHOST_TTL_SEC = int(_GHOST_TTL.total_seconds())
+# Keep in sync with scraper GHOST_TTL_SEC (default 90 ≈ one minute freshness).
+# last_seen is heartbeated on every EOS sighting; raise via env if Find cycles run long.
+_GHOST_TTL = timedelta(seconds=int(os.environ.get("GHOST_TTL_SEC", "90") or "90"))
+_GHOST_TTL_SEC = max(30, int(_GHOST_TTL.total_seconds()))
 _GHOST_SWEEP_SEC = 10.0
 # If a single sweep would wipe more than this fraction of active rows, skip —
 # almost always a scraper blip/restart, not a real mass logout (prevents "0 online").

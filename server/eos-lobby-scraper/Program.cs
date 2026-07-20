@@ -82,8 +82,9 @@ internal static class Program
         // Legacy minutes → seconds (old default was 4m).
         if (int.TryParse(Env("GHOST_TTL_MIN", ""), out var min) && min > 0)
             return Math.Clamp(min * 60, 0, 3600);
-        // Must exceed a full EOS Find cycle (~100s+ under load) or /v1/track flickers OFFLINE.
-        return 180;
+        // ~1–1.5 min freshness. Safe with last_seen heartbeat on every sighting;
+        // override via GHOST_TTL_SEC (e.g. 60 = more aggressive offline).
+        return 90;
     }
 
     private static string ResolvePostgresDsn()
