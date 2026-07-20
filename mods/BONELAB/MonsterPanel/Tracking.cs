@@ -35,11 +35,11 @@ namespace MonsterPanel
         private const float OpenPollDelaySec = 1.5f;
         private const float JoinNotifyDelayWithSpoofSec = 4.0f;
         private const float JoinNotifyDelayNoSpoofSec = 0.8f;
-        private const float JoinNotifyGapSec = 0.55f;
-        private const int JoinNotifyMaxPopups = 6;
+        private const int JoinNotifyMaxNamesInDigest = 8;
         private const int HttpTimeoutSeconds = 8;
         private const int MaxTracked = 32;
-        private const int MaxVisibleFriends = 24;
+        // BoneMenu GUIPool on Quest — keep header+rows small (was 24 → OOB).
+        private const int MaxVisibleFriends = 12;
 
         private static bool _enabled = true;
         private static bool _hooked;
@@ -281,23 +281,8 @@ namespace MonsterPanel
                 }
 
                 MelonLogger.Msg("Tracking: join alert — " + online.Count + " online");
-                int shown = 0;
-                foreach (string nick in online)
-                {
-                    if (shown >= JoinNotifyMaxPopups)
-                    {
-                        Notify("Tracking", "+" + (online.Count - shown) + " more online");
-                        break;
-                    }
-                    NotifyOnline(SafeMenu(nick));
-                    shown++;
-                    float g = 0f;
-                    while (g < JoinNotifyGapSec)
-                    {
-                        g += Time.unscaledDeltaTime;
-                        yield return null;
-                    }
-                }
+                // One lightweight popup — never SaveToMenu (Fusion notification menu thrash on join).
+                NotifyOnlineDigest(online);
             }
             finally
             {
@@ -305,32 +290,47 @@ namespace MonsterPanel
             }
         }
 
-        private static void NotifyOnline(string nick)
+        private static void NotifyOnlineDigest(List<string> online)
         {
-            MelonLogger.Msg("Tracking: " + nick + " is online");
+            if (online == null || online.Count == 0) return;
+
+            var sb = new StringBuilder();
+            int n = Math.Min(online.Count, JoinNotifyMaxNamesInDigest);
+            for (int i = 0; i < n; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(SafeMenu(online[i], 18));
+            }
+            if (online.Count > n)
+                sb.Append(" +").Append(online.Count - n).Append(" more");
+
+            string title = online.Count == 1 ? "Friend online" : (online.Count + " friends online");
+            string msg = sb.ToString();
+            MelonLogger.Msg("Tracking: " + title + " — " + msg);
+
             try
             {
-                var n = new Notification();
+                var notif = new Notification();
                 try
                 {
-                    n.Title = new NotificationText(nick, new Color(0.35f, 0.95f, 0.55f));
-                    n.Message = new NotificationText("is online");
+                    notif.Title = new NotificationText(title, new Color(0.35f, 0.95f, 0.55f));
+                    notif.Message = new NotificationText(msg);
                 }
                 catch
                 {
-                    n.Title = nick;
-                    n.Message = "is online";
+                    notif.Title = title;
+                    notif.Message = msg;
                 }
-                n.Type = NotificationType.SUCCESS;
-                n.ShowPopup = true;
-                try { n.SaveToMenu = true; } catch { /* */ }
-                n.PopupLength = 3.5f;
-                Notifier.Send(n);
+                notif.Type = NotificationType.SUCCESS;
+                notif.ShowPopup = true;
+                try { notif.SaveToMenu = false; } catch { /* */ }
+                notif.PopupLength = 4f;
+                Notifier.Send(notif);
             }
             catch (Exception e)
             {
                 MelonLogger.Warning("Tracking notify failed: " + e.Message);
-                Notify("Tracking", nick + " is online");
+                Notify(title, msg);
             }
         }
 
@@ -1183,7 +1183,11 @@ namespace MonsterPanel
             }
         }
 
-        /// <summary>Fusion lobby player profile → Add / Remove Tracking button.</summary>
+        /// <summary>
+        /// Fusion lobby player profile → Add / Remove Tracking.
+        /// ApplyPlayerToElement runs many times per player (metadata batches) — MUST reuse
+        /// existing GroupElement via AddOrGetElement and clear old buttons (no unbounded AddElement).
+        /// </summary>
         private static void ApplyPlayerToElementPostfix(PlayerElement element, PlayerID player)
         {
             try
@@ -1214,20 +1218,38 @@ namespace MonsterPanel
                 catch { /* */ }
                 if (page == null)
                     page = actions.AddPage();
+                if (page == null) return;
 
-                var group = page.AddElement<GroupElement>("Tracking");
+                // One group per profile card — never stack duplicates on every ApplyPlayerToElement.
+                GroupElement group = page.AddOrGetElement<GroupElement>("Tracking");
+                if (group == null) return;
+
+                // Card may be reused for another player — wipe previous function buttons.
+                try { group.RemoveElements(); } catch { /* */ }
+
                 bool tracked = IsTracked(pid);
                 string label = tracked ? "Remove from Tracking" : "Add to Tracking";
                 Color color = tracked ? new Color(1f, 0.4f, 0.35f) : new Color(0.35f, 0.9f, 1f);
                 string pidCopy = pid;
                 string nameCopy = username;
-                group.AddElement<LabFusion.Marrow.Proxies.FunctionElement>(label)
-                    .WithColor(color)
-                    .Do(() =>
+
+                var btn = group.AddElement<LabFusion.Marrow.Proxies.FunctionElement>(label);
+                if (btn == null) return;
+                btn.WithColor(color);
+                // Assign (do not Do/+=) so repeated ApplyPlayerToElement cannot stack handlers.
+                btn.OnPressed = () =>
+                {
+                    if (IsTracked(pidCopy)) Remove(pidCopy);
+                    else Add(pidCopy, nameCopy);
+                    // Refresh label on this same button after toggle.
+                    try
                     {
-                        if (IsTracked(pidCopy)) Remove(pidCopy);
-                        else Add(pidCopy, nameCopy);
-                    });
+                        bool now = IsTracked(pidCopy);
+                        btn.Title = now ? "Remove from Tracking" : "Add to Tracking";
+                        btn.Color = now ? new Color(1f, 0.4f, 0.35f) : new Color(0.35f, 0.9f, 1f);
+                    }
+                    catch { /* */ }
+                };
             }
             catch (Exception e)
             {

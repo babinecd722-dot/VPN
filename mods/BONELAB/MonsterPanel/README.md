@@ -1,18 +1,14 @@
 # MONSTER Panel (BONELAB MelonLoader mod)
 
-## Tracking (2.30.19+)
+## Tracking (2.30.21+)
 
-Слежение за игроками Fusion по EOS `pid` (локальный список + Postgres presence).
+- **Fix OOB crash:** Fusion profile Tracking button uses `AddOrGetElement` + clear (no duplicate groups on every `ApplyPlayerToElement`)
+- Friends list capped at **12** rows (BoneMenu GUIPool-safe)
+- Join alert: **one** digest popup, `SaveToMenu=false`
+- One-shot fetch when opening Tracking; playtime static from DB
+- JOIN: leave → settle → retry
 
-- В **профиле другого игрока** → **Add to Tracking** / Remove
-- BoneMenu → **Tracking**: one-shot fetch при открытии (без live-тиков playtime → без Quest bounds crash)
-- Playtime/Offline — статично из БД на момент запроса
-- При входе в Fusion: один фоновый `/v1/track` → popup «**nick** is online»
-- **JOIN**: leave → settle → retry; код лобби без перерисовки меню
-- Список: `UserData/MonsterPanel/tracking.json`
-- API: `POST http://62.109.21.131:8787/v1/track`
-
-**Reset spoof PID**: минтит новый zero-account (если старый burned).
+API: `POST http://62.109.21.131:8787/v1/track`
 
 ---
 
