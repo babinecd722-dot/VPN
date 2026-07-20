@@ -83,11 +83,15 @@ bot_worker() {
       # login failed hard — allow remint next loop
       force=1
     fi
-    # Back off a bit after native crash so EOS/DeviceId can settle.
+    # 0 = clean hard-exit after farm cycle. 4/5 = no/weak detections (normal).
+    # 139 / >128 = native crash — longer backoff so EOS/DeviceId can settle.
     if [[ "$rc" -eq 139 || "$rc" -gt 128 ]]; then
-      sleep $((LOOP_SLEEP + 4))
-    else
+      echo "[bot$i] native crash — backoff" | tee -a "$LOG"
+      sleep $((LOOP_SLEEP + 8))
+    elif [[ "$rc" -eq 0 ]]; then
       sleep "$LOOP_SLEEP"
+    else
+      sleep $((LOOP_SLEEP + 1))
     fi
   done
 }

@@ -5,11 +5,13 @@ Headless EOS join bots (`bonelab.fun`) that collect voice → language into Post
 Runtime lives on the agent host under `/tmp/lang-farm`. This folder mirrors the
 production bot sources for version control.
 
-## Key hardening (2026-07-19)
+## Key hardening (2026-07-19 / 2026-07-20)
 
-- Skip `Connect.Logout` on Linux EOSSDK (prevents SIGSEGV / exit 139 after success)
+- Skip `Connect.Logout` **and** `Platform.Release` on Linux — EOSSDK atexit SIGSEGVs (exit 139)
+- Clean cycle end via libc `_exit` (`SafeExit`) so shutdown handlers never run
+- Keep one EOS login across multiple lobbies per process (no early teardown after first hit)
 - Dead-lobby abort only when **no P2P**; stay full `LISTEN_SEC` if packets flow
-- SUCCESS exit only on confident language DB writes (`ok=1`)
+- Confident language DB writes (`ok=1`) count as success
 - Atomic lobby claims (`FileMode.CreateNew`)
 - No fake SmallID from LobbyInfo index (pending pid map)
 - `register_bot.py` clears `server`/`lobby_code` on OFFLINE

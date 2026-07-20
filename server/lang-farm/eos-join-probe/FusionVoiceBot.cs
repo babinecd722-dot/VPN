@@ -126,15 +126,14 @@ internal static class FusionVoiceBot
         catch (Exception e)
         {
             Console.Error.WriteLine("[langfarm] EOS identity/login failed: " + e.Message);
-            return 3;
+            return SafeExit(3);
         }
 
         var p2p = _platform.GetP2PInterface();
         if (p2p == null)
         {
             Console.Error.WriteLine("[langfarm] P2P interface NULL");
-            ShutdownIdentity();
-            return 6;
+            return SafeExit(6);
         }
         ConfigureP2P(p2p);
         RegisterP2P(p2p);
@@ -231,13 +230,10 @@ internal static class FusionVoiceBot
             ReleaseClaim(previewId);
             RegisterBotInClientDb(_localUser.ToString(), BotNick, "OFFLINE");
 
-            // SUCCESS only when we wrote a confident language (ok=1) — not unknown TXT lines.
+            // Keep the EOS session alive across lobbies — do not teardown after one hit.
+            // (Platform.Release / process exit runs EOSSDK atexit and SIGSEGVs on Linux.)
             if (detections > 0)
-            {
-                Console.WriteLine($"[langfarm] SUCCESS — {detections} confident language update(s) → {ResultsTxt}");
-                ShutdownIdentity();
-                return 0;
-            }
+                Console.WriteLine($"[langfarm] hit — {detections} confident language update(s) so far → {ResultsTxt}");
             if (_voiceDecoded > 0)
                 Console.WriteLine("[langfarm] decoded voice but not confident — next lobby");
             else if (_voicePackets > 0)
@@ -246,11 +242,14 @@ internal static class FusionVoiceBot
                 Console.WriteLine("[langfarm] P2P ok, no voice yet — next lobby");
         }
 
-        Console.WriteLine(detections > 0
-            ? $"[langfarm] done detections={detections}"
-            : "[langfarm] no confident language detections this run");
-        ShutdownIdentity();
-        return detections > 0 ? 0 : (_voicePackets > 0 || _packetsIn > 0 ? 5 : 4);
+        if (detections > 0)
+            Console.WriteLine($"[langfarm] SUCCESS — {detections} confident language update(s) → {ResultsTxt}");
+        else
+            Console.WriteLine("[langfarm] no confident language detections this run");
+
+        // Soft leave/close, then hard-exit so EOSSDK shutdown handlers never run.
+        SoftCleanup();
+        return SafeExit(detections > 0 ? 0 : (_voicePackets > 0 || _packetsIn > 0 ? 5 : 4));
     }
 
     private static void ResetStats()
@@ -995,10 +994,12 @@ internal static class FusionVoiceBot
         catch (Exception e) { Console.Error.WriteLine("[langfarm] leave: " + e.Message); }
     }
 
-    private static void ShutdownIdentity()
+    /// <summary>
+    /// Leave lobby + close P2P only. Never Platform.Release / Connect.Logout on Linux —
+    /// those tear down EOSSDK and SIGSEGV (exit 139) after otherwise-successful runs.
+    /// </summary>
+    private static void SoftCleanup()
     {
-        // Order matters: leave lobby → close P2P → release platform.
-        // Never call Connect.Logout on Linux EOSSDK (SIGSEGV / exit 139 after SUCCESS).
         try
         {
             if (!string.IsNullOrEmpty(_currentLobbyId))
@@ -1015,19 +1016,37 @@ internal static class FusionVoiceBot
             }
         }
         catch { /* */ }
-        try { EosIdentity.Logout(_platform, _localUser, () => _platform?.Tick()); } catch { /* */ }
         try
         {
-            _platform?.Release();
+            if (_localUser != null)
+                RegisterBotInClientDb(_localUser.ToString(), BotNick, "OFFLINE");
         }
-        catch (Exception e)
-        {
-            Console.Error.WriteLine("[langfarm] platform release: " + e.Message);
-        }
-        _platform = null;
-        _localUser = null;
+        catch { /* */ }
         _currentLobbyId = "";
     }
+
+    /// <summary>
+    /// Flush + libc _exit so EOSSDK atexit/"Shutdown handler" never runs (avoids SIGSEGV).
+    /// Marked as returning int for call-site convenience; never returns on Linux.
+    /// </summary>
+    private static int SafeExit(int code)
+    {
+        try { Console.Out.Flush(); Console.Error.Flush(); } catch { /* */ }
+        if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+        {
+            Console.WriteLine($"[langfarm] hard-exit code={code} (skip EOSSDK teardown)");
+            try { Console.Out.Flush(); } catch { /* */ }
+            LibcExit(code);
+        }
+
+        // Non-Linux fallback — still skip Release (known-unsafe).
+        try { EosIdentity.Logout(_platform, _localUser, () => _platform?.Tick()); } catch { /* */ }
+        Environment.Exit(code);
+        return code;
+    }
+
+    [DllImport("libc", EntryPoint = "_exit", SetLastError = false)]
+    private static extern void LibcExit(int status);
 
     /// <summary>
     /// Upsert bot into client_data so all 10 PUIDs appear on the site (scraper may be stopped during mint).
