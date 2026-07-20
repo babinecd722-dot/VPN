@@ -1,14 +1,13 @@
 # MONSTER Panel (BONELAB MelonLoader mod)
 
-## Tracking (2.30.21+)
+## Tracking (2.30.22+)
 
-- **Fix OOB crash:** Fusion profile Tracking button uses `AddOrGetElement` + clear (no duplicate groups on every `ApplyPlayerToElement`)
-- Friends list capped at **12** rows (BoneMenu GUIPool-safe)
-- Join alert: **one** digest popup, `SaveToMenu=false`
-- One-shot fetch when opening Tracking; playtime static from DB
-- JOIN: leave → settle → retry
+- **JOIN (Checkerb0ard EOS):** same path as Fusion menu — `NetworkHelper.JoinServerByCode` after clean leave + settle; success via `OnJoinedServer`
+- **OOB fix:** profile Tracking button `AddOrGetElement` (no duplicates)
+- Friends list max **12**; join alert = one digest, `SaveToMenu=false`
+- One-shot Tracking fetch; playtime static from DB
 
-API: `POST http://62.109.21.131:8787/v1/track`
+Uses LabFusion from Checkerb0ard 0.0.5 (EOS), not Steam.
 
 ---
 

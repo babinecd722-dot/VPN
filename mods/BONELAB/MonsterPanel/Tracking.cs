@@ -994,16 +994,14 @@ namespace MonsterPanel
 
         private static IEnumerator JoinAndWatchRoutine(string name, string code, string pid)
         {
-            // Close Tracking UI before network ops — BoneMenu mid-draw + Disconnect = Quest OOB.
-            try
-            {
-                if (_rootPage != null) Menu.OpenPage(_rootPage);
-            }
-            catch { /* */ }
-            yield return null;
+            // Fusion menu path (Checkerb0ard EOS): NetworkHelper.JoinServerByCode(code).
+            // JoinServerByCode → EOSMatchmaker.RequestLobbiesByCode(upper) → JoinServer(details).
+            // JoinServer Disconnect()s if already connected (async LeaveLobby). We wait for a
+            // clean Disconnected state first so CanJoinServer() succeeds (not mid-Disconnecting race).
+
             yield return null;
 
-            // Optional soft refresh of lobby_code for this friend (no UI rebuild).
+            // Soft-refresh lobby_code from DB (no BoneMenu rebuild).
             if (!string.IsNullOrEmpty(pid) && !_polling && Time.unscaledTime >= _apiReadyAt)
             {
                 var one = new List<string> { pid };
@@ -1013,19 +1011,27 @@ namespace MonsterPanel
                 catch { _polling = false; }
                 if (task != null)
                 {
-                    while (!task.IsCompleted) yield return null;
+                    float httpT = 0f;
+                    while (!task.IsCompleted && httpT < 8f)
+                    {
+                        httpT += Time.unscaledDeltaTime;
+                        yield return null;
+                    }
                     try
                     {
-                        string json = task.Result;
-                        if (json != null)
+                        if (task.IsCompleted)
                         {
-                            ApplyTrackJson(json);
-                            _apiReadyAt = Time.unscaledTime + 10f;
-                            lock (Gate)
+                            string json = task.Result;
+                            if (json != null)
                             {
-                                if (Snapshots.TryGetValue(pid, out var s) && s != null &&
-                                    !string.IsNullOrWhiteSpace(s.LobbyCode))
-                                    code = s.LobbyCode;
+                                ApplyTrackJson(json);
+                                _apiReadyAt = Time.unscaledTime + 10f;
+                                lock (Gate)
+                                {
+                                    if (Snapshots.TryGetValue(pid, out var s) && s != null &&
+                                        !string.IsNullOrWhiteSpace(s.LobbyCode))
+                                        code = s.LobbyCode;
+                                }
                             }
                         }
                     }
@@ -1034,16 +1040,10 @@ namespace MonsterPanel
                 }
             }
 
-            if (string.IsNullOrWhiteSpace(code))
+            string c = NormalizeLobbyCode(code);
+            if (string.IsNullOrEmpty(c))
             {
                 NotifyError("Join", "No lobby code");
-                yield break;
-            }
-
-            string c = code.Trim().ToUpperInvariant().Replace(" ", "");
-            if (c.Length < 4)
-            {
-                NotifyError("Join", "Bad lobby code");
                 yield break;
             }
 
@@ -1051,7 +1051,7 @@ namespace MonsterPanel
             try { inServer = NetworkInfo.HasServer; } catch { /* */ }
             if (inServer)
             {
-                MelonLogger.Msg("Tracking: disconnect before Join " + c);
+                MelonLogger.Msg("Tracking: EOS leave before JoinServerByCode " + c);
                 Notify("Joining", "Leaving current lobby…");
                 try { NetworkHelper.Disconnect("Tracking Join"); }
                 catch (Exception ex)
@@ -1060,8 +1060,9 @@ namespace MonsterPanel
                     yield break;
                 }
 
+                // Wait until Fusion reports no server (OnDisconnectComplete cleared IsClient).
                 float leaveT = 0f;
-                while (leaveT < 10f)
+                while (leaveT < 12f)
                 {
                     leaveT += Time.unscaledDeltaTime;
                     bool still = false;
@@ -1076,70 +1077,93 @@ namespace MonsterPanel
                     yield break;
                 }
 
-                // Longer settle — EOS matchmaker rejects instant rejoin.
+                // Extra settle: EOS LeaveLobby callback + matchmaker must see us Disconnected.
                 float settle = 0f;
-                while (settle < 1.5f)
+                while (settle < 2.0f)
                 {
                     settle += Time.unscaledDeltaTime;
                     yield return null;
                 }
             }
 
-            bool joined = false;
-            for (int attempt = 1; attempt <= 2 && !joined; attempt++)
+            // Success signal = OnJoinedServer (same as Fusion internal), not GetServerCode
+            // (client hosts don't own ServerCode — GetServerCode is empty for clients).
+            bool joinedFlag = false;
+            ServerEvent onJoined = () => { joinedFlag = true; };
+            try { MultiplayerHooking.OnJoinedServer += onJoined; }
+            catch (Exception e)
             {
-                try
+                MelonLogger.Warning("Tracking: OnJoinedServer hook — " + e.Message);
+                onJoined = null;
+            }
+
+            try
+            {
+                // Exact Fusion menu call — one shot (retries stack EOS lobby searches).
+                NetworkHelper.JoinServerByCode(c);
+                Notify("Joining", SafeMenu(name) + " / " + c);
+                MelonLogger.Msg("Tracking: JoinServerByCode " + c + " (EOS matchmaker)");
+            }
+            catch (Exception ex)
+            {
+                if (onJoined != null)
                 {
-                    NetworkHelper.JoinServerByCode(c);
-                    Notify("Joining", SafeMenu(name) + " / " + c + (attempt > 1 ? " (retry)" : ""));
-                    MelonLogger.Msg("Tracking: JoinServerByCode " + c + " attempt=" + attempt);
+                    try { MultiplayerHooking.OnJoinedServer -= onJoined; } catch { /* */ }
                 }
-                catch (Exception ex)
+                NotifyError("Join failed", ex.Message);
+                yield break;
+            }
+
+            float t = 0f;
+            while (t < 20f)
+            {
+                t += Time.unscaledDeltaTime;
+                bool nowIn = joinedFlag;
+                if (!nowIn)
                 {
-                    NotifyError("Join failed", ex.Message);
+                    try { nowIn = NetworkInfo.HasServer; } catch { /* */ }
+                }
+                if (nowIn)
+                {
+                    MelonLogger.Msg(
+                        "Tracking: join OK — target=" + c +
+                        " via=" + (joinedFlag ? "OnJoinedServer" : "HasServer") +
+                        " t=" + t.ToString("0.0", CultureInfo.InvariantCulture) + "s");
+                    Notify("Joined", SafeMenu(name) + " / " + c);
+                    if (onJoined != null)
+                    {
+                        try { MultiplayerHooking.OnJoinedServer -= onJoined; } catch { /* */ }
+                    }
                     yield break;
                 }
-
-                float t = 0f;
-                while (t < 14f)
-                {
-                    t += Time.unscaledDeltaTime;
-                    bool nowIn = false;
-                    try { nowIn = NetworkInfo.HasServer; } catch { /* */ }
-                    if (nowIn)
-                    {
-                        string got = null;
-                        try { got = NetworkHelper.GetServerCode(); } catch { /* */ }
-                        MelonLogger.Msg(
-                            "Tracking: join OK — target=" + c +
-                            " code=" + (got ?? "?") +
-                            " t=" + t.ToString("0.0", CultureInfo.InvariantCulture) + "s");
-                        Notify("Joined", SafeMenu(name) + " / " + c);
-                        joined = true;
-                        break;
-                    }
-                    yield return null;
-                }
-
-                if (!joined && attempt < 2)
-                {
-                    MelonLogger.Warning("Tracking: join attempt " + attempt + " timed out — retry");
-                    float pause = 0f;
-                    while (pause < 1.0f)
-                    {
-                        pause += Time.unscaledDeltaTime;
-                        yield return null;
-                    }
-                }
+                yield return null;
             }
 
-            if (!joined)
+            if (onJoined != null)
             {
-                MelonLogger.Warning("Tracking: join timed out for " + c);
-                NotifyError(
-                    "Join failed",
-                    "Lobby not found / private / stale. Refresh Tracking and retry.");
+                try { MultiplayerHooking.OnJoinedServer -= onJoined; } catch { /* */ }
             }
+
+            MelonLogger.Warning("Tracking: join timed out for " + c);
+            NotifyError(
+                "Join failed",
+                "No lobby with code " + c + " (private/stale/full). Refresh and retry.");
+        }
+
+        /// <summary>Match EOSMatchmaker: trim + ToUpperInvariant (LobbyCode attribute).</summary>
+        private static string NormalizeLobbyCode(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code)) return "";
+            var sb = new StringBuilder(8);
+            foreach (char ch in code.Trim())
+            {
+                if (char.IsWhiteSpace(ch) || ch == '-' || ch == '_') continue;
+                sb.Append(char.ToUpperInvariant(ch));
+            }
+            string c = sb.ToString();
+            // Fusion RandomCodeGenerator length is 8; accept 6–8 for older codes.
+            if (c.Length < 6 || c.Length > 10) return "";
+            return c;
         }
 
         private static string FormatListTitle(TrackedEntry e, TrackSnapshot snap)
