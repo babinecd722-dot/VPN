@@ -79,10 +79,11 @@ internal static class Program
     {
         if (int.TryParse(Env("GHOST_TTL_SEC", ""), out var sec))
             return Math.Clamp(sec, 0, 3600);
-        // Legacy minutes → seconds (old default was 4m; new default 90s).
+        // Legacy minutes → seconds (old default was 4m).
         if (int.TryParse(Env("GHOST_TTL_MIN", ""), out var min) && min > 0)
             return Math.Clamp(min * 60, 0, 3600);
-        return 90;
+        // Must exceed a full EOS Find cycle (~100s+ under load) or /v1/track flickers OFFLINE.
+        return 180;
     }
 
     private static string ResolvePostgresDsn()
@@ -1479,12 +1480,10 @@ internal static class Program
                         string.Equals(row.Server ?? "", p.Server ?? "", StringComparison.Ordinal) &&
                         string.Equals(row.ServerMap ?? "", p.ServerMap ?? "", StringComparison.Ordinal) &&
                         string.Equals(row.LobbyCode ?? "", p.LobbyCode ?? "", StringComparison.Ordinal);
-                    if (same)
-                    {
-                        unchanged++;
-                        continue;
-                    }
 
+                    // Always refresh last_seen_at — skipping "unchanged" left rows stale for
+                    // 90s+ between EOS Finds so /v1/track ghost-TTL flickered online↔offline
+                    // while status stayed IN GAME (session timer looked frozen).
                     uName.Value = p.Name;
                     uStatus.Value = status;
                     uServer.Value = (object)p.Server ?? DBNull.Value;
@@ -1492,7 +1491,8 @@ internal static class Program
                     uCode.Value = (object)p.LobbyCode ?? DBNull.Value;
                     uPid.Value = p.Pid;
                     upd.ExecuteNonQuery();
-                    upserted++;
+                    if (same) unchanged++;
+                    else upserted++;
                 }
                 else
                 {
