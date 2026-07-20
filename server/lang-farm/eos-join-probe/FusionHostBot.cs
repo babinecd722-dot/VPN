@@ -19,12 +19,14 @@ namespace EosJoinProbe;
 internal static class FusionHostBot
 {
     private static readonly string GameName = Env("FUSION_GAME_NAME", "BONELAB");
-    // Unicode one-dot leader (U+2024) instead of ASCII '.' so Fusion LinkFilter
-    // does not censor name/desc as a URL (still reads as www.bonelab.fun).
-    private static readonly string LobbyName = Env("HOST_LOBBY_NAME", "www․bonelab․fun");
+    // ASCII dots + U+200B (ZWSP) after each '.' — looks like www.bonelab.fun on Quest
+    // (U+2024 one-dot-leader rendered as □), and bypasses Fusion LinkFilter URL censor.
+    private static readonly string LobbyName = Env(
+        "HOST_LOBBY_NAME",
+        "www.\u200bbonelab.\u200bfun");
     private static readonly string LobbyDesc = Env(
         "HOST_LOBBY_DESC",
-        "www․bonelab․fun");
+        "www.\u200bbonelab.\u200bfun");
     private static readonly string LevelTitle = Env("HOST_LEVEL_TITLE", "Halfway Park");
     private static readonly string LevelBarcode = Env(
         "HOST_LEVEL_BARCODE",

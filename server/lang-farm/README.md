@@ -49,7 +49,7 @@ systemctl status fusion-lobby-host
 journalctl -u fusion-lobby-host -f
 ```
 
-Defaults: lobby name/desc `www․bonelab․fun` (Unicode dots U+2024 to bypass Fusion LinkFilter), nick `coolguy`, map Halfway Park, `HOST_HOLD_SEC=0` (forever), soft caps `MemoryMax=256M` / `CPUQuota=50%`.
+Defaults: lobby name/desc `www.bonelab.fun` (ASCII '.' + U+200B ZWSP — LinkFilter bypass, Quest-safe), nick `coolguy`, map Halfway Park, `HOST_HOLD_SEC=0` (forever), soft caps `MemoryMax=256M` / `CPUQuota=50%`.
 
 `HOST_DISPLAY_PLAYERS=7` pads **LobbyInfo only** (browser count looks full-ish, `Full=False` so Find still returns it). Zero extra processes/CPU — not real bots.
 
