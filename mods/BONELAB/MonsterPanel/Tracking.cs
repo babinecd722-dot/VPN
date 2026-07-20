@@ -21,8 +21,8 @@ namespace MonsterPanel
 {
     /// <summary>
     /// Friend-style presence tracking for Fusion players.
-    /// Local pid list in UserData → poll /v1/track only while Tracking BoneMenu is open → Join by lobby_code.
-    /// Completely inert while sitting in a Fusion lobby with the menu closed (no join hooks, no popups, no poll).
+    /// Cache-first BoneMenu + gentle background /v1/track (no burst rebuilds that GUIPool-bounds Quest).
+    /// Inert in a Fusion lobby while Tracking menu is closed.
     /// </summary>
     internal static class Tracking
     {
@@ -30,9 +30,13 @@ namespace MonsterPanel
         // Baked-in presence API (VPS player-ingest). No UserData secrets required.
         private const string ApiUrl = "http://62.109.21.131:8787";
         private const string ApiKey = "e63d7b2ae9d5006d109712e6c3ea2592611f563e380724de";
-        private const float PollIntervalSec = 10f;
+        private const float PollIntervalSec = 12f;
+        private const float IdlePollIntervalSec = 45f; // background when NOT in a Fusion lobby
+        private const float RebuildMinIntervalSec = 2.5f;
+        private const float OpenPollDelaySec = 1.75f; // paint menu first, then fetch
         private const int HttpTimeoutSeconds = 8;
         private const int MaxTracked = 32;
+        private const int MaxVisibleFriends = 24; // hard cap BoneMenu rows (bounds-safe)
 
         private static bool _enabled = true;
         private static bool _hooked;
@@ -40,9 +44,13 @@ namespace MonsterPanel
         private static bool _polling;
         private static bool _rebuildQueued;
         private static bool _detailQueued;
+        private static bool _openPollQueued;
         private static float _pollCd;
+        private static float _idlePollCd;
+        private static float _lastRebuildAt = -999f;
         private static string _lastError = "";
         private static string _detailQueuedPid = "";
+        private static string _snapFingerprint = "";
 
         private static readonly object Gate = new object();
         private static readonly List<TrackedEntry> Entries = new List<TrackedEntry>();
@@ -86,7 +94,7 @@ namespace MonsterPanel
             LoadList();
             InstallFusionProfileHook(harmony);
             // No boot poll — stay inert until the player opens Tracking in BoneMenu.
-            MelonLogger.Msg($"Tracking: enabled={_enabled} tracked={Entries.Count} api={ApiUrl} (menu-only poll)");
+            MelonLogger.Msg($"Tracking: enabled={_enabled} tracked={Entries.Count} api={ApiUrl} (cache-first, gentle poll)");
         }
 
         public static void InstallMenu(Page root)
@@ -104,18 +112,38 @@ namespace MonsterPanel
         }
 
         /// <summary>
-        /// Background poll ONLY while Tracking BoneMenu pages are open.
-        /// Closed menu in a Fusion lobby → zero Tracking work (no HTTP, no BoneMenu rebuild).
+        /// Gentle presence refresh:
+        /// - Tracking menu open → poll on interval, rebuild only if data changed
+        /// - Menu closed + not in Fusion lobby → slow idle poll (cache warm, no UI)
+        /// - Menu closed + in Fusion lobby → fully inert (no HTTP / no BoneMenu)
         /// </summary>
         public static void Tick()
         {
             if (!_enabled || Entries.Count == 0) return;
-            if (!IsTrackingMenuOpen()) return;
-            if (Time.unscaledTime < _apiReadyAt) return;
-            _pollCd -= Time.unscaledDeltaTime;
-            if (_pollCd > 0f || _polling) return;
-            _pollCd = PollIntervalSec;
-            MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: true));
+            if (Time.unscaledTime < _apiReadyAt || _polling) return;
+
+            bool menuOpen = IsTrackingMenuOpen();
+            if (menuOpen)
+            {
+                _pollCd -= Time.unscaledDeltaTime;
+                if (_pollCd > 0f) return;
+                _pollCd = PollIntervalSec;
+                MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: true));
+                return;
+            }
+
+            // Warm cache only outside a live Fusion session — never hammer while seated in lobby.
+            if (IsInFusionLobby()) return;
+            _idlePollCd -= Time.unscaledDeltaTime;
+            if (_idlePollCd > 0f) return;
+            _idlePollCd = IdlePollIntervalSec;
+            MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: false));
+        }
+
+        private static bool IsInFusionLobby()
+        {
+            try { return NetworkInfo.HasServer; }
+            catch { return false; }
         }
 
         private static bool IsTrackingMenuOpen()
@@ -179,8 +207,12 @@ namespace MonsterPanel
 
             Notify("Added to Tracking", SafeMenu(name));
             MelonLogger.Msg("Tracking: add " + pid + " (" + name + ")");
-            RequestMenuRefresh();
-            _pollCd = 0f;
+            // Don't force an immediate full poll+rebuild (bounds crash in live lobbies).
+            // Cache row appears on next safe rebuild; presence fills on the next gentle Tick poll.
+            if (IsTrackingMenuOpen())
+                ScheduleRebuild(poll: false, force: false);
+            else
+                _idlePollCd = Math.Min(_idlePollCd, 3f);
         }
 
         public static void Remove(string pid)
@@ -275,7 +307,37 @@ namespace MonsterPanel
                 if (!force)
                     _pollCd = PollIntervalSec;
                 if (refreshMenu)
-                    RequestMenuRefresh();
+                {
+                    string fp = ComputeSnapFingerprint();
+                    bool changed = !string.Equals(fp, _snapFingerprint, StringComparison.Ordinal);
+                    _snapFingerprint = fp;
+                    if (changed && IsTrackingMenuOpen())
+                        RequestMenuRefresh();
+                    else if (!string.IsNullOrEmpty(_detailPid) && IsTrackingMenuOpen())
+                        ScheduleDetailFill(_detailPid, open: false);
+                }
+            }
+        }
+
+        private static string ComputeSnapFingerprint()
+        {
+            lock (Gate)
+            {
+                var sb = new StringBuilder(Entries.Count * 48);
+                for (int i = 0; i < Entries.Count; i++)
+                {
+                    var e = Entries[i];
+                    sb.Append(e.Pid).Append('|');
+                    if (Snapshots.TryGetValue(e.Pid, out var s) && s != null)
+                    {
+                        sb.Append(s.Online ? '1' : '0').Append('|')
+                          .Append(s.Status ?? "").Append('|')
+                          .Append(s.LobbyCode ?? "").Append('|')
+                          .Append(s.Server ?? "").Append(';');
+                    }
+                    else sb.Append("?;");
+                }
+                return sb.ToString();
             }
         }
 
@@ -411,8 +473,31 @@ namespace MonsterPanel
         private static void OnPageOpened(Page opened)
         {
             if (opened != _rootPage) return;
-            // NEVER RemoveAll inside OnPageOpened — BoneMenu is mid-draw → GUIPool NRE on Quest.
-            ScheduleRebuild(poll: true);
+            // Cache-only first paint. Never poll+RemoveAll in the same frame as open (Quest bounds/GUIPool).
+            ScheduleRebuild(poll: false, force: true);
+            QueueDelayedOpenPoll();
+        }
+
+        private static void QueueDelayedOpenPoll()
+        {
+            if (_openPollQueued || !_enabled || Entries.Count == 0) return;
+            _openPollQueued = true;
+            MelonCoroutines.Start(DelayedOpenPollRoutine());
+        }
+
+        private static IEnumerator DelayedOpenPollRoutine()
+        {
+            float t = 0f;
+            while (t < OpenPollDelaySec)
+            {
+                t += Time.unscaledDeltaTime;
+                yield return null;
+            }
+            _openPollQueued = false;
+            if (!IsTrackingMenuOpen()) yield break;
+            if (_polling || Time.unscaledTime < _apiReadyAt) yield break;
+            // Fetch in background; rebuild only if presence fingerprint changes.
+            MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: true));
         }
 
         private static void RequestMenuRefresh()
@@ -426,21 +511,29 @@ namespace MonsterPanel
                 return;
             }
             if (cur == _rootPage)
-                ScheduleRebuild(poll: false);
+                ScheduleRebuild(poll: false, force: false);
         }
 
-        private static void ScheduleRebuild(bool poll)
+        private static void ScheduleRebuild(bool poll, bool force)
         {
+            if (!force && Time.unscaledTime - _lastRebuildAt < RebuildMinIntervalSec)
+                return;
             if (_rebuildQueued) return;
             _rebuildQueued = true;
-            MelonCoroutines.Start(DeferredRebuildRoutine(poll));
+            MelonCoroutines.Start(DeferredRebuildRoutine(poll, force));
         }
 
-        private static IEnumerator DeferredRebuildRoutine(bool poll)
+        private static IEnumerator DeferredRebuildRoutine(bool poll, bool force)
         {
-            // Wait until BoneMenu finishes OnPageOpened / DrawElements.
+            // Extra frames so BoneMenu finishes OnPageOpened / DrawElements (avoids GUIPool bounds).
             yield return null;
             yield return null;
+            yield return null;
+            if (IsInFusionLobby())
+            {
+                yield return null;
+                yield return null;
+            }
             _rebuildQueued = false;
             try
             {
@@ -448,6 +541,8 @@ namespace MonsterPanel
                 try { cur = Menu.CurrentPage; } catch { /* */ }
                 if (cur == _detailPage) yield break;
                 if (cur != null && cur != _rootPage) yield break;
+                if (!force && Time.unscaledTime - _lastRebuildAt < RebuildMinIntervalSec)
+                    yield break;
                 RebuildMenu();
             }
             catch (Exception ex)
@@ -455,6 +550,7 @@ namespace MonsterPanel
                 MelonLogger.Warning("Tracking deferred rebuild: " + ex.Message);
             }
 
+            // Open path never passes poll:true anymore; keep hook inert if called.
             if (poll && _enabled && Entries.Count > 0 && !_polling && Time.unscaledTime >= _apiReadyAt)
             {
                 _pollCd = 0f;
@@ -502,15 +598,21 @@ namespace MonsterPanel
 
                 _rootPage.RemoveAll();
                 _rootPage.Color = new Color(0.2f, 0.85f, 0.95f);
+                _lastRebuildAt = Time.unscaledTime;
 
                 _rootPage.CreateFunction("Refresh now", new Color(0.45f, 0.85f, 1f), (Action)(() =>
                 {
-                    if (_pollCd > 0f && !_polling)
+                    if (_polling)
                     {
-                        Notify("Tracking", "Wait " + Mathf.CeilToInt(_pollCd) + "s");
+                        Notify("Tracking", "Already refreshing…");
                         return;
                     }
-                    _pollCd = 0f;
+                    if (Time.unscaledTime < _apiReadyAt)
+                    {
+                        float left = Mathf.Max(0f, _apiReadyAt - Time.unscaledTime);
+                        Notify("Tracking", "Wait " + Mathf.CeilToInt(left) + "s");
+                        return;
+                    }
                     MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: true));
                 }));
 
@@ -539,20 +641,31 @@ namespace MonsterPanel
                     var order = new List<TrackedEntry>(Entries);
                     order.Sort((a, b) =>
                     {
-                        bool ao = Snapshots.TryGetValue(a.Pid, out var sa) && sa.Online;
-                        bool bo = Snapshots.TryGetValue(b.Pid, out var sb) && sb.Online;
+                        bool ao = Snapshots.TryGetValue(a.Pid, out var sa) && sa != null && sa.Online;
+                        bool bo = Snapshots.TryGetValue(b.Pid, out var sb) && sb != null && sb.Online;
                         if (ao != bo) return ao ? -1 : 1;
                         return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
                     });
 
+                    int shown = 0;
                     foreach (var e in order)
                     {
+                        if (shown >= MaxVisibleFriends)
+                        {
+                            int more = order.Count - shown;
+                            _rootPage.CreateFunction(
+                                "+" + more + " more (remove some)",
+                                new Color(0.7f, 0.55f, 0.35f),
+                                (Action)(() => { }));
+                            break;
+                        }
                         Snapshots.TryGetValue(e.Pid, out var snap);
                         string pid = e.Pid;
                         _rootPage.CreateFunction(
                             FormatListTitle(e, snap),
                             ListColor(snap),
                             (Action)(() => OpenFriend(pid)));
+                        shown++;
                     }
                 }
             }
@@ -573,20 +686,18 @@ namespace MonsterPanel
             _detailPid = "";
             Notify("Tracking", "List cleared");
             MelonLogger.Msg("Tracking: clear all friends");
-            ScheduleRebuild(poll: false);
+            ScheduleRebuild(poll: false, force: true);
         }
 
         /// <summary>
-        /// Open friend card from cache immediately; soft-refresh that pid in background.
-        /// No HTTP / Join / Disconnect on the click itself.
+        /// Open friend card from cache immediately; do NOT fire a full /v1/track burst on click.
+        /// Presence updates arrive from the gentle Tick / delayed-open poll.
         /// </summary>
         private static void OpenFriend(string pid)
         {
             if (string.IsNullOrWhiteSpace(pid) || _detailPage == null) return;
             _detailPid = pid;
-            // Defer RemoveAll so we don't fight the click that opened the row.
             ScheduleDetailFill(pid, open: true);
-            MelonCoroutines.Start(SoftRefreshFriendRoutine(pid));
         }
 
         private static void FillDetailPage(string pid, bool open)
@@ -684,38 +795,6 @@ namespace MonsterPanel
             {
                 MelonLogger.Warning("Tracking friend page: " + ex.Message);
             }
-        }
-
-        /// <summary>Background poll so the card updates without blocking the open click.</summary>
-        private static IEnumerator SoftRefreshFriendRoutine(string pid)
-        {
-            // Let the menu paint first — never block OpenFriend on HTTP.
-            yield return null;
-            yield return null;
-
-            float wait = 0f;
-            while ((_polling || Time.unscaledTime < _apiReadyAt) && wait < 12f)
-            {
-                wait += Time.unscaledDeltaTime;
-                yield return null;
-            }
-
-            if (!_polling)
-                MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: false));
-
-            wait = 0f;
-            while (_polling && wait < 15f)
-            {
-                wait += Time.unscaledDeltaTime;
-                yield return null;
-            }
-
-            if (!string.Equals(_detailPid, pid, StringComparison.OrdinalIgnoreCase))
-                yield break;
-            Page cur = null;
-            try { cur = Menu.CurrentPage; } catch { /* */ }
-            if (cur == _detailPage)
-                ScheduleDetailFill(pid, open: false);
         }
 
         private static Color ListColor(TrackSnapshot snap)
