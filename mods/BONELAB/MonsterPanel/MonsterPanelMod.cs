@@ -22,7 +22,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.30", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.31", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -1904,7 +1904,10 @@ namespace MonsterPanel
             }
 
             /// <summary>
-            /// Pull player to me. Host: PlayerRepTeleport (real). Client: Fusion permission request.
+            /// Pull player to me via PlayerRepTeleport network message.
+            /// PlayerSender.SendPlayerTeleport is host-only; Fusion permission request
+            /// needs lobby Teleportation rights. Relaying the native tag works for both
+            /// host and client (server forwards ToTarget with no permission gate).
             /// </summary>
             private static void BringToMe(byte sid)
             {
@@ -1933,18 +1936,16 @@ namespace MonsterPanel
 
                     string who = MenuName(np);
 
-                    if (NetworkInfo.IsHost)
-                    {
-                        // Authoritative: their client applies LocalPlayer.TeleportToPosition.
-                        PlayerSender.SendPlayerTeleport(sid, land);
-                        MelonLogger.Msg($"Teleport: Bring (host) {who} → {land}");
-                        return;
-                    }
+                    // Same payload Fusion host uses for admin teleport — forces THEIR
+                    // LocalPlayer.TeleportToPosition on receive (network-owned, sticks).
+                    var data = new PlayerRepTeleportData { Position = land };
+                    MessageRelay.RelayNative(
+                        data,
+                        NativeMessageTag.PlayerRepTeleport,
+                        new MessageRoute(sid, NetworkChannel.Reliable));
 
-                    // Non-host: ask server (needs lobby Teleportation permission).
-                    PermissionSender.SendPermissionRequest(PermissionCommandType.TELEPORT_TO_ME, sid);
                     MelonLogger.Msg(
-                        $"Teleport: Bring requested for {who} (needs host/teleport perms).");
+                        $"Teleport: Bring {who} (sid {sid}) → {land} host={NetworkInfo.IsHost}");
                 }
                 catch (Exception e) { MelonLogger.Warning("Teleport bring: " + e.Message); }
             }
