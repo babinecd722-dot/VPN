@@ -23,7 +23,7 @@ using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 using PlayerHealth = Il2CppSLZ.Marrow.Player_Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.32", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.34", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -95,6 +95,7 @@ namespace MonsterPanel
                 FusionCleanup.Install(HarmonyInstance); // Fusion Admin → Cleanup → Despawn All (non-host too)
                 Tracking.Init(HarmonyInstance); // profile Add to Tracking + /v1/track poll
                 AntiOob.Install(HarmonyInstance); // silent Fusion network OOB shield (no UI)
+                SlowMoFix.Install(HarmonyInstance); // silent stock Slow Mo → real timescale (no UI)
             }
             AntiManip.Install(HarmonyInstance); // silent Dev Manipulator immunity (no UI)
             BuildMenu();
@@ -114,6 +115,7 @@ namespace MonsterPanel
                 Freedom.Tick();   // снимаем ЧУЖИЕ констрейны с тебя и предметов рядом (свои не трогаем)
                 AntiManip.Tick(); // backup: release manipulator locks on our rig
                 AntiOob.Tick();   // keep physics on after OOB events (no reload cascade)
+                SlowMoFix.Tick(); // keep stock Slow Mo armed + non-host bypass
                 if (KillAura) Aura.KillTick();
                 if (Disarm) Aura.DisarmTick();
                 Guards.Tick();
