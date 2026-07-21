@@ -21,7 +21,7 @@ Uses LabFusion from Checkerb0ard 0.0.5 (EOS), not Steam.
 
 Страница **MONSTER Panel** в BoneMenu, два тумблера (без кнопок — вкл/выкл):
 
-- **Invincible** — бессмертие. Игрок не получает урон и не умирает.
+- **Invincible** — бессмертие локального игрока (2.30.32+: TAKEDAMAGE/Dying/Death/OnReceivedDamage/insta-death + tick heal; чужих не трогает).
 - **Monster Damage** — ваншот с жёстким отбросом:
   - **враги-гуманоиды** (PuppetMaster) — мгновенно убиваются и **отлетают** в сторону удара;
   - **объекты/ящики** (Health) — уничтожаются с одного касания;

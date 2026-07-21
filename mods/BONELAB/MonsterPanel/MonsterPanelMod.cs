@@ -21,8 +21,9 @@ using LabFusion.Utilities;
 using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
+using PlayerHealth = Il2CppSLZ.Marrow.Player_Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.31", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.32", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -104,6 +105,9 @@ namespace MonsterPanel
         public override void OnUpdate()
         {
             TankUpdate();
+
+            if (Invincible)
+                GodMode.Tick();
 
             if (_fusionLoaded)
             {
@@ -1107,12 +1111,30 @@ namespace MonsterPanel
 
         private void ApplyPatches()
         {
-            Type playerHealth = AccessTools.TypeByName(PlayerHealthType);
+            Type playerHealth = AccessTools.TypeByName(PlayerHealthType) ?? typeof(PlayerHealth);
             if (playerHealth != null)
             {
+                // Local-only godmode: never block remote Player_Health (would break killing others).
                 var god = Hm(nameof(GodPrefix));
-                foreach (string m in new[] { "TAKEDAMAGE", "ApplyKillDamage", "Death" })
+                foreach (string m in new[]
+                {
+                    "TAKEDAMAGE",
+                    "ApplyKillDamage",
+                    "Death",
+                    "Dying",
+                    "OnReceivedDamage",
+                    "ShowHealthInstaDeathMode",
+                    "LifeSavingDamgeDealt",
+                })
                     TryPatch(playerHealth, m, god);
+
+                // Instant-death mode toggle — force stay off while Invincible.
+                TryPatch(playerHealth, "ToggleInstantDeathMode", Hm(nameof(GodInstantDeathPrefix)));
+
+                // Health percent updates that would drop us — keep full while Invincible.
+                TryPatch(playerHealth, "UpdateHealth", Hm(nameof(GodUpdateHealthPrefix)));
+
+                MelonLogger.Msg("MONSTER Panel: Invincible hardened (local Player_Health death paths).");
             }
             else MelonLogger.Error("MONSTER Panel: Player_Health not found - invincibility inactive");
 
@@ -1174,7 +1196,83 @@ namespace MonsterPanel
             catch (Exception e) { MelonLogger.Warning($"MONSTER Panel: {label} - {e.Message}"); }
         }
 
-        private static bool GodPrefix() => !Invincible;
+        /// <summary>True only for OUR Player_Health — Invincible must never shield other players.</summary>
+        private static bool IsLocalPlayerHealth(PlayerHealth health)
+        {
+            try
+            {
+                if (health == null) return false;
+                var rm = health._rigManager;
+                var me = BoneLib.Player.RigManager;
+                return rm != null && me != null && rm == me;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>Skip death/damage methods on local health while Invincible.</summary>
+        private static bool GodPrefix(PlayerHealth __instance)
+        {
+            if (!Invincible) return true;
+            if (!IsLocalPlayerHealth(__instance)) return true;
+            return false;
+        }
+
+        private static bool GodInstantDeathPrefix(PlayerHealth __instance, bool toggleOn)
+        {
+            if (!Invincible || !IsLocalPlayerHealth(__instance)) return true;
+            // Never allow turning instant-death ON while godmode.
+            if (toggleOn) return false;
+            return true;
+        }
+
+        private static bool GodUpdateHealthPrefix(PlayerHealth __instance, float perc)
+        {
+            if (!Invincible || !IsLocalPlayerHealth(__instance)) return true;
+            // Block health reductions; allow full/heal refreshes.
+            if (perc < 0.999f)
+            {
+                try { __instance.SetFullHealth(); } catch { /* */ }
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>Backup: keep local health full / not dying while Invincible is on.</summary>
+        private static class GodMode
+        {
+            private static float _timer;
+
+            public static void Tick()
+            {
+                _timer -= Time.unscaledDeltaTime;
+                if (_timer > 0f) return;
+                _timer = 0.35f;
+
+                try
+                {
+                    var rm = BoneLib.Player.RigManager;
+                    if (rm == null) return;
+                    var health = rm.health;
+                    if (health == null) return;
+
+                    var ph = health.TryCast<PlayerHealth>();
+                    if (ph == null) return;
+
+                    if (!ph.alive || ph.isInstaDying)
+                    {
+                        ph.isInstaDying = false;
+                        ph.SetFullHealth();
+                    }
+                }
+                catch
+                {
+                    // best-effort
+                }
+            }
+        }
 
         private static void PuppetPrefix(SubBehaviourHealth __instance, Attack attack)
         {
