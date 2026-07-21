@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Reflection;
+using System.Text;
 using BoneLib.BoneMenu;
 using HarmonyLib;
 using Il2CppSLZ.Marrow;
@@ -10,13 +12,17 @@ using Il2CppSLZ.Marrow.PuppetMasta;
 using LabFusion.Entities;
 using LabFusion.Extensions;
 using LabFusion.Marrow.Extenders;
+using LabFusion.Network;
+using LabFusion.Player;
 using LabFusion.RPC;
+using LabFusion.Scene;
+using LabFusion.Senders;
 using LabFusion.Utilities;
 using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.28", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.29", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -1597,11 +1603,10 @@ namespace MonsterPanel
         {
             private static Page _page;
             private static bool _hooked;
+            private static bool _rebuildQueued;
 
             /// <summary>LabFusion загружен? (тип резолвится только если сборка в игре есть.)</summary>
             public static bool FusionLoaded => AccessTools.TypeByName("LabFusion.Entities.NetworkPlayer") != null;
-
-            private static bool _rebuildQueued;
 
             /// <summary>Создаёт подстраницу Teleport в корне панели и вешает авто-обновление списка.</summary>
             public static void Install(Page root)
@@ -1610,7 +1615,7 @@ namespace MonsterPanel
                 _page = root.CreatePage("Teleport", new Color(0.3f, 0.7f, 1f), 0, true);
                 if (!_hooked)
                 {
-                    Menu.OnPageOpened += (Action<Page>)OnPageOpened;   // при каждом открытии — свежий список
+                    Menu.OnPageOpened += (Action<Page>)OnPageOpened;
                     _hooked = true;
                 }
                 Rebuild();
@@ -1632,35 +1637,61 @@ namespace MonsterPanel
                 Rebuild();
             }
 
-            /// <summary>Flat list: TP / Bring / Tracking per player — no nested pages.</summary>
+            private static void QueueRebuild()
+            {
+                if (_rebuildQueued) return;
+                _rebuildQueued = true;
+                MelonCoroutines.Start(DeferredRebuild());
+            }
+
+            /// <summary>Flat list: header name + Go to / Bring / Track — stable ASCII labels.</summary>
             private static void Rebuild()
             {
                 if (_page == null) return;
                 try
                 {
                     _page.RemoveAll();
-                    _page.CreateFunction("Refresh", new Color(0.7f, 0.7f, 0.7f), (Action)(() =>
-                    {
-                        if (_rebuildQueued) return;
-                        _rebuildQueued = true;
-                        MelonCoroutines.Start(DeferredRebuild());
-                    }));
+                    _page.CreateFunction("Refresh", new Color(0.7f, 0.7f, 0.7f), (Action)QueueRebuild);
 
-                    int count = 0;
+                    // Snapshot + sort so BoneMenu order is stable and names aren't scrambled.
+                    var list = new List<NetworkPlayer>();
                     foreach (var np in NetworkPlayer.Players)
                     {
                         if (np == null || np.PlayerID == null || np.PlayerID.IsMe) continue;
                         if (!np.HasRig) continue;
+                        list.Add(np);
+                    }
 
+                    list.Sort((a, b) =>
+                    {
+                        string na = MenuName(a);
+                        string nb = MenuName(b);
+                        int c = string.CompareOrdinal(na, nb);
+                        if (c != 0) return c;
+                        return a.PlayerID.SmallID.CompareTo(b.PlayerID.SmallID);
+                    });
+
+                    int count = 0;
+                    foreach (var np in list)
+                    {
                         byte sid = np.PlayerID.SmallID;
-                        string name = SafeName(np.Username, sid);   // без rich-text тегов и не-ASCII: шрифт BoneMenu только латиница
-                        string shortName = name.Length > 14 ? name.Substring(0, 14) : name;
+                        string name = MenuName(np);
+                        string shortName = name.Length > 16 ? name.Substring(0, 16) : name;
 
-                        _page.CreateFunction("TP  " + shortName, new Color(0.3f, 1f, 0.5f), (Action)(() => TeleportSelfTo(sid)));
-                        _page.CreateFunction("Bring  " + shortName, new Color(1f, 0.6f, 0.2f), (Action)(() => BringToMe(sid)));
+                        // Header row (no action) — clean nick, not animated rich-text nickname.
+                        string header = shortName;
+                        _page.CreateFunction("· " + header, new Color(0.85f, 0.9f, 1f), (Action)(() => { }));
+
+                        byte sidGo = sid;
+                        _page.CreateFunction("  Go to", new Color(0.3f, 1f, 0.5f),
+                            (Action)(() => TeleportSelfTo(sidGo)));
+
+                        byte sidBring = sid;
+                        _page.CreateFunction("  Bring here", new Color(1f, 0.65f, 0.25f),
+                            (Action)(() => BringToMe(sidBring)));
 
                         string trackPid = null;
-                        string trackName = np.Username;
+                        string trackName = MenuName(np);
                         try { trackPid = np.PlayerID.PlatformID; } catch { /* */ }
                         if (!string.IsNullOrWhiteSpace(trackPid))
                         {
@@ -1668,15 +1699,13 @@ namespace MonsterPanel
                             string nameCopy = trackName;
                             bool tracked = Tracking.IsTracked(pidCopy);
                             _page.CreateFunction(
-                                (tracked ? "Untrack  " : "Track  ") + shortName,
+                                tracked ? "  Untrack" : "  Track",
                                 tracked ? new Color(1f, 0.4f, 0.35f) : new Color(0.35f, 0.9f, 1f),
                                 (Action)(() =>
                                 {
                                     if (Tracking.IsTracked(pidCopy)) Tracking.Remove(pidCopy);
                                     else Tracking.Add(pidCopy, nameCopy);
-                                    if (_rebuildQueued) return;
-                                    _rebuildQueued = true;
-                                    MelonCoroutines.Start(DeferredRebuild());
+                                    QueueRebuild();
                                 }));
                         }
                         count++;
@@ -1696,87 +1725,282 @@ namespace MonsterPanel
                 return null;
             }
 
-            /// <summary>Имя для BoneMenu: срезаем rich-text теги (&lt;color&gt;…) и не-ASCII (кириллицу),
-            /// иначе шрифт меню рисует кашу/квадраты. Пусто → "Player N".</summary>
-            private static string SafeName(string username, byte sid)
+            /// <summary>
+            /// Stable BoneMenu label: raw Metadata.Username (not shimmer Nickname),
+            /// strip rich-text / ZWSP / non-ASCII so Quest font doesn't show garbage.
+            /// </summary>
+            private static string MenuName(NetworkPlayer np)
             {
-                if (string.IsNullOrEmpty(username)) return "Player " + sid;
-                var sb = new System.Text.StringBuilder(username.Length);
+                byte sid = 0;
+                try { if (np?.PlayerID != null) sid = np.PlayerID.SmallID; } catch { /* */ }
+
+                string raw = null;
+                try
+                {
+                    // Prefer platform username — animated Nickname (AdminNick / rich color) is menu poison.
+                    raw = np.PlayerID?.Metadata?.Username?.GetValueOrEmpty();
+                }
+                catch { /* */ }
+
+                if (string.IsNullOrWhiteSpace(raw))
+                {
+                    try { raw = np.Username; } catch { /* */ }
+                }
+
+                return CleanForMenu(raw, sid);
+            }
+
+            private static string CleanForMenu(string username, byte sid)
+            {
+                if (string.IsNullOrEmpty(username))
+                    return "Player" + sid;
+
+                var sb = new StringBuilder(username.Length);
                 bool inTag = false;
                 foreach (char c in username)
                 {
                     if (c == '<') { inTag = true; continue; }
                     if (c == '>') { inTag = false; continue; }
                     if (inTag) continue;
-                    if (c >= 32 && c < 127) sb.Append(c);   // только печатная латиница
+                    // Drop zero-width / control / non-ASCII (BoneMenu latin-only glyphs).
+                    if (c < 32 || c == 127 || c == '\u200B' || c == '\uFEFF' || c > 126)
+                        continue;
+                    // Keep readable handle chars only.
+                    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+                        || c == ' ' || c == '.' || c == '_' || c == '-' || c == '+')
+                        sb.Append(c);
                 }
+
                 string s = sb.ToString().Trim();
-                return s.Length == 0 ? ("Player " + sid) : s;
+                while (s.Contains("  ")) s = s.Replace("  ", " ");
+                if (s.StartsWith("~")) s = s.TrimStart('~').Trim();
+                if (s.Length == 0) return "Player" + sid;
+                if (s.Length > 20) s = s.Substring(0, 20);
+                return s;
             }
 
-            /// <summary>Телепортируемся к выбранному игроку (свой риг — синхронизируется по сети штатно).</summary>
+            private static bool IsSaneWorldPos(Vector3 v)
+            {
+                if (float.IsNaN(v.x) || float.IsNaN(v.y) || float.IsNaN(v.z)) return false;
+                if (float.IsInfinity(v.x) || float.IsInfinity(v.y) || float.IsInfinity(v.z)) return false;
+                float sqr = v.sqrMagnitude;
+                // Reject origin-ish / absurd (spawn bug + Fusion world limit).
+                if (sqr < 0.25f) return false;
+                if (sqr >= NetworkTransformManager.WorldLimitSquared) return false;
+                return true;
+            }
+
+            /// <summary>
+            /// Real stand position of a remote player. Prefer network pelvis pose, then feet —
+            /// RigManager transform alone can sit at spawn while the rep is elsewhere.
+            /// </summary>
+            private static bool TryGetStandPose(NetworkPlayer np, out Vector3 stand, out Vector3 forward)
+            {
+                stand = default;
+                forward = Vector3.forward;
+                if (np == null || !np.HasRig) return false;
+
+                Vector3 pelvis = default;
+                bool havePelvis = false;
+                Vector3 feet = default;
+                bool haveFeet = false;
+
+                try
+                {
+                    if (np.ReceivedPose && np.RigPose != null && np.RigPose.PelvisPose != null)
+                    {
+                        pelvis = np.RigPose.PelvisPose.PredictedPosition;
+                        if (IsSaneWorldPos(pelvis))
+                        {
+                            havePelvis = true;
+                            var f = np.RigPose.PelvisPose.Rotation * Vector3.forward;
+                            f.y = 0f;
+                            if (f.sqrMagnitude > 0.001f) forward = f.normalized;
+                        }
+                    }
+                }
+                catch { /* */ }
+
+                try
+                {
+                    var rm = np.RigRefs?.RigManager;
+                    if (rm?.physicsRig?.feet != null)
+                    {
+                        feet = rm.physicsRig.feet.transform.position;
+                        if (IsSaneWorldPos(feet)) haveFeet = true;
+                    }
+
+                    if (!havePelvis && np.RigSkeleton?.PhysicsPelvis != null)
+                    {
+                        pelvis = np.RigSkeleton.PhysicsPelvis.transform.position;
+                        if (IsSaneWorldPos(pelvis)) havePelvis = true;
+                    }
+
+                    if (rm != null)
+                    {
+                        var look = rm.transform.forward;
+                        look.y = 0f;
+                        if (look.sqrMagnitude > 0.001f) forward = look.normalized;
+                    }
+                }
+                catch { /* */ }
+
+                if (haveFeet && havePelvis)
+                {
+                    // If feet drifted from pose (desync), trust pose and drop to foot height.
+                    if ((feet - pelvis).sqrMagnitude > 64f) // >8m
+                        stand = new Vector3(pelvis.x, pelvis.y - 0.95f, pelvis.z);
+                    else
+                        stand = feet;
+                }
+                else if (haveFeet)
+                {
+                    stand = feet;
+                }
+                else if (havePelvis)
+                {
+                    stand = new Vector3(pelvis.x, pelvis.y - 0.95f, pelvis.z);
+                }
+                else
+                {
+                    return false;
+                }
+
+                // Snap onto floor when possible (ignore player colliders).
+                stand = GroundSnap(stand);
+                return IsSaneWorldPos(stand);
+            }
+
+            private static bool TryGetLocalStand(out Vector3 stand, out Vector3 forward)
+            {
+                stand = default;
+                forward = Vector3.forward;
+                try
+                {
+                    var me = BoneLib.Player.RigManager;
+                    if (me == null) return false;
+
+                    if (me.physicsRig?.feet != null)
+                        stand = me.physicsRig.feet.transform.position;
+                    else
+                        stand = me.transform.position;
+
+                    var head = BoneLib.Player.Head;
+                    Vector3 f = head != null ? head.forward : me.transform.forward;
+                    f.y = 0f;
+                    if (f.sqrMagnitude > 0.001f) forward = f.normalized;
+
+                    stand = GroundSnap(stand);
+                    return IsSaneWorldPos(stand);
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+
+            private static Vector3 GroundSnap(Vector3 p)
+            {
+                try
+                {
+                    var hits = Physics.RaycastAll(p + Vector3.up * 0.5f, Vector3.down, 8f,
+                        Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+                    float floorY = float.NegativeInfinity;
+                    bool found = false;
+                    foreach (var h in hits)
+                    {
+                        if (h.collider == null) continue;
+                        if (h.collider.GetComponentInParent<RigManager>() != null) continue;
+                        if (h.point.y > floorY) { floorY = h.point.y; found = true; }
+                    }
+                    if (found) return new Vector3(p.x, floorY, p.z);
+                }
+                catch { /* */ }
+                return p;
+            }
+
+            /// <summary>Teleport local player next to target (Fusion LocalPlayer path).</summary>
             private static void TeleportSelfTo(byte sid)
             {
                 try
                 {
                     var np = Find(sid);
-                    if (np == null || !np.HasRig) { MelonLogger.Msg("Teleport: player unavailable (left?)."); return; }
-                    RigManager target = np.RigRefs.RigManager;
-                    RigManager me = BoneLib.Player.RigManager;
-                    if (target == null || me == null) return;
+                    if (np == null || !np.HasRig)
+                    {
+                        MelonLogger.Msg("Teleport: player unavailable (left?).");
+                        return;
+                    }
 
-                    Vector3 dest = Grounded(target);
-                    // Небольшой отступ, чтобы не оказаться внутри игрока.
-                    Vector3 myPos = Grounded(me);
-                    Vector3 off = myPos - dest; off.y = 0f;
-                    off = off.sqrMagnitude > 0.01f ? off.normalized : -target.transform.forward;
-                    me.Teleport(dest + off * 0.8f, true);
-                    MelonLogger.Msg($"Teleport: teleported to {SafeName(np.Username, sid)} (sid {sid}).");
+                    if (!TryGetStandPose(np, out var dest, out var theirFwd))
+                    {
+                        MelonLogger.Warning("Teleport: no sane position for target (pose/feet).");
+                        return;
+                    }
+
+                    // Stand beside them, facing their forward.
+                    Vector3 side = Vector3.Cross(Vector3.up, theirFwd);
+                    if (side.sqrMagnitude < 0.001f) side = Vector3.right;
+                    side.Normalize();
+
+                    Vector3 land = dest + side * 1.1f;
+                    land = GroundSnap(land);
+                    if (!IsSaneWorldPos(land))
+                    {
+                        MelonLogger.Warning("Teleport: landing pos not sane.");
+                        return;
+                    }
+
+                    // Fusion path — syncs correctly (unlike raw RigManager.Teleport edge cases).
+                    LocalPlayer.TeleportToPosition(land, -side);
+                    MelonLogger.Msg($"Teleport: went to {MenuName(np)} (sid {sid}) @ {land}");
                 }
                 catch (Exception e) { MelonLogger.Warning("Teleport self: " + e.Message); }
             }
 
-            /// <summary>Притягиваем игрока к себе. Best-effort: его позицией владеет его клиент, может не «прилипнуть».</summary>
+            /// <summary>
+            /// Pull player to me. Host: PlayerRepTeleport (real). Client: Fusion permission request.
+            /// </summary>
             private static void BringToMe(byte sid)
             {
                 try
                 {
                     var np = Find(sid);
-                    if (np == null || !np.HasRig) { MelonLogger.Msg("Teleport: player unavailable (left?)."); return; }
-                    RigManager target = np.RigRefs.RigManager;
-                    RigManager me = BoneLib.Player.RigManager;
-                    if (target == null || me == null) return;
+                    if (np == null || !np.HasRig)
+                    {
+                        MelonLogger.Msg("Teleport: player unavailable (left?).");
+                        return;
+                    }
 
-                    Vector3 dest = Grounded(me);
-                    var head = BoneLib.Player.Head;
-                    Vector3 fwd = head != null ? head.forward : me.transform.forward;
-                    fwd.y = 0f;
-                    if (fwd.sqrMagnitude < 0.0001f) fwd = Vector3.forward;
-                    target.Teleport(dest + fwd.normalized * 1.2f, true);
-                    MelonLogger.Msg($"Teleport: pulled {SafeName(np.Username, sid)} (sid {sid}) - if it didn't stick, that's network position ownership.");
+                    if (!TryGetLocalStand(out var meStand, out var fwd))
+                    {
+                        MelonLogger.Warning("Teleport: local stand pos not sane.");
+                        return;
+                    }
+
+                    Vector3 land = meStand + fwd * 1.4f;
+                    land = GroundSnap(land);
+                    if (!IsSaneWorldPos(land))
+                    {
+                        MelonLogger.Warning("Teleport: bring landing not sane.");
+                        return;
+                    }
+
+                    string who = MenuName(np);
+
+                    if (NetworkInfo.IsHost)
+                    {
+                        // Authoritative: their client applies LocalPlayer.TeleportToPosition.
+                        PlayerSender.SendPlayerTeleport(sid, land);
+                        MelonLogger.Msg($"Teleport: Bring (host) {who} → {land}");
+                        return;
+                    }
+
+                    // Non-host: ask server (needs lobby Teleportation permission).
+                    PermissionSender.SendPermissionRequest(PermissionCommandType.TELEPORT_TO_ME, sid);
+                    MelonLogger.Msg(
+                        $"Teleport: Bring requested for {who} (needs host/teleport perms).");
                 }
                 catch (Exception e) { MelonLogger.Warning("Teleport bring: " + e.Message); }
-            }
-
-            /// <summary>Позиция ног рига на полу. Луч вниз ИГНОРИРУЕТ тела игроков — иначе телепорт
-            /// «косо»: попадали на колено/бедро цели и оказывались в воздухе/внутри неё.</summary>
-            private static Vector3 Grounded(RigManager rig)
-            {
-                Vector3 p;
-                try { p = rig.physicsRig != null ? rig.physicsRig.transform.position : rig.transform.position; }
-                catch { p = rig.transform.position; }
-
-                var hits = Physics.RaycastAll(p + Vector3.up * 0.4f, Vector3.down, 6f,
-                    Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
-                float floorY = float.NegativeInfinity; bool found = false;
-                foreach (var h in hits)
-                {
-                    if (h.collider == null) continue;
-                    if (h.collider.GetComponentInParent<RigManager>() != null) continue; // пропускаем любые тела игроков
-                    if (h.point.y > floorY) { floorY = h.point.y; found = true; }        // ближайший пол под ногами
-                }
-                if (found) return new Vector3(p.x, floorY, p.z);
-                return new Vector3(p.x, p.y - 0.9f, p.z);   // запас: примерно на уровень ног
             }
         }
     }
