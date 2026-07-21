@@ -5,41 +5,60 @@ using LabFusion.Data;
 using LabFusion.Network;
 using LabFusion.Player;
 using LabFusion.Scene;
+using LabFusion.UI.Popups;
+using LabFusion.Utilities;
 using MelonLoader;
 using UnityEngine;
 
 namespace MonsterPanel;
 
 /// <summary>
-/// Silent shield against Fusion network OOB abuse (no UI text).
+/// Silent shield against Fusion OOB kick/reload loops (no UI text).
 ///
-/// LabFusion audit (Checkerb0ard): the ONLY path that Disconnect("Left Bounds") +
-/// SceneStreamer.Reload + "Whoops" popup is FusionPlayer.CheckFloatingPoint.
-/// The network vector that teleports the LOCAL client with no auth/bounds is
-/// PlayerRepTeleportMessage (tag 69). Pose updates refuse LocalSmallID.
-/// PDController already zeros forces for OOB remote targets.
-/// Truncated packets are try/caught in NativeMessageHandler.ReadMessage.
+/// Fusion text the user sees as "a lot of bounds" is:
+///   Title: "Whoops! Sorry about that!"
+///   Message: "The scene was reloaded due to being sent far out of bounds."
+/// Only emitted from FusionPlayer.CheckFloatingPoint together with
+/// Disconnect("Left Bounds") and SceneStreamer.Reload — that triad is what
+/// cascades into reload→spawn→OOB→reload (crash-crash-crash before load finishes).
 ///
-/// Defense layers:
-///   1) Drop bad PlayerRepTeleport payloads.
-///   2) Sanitize LocalPlayer.TeleportToPosition overloads.
-///   3) Sanitize RigManagerExtensions.TeleportToPosition when target is local.
-///   4) Replace CheckFloatingPoint (no disconnect / reload / popup).
-///   5) Belt: block NetworkHelper.Disconnect("Left Bounds") if (4) ever misses.
+/// Defense:
+///   Replace CheckFloatingPoint (never reload / disconnect / Whoops).
+///   Block leftover Disconnect("Left Bounds") and suppress the Whoops popup.
+///   Sanitize network + local teleports.
+///   Cascade control: skip while loading, scene grace, recover cooldown, lockdown.
 /// </summary>
 internal static class AntiOob
 {
-    // Mirror NetworkTransformManager.WorldLimit with a small inner margin for recover target.
     private const float SoftWorldLimit = NetworkTransformManager.WorldLimit;
     private const float SoftWorldLimitSq = SoftWorldLimit * SoftWorldLimit;
     private const float RecoverLimit = SoftWorldLimit * 0.9f;
     private const float RecoverLimitSq = RecoverLimit * RecoverLimit;
+
+    // Cascade / thrash control — professional calm after first hit.
+    private const float RecoverCooldownSec = 8f;
+    private const float SceneGraceSec = 12f;
+    private const float LockdownSec = 45f;
+    private const int RecoverBurstLimit = 3;
+    private const float RecoverBurstWindowSec = 25f;
+    private const float LogCooldownSec = 5f;
+
     private const string LeftBoundsReason = "Left Bounds";
+    private const string WhoopsTitle = "Whoops! Sorry about that!";
 
     private static bool _installed;
+    private static bool _inRecover;
     private static Vector3 _lastGoodFeet;
     private static bool _hasLastGood;
-    private static float _lastRecoverAt;
+
+    private static float _lastRecoverAt = -999f;
+    private static float _sceneGraceUntil;
+    private static float _lockdownUntil;
+    private static float _holdPhysicsUntil;
+    private static float _lastLogAt = -999f;
+
+    private static readonly float[] _recentRecovers = new float[RecoverBurstLimit];
+    private static int _recentRecoverCount;
 
     internal static void Install(HarmonyLib.Harmony harmony)
     {
@@ -51,70 +70,48 @@ internal static class AntiOob
 
         try
         {
-            var onHandle = AccessTools.Method(typeof(PlayerRepTeleportMessage), "OnHandleMessage");
-            if (onHandle != null)
-            {
-                harmony.Patch(onHandle,
-                    prefix: new HarmonyMethod(typeof(AntiOob), nameof(TeleportMessagePrefix)));
-                ok++;
-            }
+            ok += Patch(harmony, AccessTools.Method(typeof(PlayerRepTeleportMessage), "OnHandleMessage"),
+                nameof(TeleportMessagePrefix));
 
-            var teleport1 = AccessTools.Method(typeof(LocalPlayer), nameof(LocalPlayer.TeleportToPosition),
-                new[] { typeof(Vector3) });
-            if (teleport1 != null)
-            {
-                harmony.Patch(teleport1,
-                    prefix: new HarmonyMethod(typeof(AntiOob), nameof(TeleportToPositionPrefix)));
-                ok++;
-            }
+            ok += Patch(harmony,
+                AccessTools.Method(typeof(LocalPlayer), nameof(LocalPlayer.TeleportToPosition), new[] { typeof(Vector3) }),
+                nameof(TeleportToPositionPrefix));
+            ok += Patch(harmony,
+                AccessTools.Method(typeof(LocalPlayer), nameof(LocalPlayer.TeleportToPosition),
+                    new[] { typeof(Vector3), typeof(Vector3) }),
+                nameof(TeleportToPositionForwardPrefix));
 
-            var teleport2 = AccessTools.Method(typeof(LocalPlayer), nameof(LocalPlayer.TeleportToPosition),
-                new[] { typeof(Vector3), typeof(Vector3) });
-            if (teleport2 != null)
-            {
-                harmony.Patch(teleport2,
-                    prefix: new HarmonyMethod(typeof(AntiOob), nameof(TeleportToPositionForwardPrefix)));
-                ok++;
-            }
+            ok += Patch(harmony,
+                AccessTools.Method(typeof(LabFusion.Extensions.RigManagerExtensions), "TeleportToPosition",
+                    new[] { typeof(RigManager), typeof(Vector3), typeof(bool) }),
+                nameof(RigTeleportPrefix));
+            ok += Patch(harmony,
+                AccessTools.Method(typeof(LabFusion.Extensions.RigManagerExtensions), "TeleportToPosition",
+                    new[] { typeof(RigManager), typeof(Vector3), typeof(Vector3), typeof(bool) }),
+                nameof(RigTeleportForwardPrefix));
 
-            // Extension teleports used by NetworkPlayer reps and LocalPlayer internals.
-            var rigTp1 = AccessTools.Method(typeof(LabFusion.Extensions.RigManagerExtensions),
-                "TeleportToPosition", new[] { typeof(RigManager), typeof(Vector3), typeof(bool) });
-            if (rigTp1 != null)
-            {
-                harmony.Patch(rigTp1,
-                    prefix: new HarmonyMethod(typeof(AntiOob), nameof(RigTeleportPrefix)));
-                ok++;
-            }
-
-            var rigTp2 = AccessTools.Method(typeof(LabFusion.Extensions.RigManagerExtensions),
-                "TeleportToPosition",
-                new[] { typeof(RigManager), typeof(Vector3), typeof(Vector3), typeof(bool) });
-            if (rigTp2 != null)
-            {
-                harmony.Patch(rigTp2,
-                    prefix: new HarmonyMethod(typeof(AntiOob), nameof(RigTeleportForwardPrefix)));
-                ok++;
-            }
-
-            // private static void CheckFloatingPoint() — the only OOB kick path in Fusion.
-            var checkFp = AccessTools.Method(typeof(LabFusion.Utilities.FusionPlayer), "CheckFloatingPoint");
-            if (checkFp != null)
-            {
-                harmony.Patch(checkFp,
-                    prefix: new HarmonyMethod(typeof(AntiOob), nameof(CheckFloatingPointPrefix)));
-                ok++;
+            if (Patch(harmony,
+                    AccessTools.Method(typeof(FusionPlayer), "CheckFloatingPoint"),
+                    nameof(CheckFloatingPointPrefix)) > 0)
                 critical++;
-            }
 
-            var disconnect = AccessTools.Method(typeof(NetworkHelper), nameof(NetworkHelper.Disconnect),
-                new[] { typeof(string) });
-            if (disconnect != null)
-            {
-                harmony.Patch(disconnect,
-                    prefix: new HarmonyMethod(typeof(AntiOob), nameof(DisconnectPrefix)));
-                ok++;
+            if (Patch(harmony,
+                    AccessTools.Method(typeof(NetworkHelper), nameof(NetworkHelper.Disconnect), new[] { typeof(string) }),
+                    nameof(DisconnectPrefix)) > 0)
                 critical++;
+
+            // Suppress the "far out of bounds" / Whoops popup if Fusion ever emits it.
+            ok += Patch(harmony,
+                AccessTools.Method(typeof(Notifier), nameof(Notifier.Send), new[] { typeof(Notification) }),
+                nameof(NotifierSendPrefix));
+
+            try
+            {
+                MultiplayerHooking.OnMainSceneInitialized += OnMainSceneInitialized;
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning($"[AntiOob] MainScene hook failed: {ex.Message}");
             }
 
             if (critical < 2)
@@ -125,7 +122,7 @@ internal static class AntiOob
             }
 
             _installed = true;
-            MelonLogger.Msg($"[AntiOob] Silent OOB shield active ({ok} patches).");
+            MelonLogger.Msg($"[AntiOob] Silent OOB shield active ({ok + critical} patches, cascade-safe).");
         }
         catch (Exception ex)
         {
@@ -133,21 +130,49 @@ internal static class AntiOob
         }
     }
 
+    /// <summary>Keep physics alive after an OOB event; call from Melon OnUpdate.</summary>
+    internal static void Tick()
+    {
+        if (!_installed)
+            return;
+
+        try
+        {
+            if (Time.unscaledTime <= _holdPhysicsUntil && !Physics.autoSimulation)
+                Physics.autoSimulation = true;
+        }
+        catch
+        {
+            // ignored
+        }
+    }
+
+    private static int Patch(HarmonyLib.Harmony harmony, System.Reflection.MethodInfo method, string prefix)
+    {
+        if (method == null)
+            return 0;
+        harmony.Patch(method, prefix: new HarmonyMethod(typeof(AntiOob), prefix));
+        return 1;
+    }
+
+    private static void OnMainSceneInitialized()
+    {
+        // After each load: give spawn a quiet window so we never thrash mid-stream.
+        _sceneGraceUntil = Time.unscaledTime + SceneGraceSec;
+        Physics.autoSimulation = true;
+        _holdPhysicsUntil = _sceneGraceUntil;
+    }
+
     private static bool IsFinite(Vector3 v) =>
         !(float.IsNaN(v.x) || float.IsNaN(v.y) || float.IsNaN(v.z)
           || float.IsInfinity(v.x) || float.IsInfinity(v.y) || float.IsInfinity(v.z));
 
-    /// <summary>Same rule as NetworkTransformManager.IsInBounds (sphere + NaN).</summary>
     private static bool IsInSoftBounds(Vector3 v)
     {
         if (!IsFinite(v))
             return false;
-
         float sqr = v.sqrMagnitude;
-        if (float.IsNaN(sqr))
-            return false;
-
-        return sqr < SoftWorldLimitSq;
+        return !float.IsNaN(sqr) && sqr < SoftWorldLimitSq;
     }
 
     private static bool IsInRecoverBounds(Vector3 v) =>
@@ -165,7 +190,61 @@ internal static class AntiOob
         }
     }
 
-    // Prefix PlayerRepTeleportMessage.OnHandleMessage — drop before LocalPlayer.TeleportToPosition.
+    private static bool IsLoading()
+    {
+        try
+        {
+            return FusionSceneManager.IsLoading();
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void LogRateLimited(string message)
+    {
+        if (Time.unscaledTime - _lastLogAt < LogCooldownSec)
+            return;
+        _lastLogAt = Time.unscaledTime;
+        MelonLogger.Warning(message);
+    }
+
+    private static bool InLockdown => Time.unscaledTime < _lockdownUntil;
+    private static bool InSceneGrace => Time.unscaledTime < _sceneGraceUntil;
+    private static bool InRecoverCooldown => Time.unscaledTime - _lastRecoverAt < RecoverCooldownSec;
+
+    private static void NoteRecover()
+    {
+        _lastRecoverAt = Time.unscaledTime;
+        _holdPhysicsUntil = Time.unscaledTime + RecoverCooldownSec;
+
+        // Ring of recent recovers → lockdown if burst (stops crash-crash-crash).
+        if (_recentRecoverCount < _recentRecovers.Length)
+            _recentRecovers[_recentRecoverCount++] = _lastRecoverAt;
+        else
+        {
+            Array.Copy(_recentRecovers, 1, _recentRecovers, 0, _recentRecovers.Length - 1);
+            _recentRecovers[_recentRecovers.Length - 1] = _lastRecoverAt;
+        }
+
+        int inWindow = 0;
+        for (int i = 0; i < _recentRecoverCount; i++)
+        {
+            if (_lastRecoverAt - _recentRecovers[i] <= RecoverBurstWindowSec)
+                inWindow++;
+        }
+
+        if (inWindow >= RecoverBurstLimit)
+        {
+            _lockdownUntil = Time.unscaledTime + LockdownSec;
+            LogRateLimited(
+                $"[AntiOob] Lockdown {LockdownSec:0}s after {inWindow} recovers — blocking OOB teleports, no reload.");
+        }
+    }
+
+    // ---- Network teleport ----
+
     private static bool TeleportMessagePrefix(ReceivedMessage received)
     {
         try
@@ -175,8 +254,15 @@ internal static class AntiOob
 
             if (!IsInSoftBounds(position))
             {
-                MelonLogger.Warning(
+                LogRateLimited(
                     $"[AntiOob] Blocked network teleport to {position} (NaN/Inf or past world limit).");
+                return false;
+            }
+
+            // During lockdown, reject ALL network teleports — stops OOB thrash cascades.
+            if (InLockdown)
+            {
+                LogRateLimited("[AntiOob] Dropped network teleport during lockdown.");
                 return false;
             }
 
@@ -184,7 +270,7 @@ internal static class AntiOob
         }
         catch (Exception ex)
         {
-            MelonLogger.Warning($"[AntiOob] TeleportMessagePrefix: {ex.Message}");
+            LogRateLimited($"[AntiOob] TeleportMessagePrefix: {ex.Message}");
             return false;
         }
     }
@@ -197,7 +283,6 @@ internal static class AntiOob
 
     private static bool RigTeleportPrefix(RigManager rigManager, ref Vector3 position, bool resetVelocity)
     {
-        // Remote NetworkPlayer reps may legitimately snap; only gate the local body.
         if (!IsLocalRig(rigManager))
             return true;
         return SanitizeTeleport(ref position);
@@ -213,11 +298,15 @@ internal static class AntiOob
 
     private static bool SanitizeTeleport(ref Vector3 position)
     {
+        // Our own recover teleports are already validated.
+        if (_inRecover)
+            return true;
+
         try
         {
             if (!IsFinite(position))
             {
-                MelonLogger.Warning("[AntiOob] Blocked TeleportToPosition with NaN/Inf.");
+                LogRateLimited("[AntiOob] Blocked TeleportToPosition with NaN/Inf.");
                 return false;
             }
 
@@ -226,12 +315,12 @@ internal static class AntiOob
                 float mag = position.magnitude;
                 if (mag < 1e-3f || float.IsNaN(mag))
                 {
-                    MelonLogger.Warning("[AntiOob] Blocked TeleportToPosition with unusable magnitude.");
+                    LogRateLimited("[AntiOob] Blocked TeleportToPosition with unusable magnitude.");
                     return false;
                 }
 
                 position = position * (RecoverLimit / mag);
-                MelonLogger.Warning($"[AntiOob] Clamped TeleportToPosition into soft world → {position}");
+                LogRateLimited($"[AntiOob] Clamped TeleportToPosition → {position}");
             }
 
             return true;
@@ -242,13 +331,18 @@ internal static class AntiOob
         }
     }
 
-    // Full replacement for FusionPlayer.CheckFloatingPoint — never disconnect / reload / popup.
+    // ---- Core: replace Fusion OOB kick (never Reload / Disconnect / Whoops) ----
+
     private static bool CheckFloatingPointPrefix()
     {
         try
         {
-            if (!RigData.HasPlayer)
-                return false;
+            // Always keep simulation on — Fusion flips this off before reload and that
+            // stacks with reload loops into "can't finish loading".
+            Physics.autoSimulation = true;
+
+            if (IsLoading() || !RigData.HasPlayer)
+                return false; // skip original always
 
             var feet = RigData.Refs.RigManager.physicsRig.feet.transform.position;
 
@@ -259,44 +353,92 @@ internal static class AntiOob
                 return false;
             }
 
-            if (Time.unscaledTime - _lastRecoverAt < 1.5f)
+            // Mid-load / grace / cooldown / lockdown: hold steady, do not thrash teleports.
+            if (InSceneGrace || InRecoverCooldown || InLockdown || _inRecover)
+            {
+                _holdPhysicsUntil = Time.unscaledTime + 2f;
                 return false;
-            _lastRecoverAt = Time.unscaledTime;
+            }
 
-            // Keep physics simulating (Fusion would set autoSimulation=false before reload).
-            Physics.autoSimulation = true;
+            NoteRecover();
 
             Vector3 safe = ResolveSafePoint();
-            MelonLogger.Warning(
-                $"[AntiOob] Recovered from OOB/NaN feet={feet} → {safe} (no disconnect).");
+            LogRateLimited(
+                $"[AntiOob] Recovered OOB/NaN feet={feet} → {safe} (no disconnect, no reload).");
 
-            LocalPlayer.TeleportToPosition(safe);
+            _inRecover = true;
+            try
+            {
+                LocalPlayer.TeleportToPosition(safe);
+            }
+            finally
+            {
+                _inRecover = false;
+            }
+
             return false;
         }
         catch (Exception ex)
         {
-            MelonLogger.Warning($"[AntiOob] CheckFloatingPointPrefix: {ex.Message}");
+            Physics.autoSimulation = true;
+            LogRateLimited($"[AntiOob] CheckFloatingPointPrefix: {ex.Message}");
             return false;
         }
     }
 
-    // Last resort: never leave the lobby solely because Fusion thinks we Left Bounds.
     private static bool DisconnectPrefix(string reason)
     {
-        if (string.Equals(reason, LeftBoundsReason, StringComparison.Ordinal))
+        if (!string.Equals(reason, LeftBoundsReason, StringComparison.Ordinal))
+            return true;
+
+        LogRateLimited("[AntiOob] Blocked Disconnect(\"Left Bounds\").");
+        Physics.autoSimulation = true;
+        _holdPhysicsUntil = Time.unscaledTime + RecoverCooldownSec;
+
+        if (!_inRecover && RigData.HasPlayer && !IsLoading() && !InRecoverCooldown)
         {
-            MelonLogger.Warning("[AntiOob] Blocked Disconnect(\"Left Bounds\").");
-            Physics.autoSimulation = true;
+            NoteRecover();
+            _inRecover = true;
             try
             {
-                if (RigData.HasPlayer)
-                    LocalPlayer.TeleportToPosition(ResolveSafePoint());
+                LocalPlayer.TeleportToPosition(ResolveSafePoint());
             }
             catch
             {
                 // best-effort
             }
-            return false;
+            finally
+            {
+                _inRecover = false;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool NotifierSendPrefix(Notification notification)
+    {
+        try
+        {
+            if (notification == null)
+                return true;
+
+            string title = notification.Title.Text ?? string.Empty;
+            string message = notification.Message.Text ?? string.Empty;
+
+            bool whoops = title.IndexOf("Whoops", StringComparison.OrdinalIgnoreCase) >= 0;
+            bool farBounds = message.IndexOf("out of bounds", StringComparison.OrdinalIgnoreCase) >= 0
+                             || message.IndexOf("far out of bounds", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (whoops && farBounds)
+            {
+                LogRateLimited("[AntiOob] Suppressed Fusion Whoops / far-out-of-bounds popup.");
+                return false;
+            }
+        }
+        catch
+        {
+            // if reflection/text fails, allow notification
         }
 
         return true;

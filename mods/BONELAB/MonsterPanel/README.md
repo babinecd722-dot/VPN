@@ -7,9 +7,13 @@
 - Online watch every **~15s** (API cooldown 10s): offline→online → Fusion popup like player joined (`Name Online` / `is online.`, `SaveToMenu=false`)
 - Join success logic from 2.30.23 unchanged
 
-## Anti-OOB (2.30.26+)
+## Anti-OOB (2.30.28+)
 
-Silent Fusion shield (no BoneMenu text): blocks / clamps malicious `PlayerRepTeleport`, sanitizes local `RigManager` teleports, replaces Fusion's OOB disconnect+reload with checkpoint recover, and blocks leftover `Disconnect("Left Bounds")`.
+Silent Fusion shield against the **Whoops / far out of bounds** kick (no BoneMenu text):
+- Blocks the reload→spawn→OOB→reload cascade (crash-crash-crash before load finishes)
+- Scene grace + recover cooldown + lockdown after burst recovers
+- Suppresses the Whoops popup; blocks `Disconnect("Left Bounds")`
+- Sanitizes `PlayerRepTeleport` and local teleports
 
 Uses LabFusion from Checkerb0ard 0.0.5 (EOS), not Steam.
 
