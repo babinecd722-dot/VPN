@@ -82,12 +82,12 @@ Uses LabFusion from Checkerb0ard 0.0.5 (EOS), not Steam.
 > «железно» убрать тег нельзя. Но текст имени мы меняем/убираем. Если у тебя стоит галка
 > «richText» off на конкретном шрифте — теги покажутся как текст; проверь на устройстве и скажи.
 
-## Teleport (2.30.29+, LabFusion)
+## Teleport (2.30.30+, LabFusion)
 
-Подстраница **Teleport**: чистые ники (Username, без rich-text nickname), сортировка.
-- **Go to** — `LocalPlayer.TeleportToPosition` к реальной позе/ногам игрока (не спавн).
-- **Bring here** — хост: `SendPlayerTeleport`; клиент: запрос `TELEPORT_TO_ME` (нужны права телепорта в лобби).
-- **Track / Untrack** — как раньше.
+Классическое меню: список игроков → подстраница с **Teleport to player** / **Bring player to me** (без Tracking).
+- Go to: поза/ноги + `LocalPlayer.TeleportToPosition`
+- Bring: хост `SendPlayerTeleport`; клиент — запрос прав телепорта
+- Ники с `<color>` как раньше
 
 ## Как работает (Harmony-префиксы, типизированно)
 

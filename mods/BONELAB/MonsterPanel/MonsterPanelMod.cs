@@ -22,7 +22,7 @@ using MelonLoader;
 using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.29", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.30", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -1611,7 +1611,8 @@ namespace MonsterPanel
             /// <summary>Создаёт подстраницу Teleport в корне панели и вешает авто-обновление списка.</summary>
             public static void Install(Page root)
             {
-                // Flat list only — CreatePage-per-player + pagination crashed Quest GUIPool.
+                // Classic UI: player list → subpage with Teleport / Bring (no Tracking here).
+                // elementCount 0 = no pagination arrows (Quest GUIPool safer).
                 _page = root.CreatePage("Teleport", new Color(0.3f, 0.7f, 1f), 0, true);
                 if (!_hooked)
                 {
@@ -1644,7 +1645,10 @@ namespace MonsterPanel
                 MelonCoroutines.Start(DeferredRebuild());
             }
 
-            /// <summary>Flat list: header name + Go to / Bring / Track — stable ASCII labels.</summary>
+            /// <summary>
+            /// Classic layout: one page entry per player → open submenu
+            /// "Teleport to player" / "Bring player to me". No Tracking buttons.
+            /// </summary>
             private static void Rebuild()
             {
                 if (_page == null) return;
@@ -1653,61 +1657,22 @@ namespace MonsterPanel
                     _page.RemoveAll();
                     _page.CreateFunction("Refresh", new Color(0.7f, 0.7f, 0.7f), (Action)QueueRebuild);
 
-                    // Snapshot + sort so BoneMenu order is stable and names aren't scrambled.
-                    var list = new List<NetworkPlayer>();
+                    int count = 0;
                     foreach (var np in NetworkPlayer.Players)
                     {
                         if (np == null || np.PlayerID == null || np.PlayerID.IsMe) continue;
                         if (!np.HasRig) continue;
-                        list.Add(np);
-                    }
 
-                    list.Sort((a, b) =>
-                    {
-                        string na = MenuName(a);
-                        string nb = MenuName(b);
-                        int c = string.CompareOrdinal(na, nb);
-                        if (c != 0) return c;
-                        return a.PlayerID.SmallID.CompareTo(b.PlayerID.SmallID);
-                    });
-
-                    int count = 0;
-                    foreach (var np in list)
-                    {
                         byte sid = np.PlayerID.SmallID;
                         string name = MenuName(np);
-                        string shortName = name.Length > 16 ? name.Substring(0, 16) : name;
 
-                        // Header row (no action) — clean nick, not animated rich-text nickname.
-                        string header = shortName;
-                        _page.CreateFunction("· " + header, new Color(0.85f, 0.9f, 1f), (Action)(() => { }));
-
+                        Page sub = _page.CreatePage(name, new Color(0.6f, 0.85f, 1f), 0, true);
                         byte sidGo = sid;
-                        _page.CreateFunction("  Go to", new Color(0.3f, 1f, 0.5f),
-                            (Action)(() => TeleportSelfTo(sidGo)));
-
                         byte sidBring = sid;
-                        _page.CreateFunction("  Bring here", new Color(1f, 0.65f, 0.25f),
+                        sub.CreateFunction("Teleport to player", new Color(0.3f, 1f, 0.5f),
+                            (Action)(() => TeleportSelfTo(sidGo)));
+                        sub.CreateFunction("Bring player to me", new Color(1f, 0.6f, 0.2f),
                             (Action)(() => BringToMe(sidBring)));
-
-                        string trackPid = null;
-                        string trackName = MenuName(np);
-                        try { trackPid = np.PlayerID.PlatformID; } catch { /* */ }
-                        if (!string.IsNullOrWhiteSpace(trackPid))
-                        {
-                            string pidCopy = trackPid.Trim();
-                            string nameCopy = trackName;
-                            bool tracked = Tracking.IsTracked(pidCopy);
-                            _page.CreateFunction(
-                                tracked ? "  Untrack" : "  Track",
-                                tracked ? new Color(1f, 0.4f, 0.35f) : new Color(0.35f, 0.9f, 1f),
-                                (Action)(() =>
-                                {
-                                    if (Tracking.IsTracked(pidCopy)) Tracking.Remove(pidCopy);
-                                    else Tracking.Add(pidCopy, nameCopy);
-                                    QueueRebuild();
-                                }));
-                        }
                         count++;
                     }
 
@@ -1726,8 +1691,7 @@ namespace MonsterPanel
             }
 
             /// <summary>
-            /// Stable BoneMenu label: raw Metadata.Username (not shimmer Nickname),
-            /// strip rich-text / ZWSP / non-ASCII so Quest font doesn't show garbage.
+            /// Fusion display name — keep &lt;color&gt; for BoneMenu. No Tracking coupling.
             /// </summary>
             private static string MenuName(NetworkPlayer np)
             {
@@ -1735,48 +1699,30 @@ namespace MonsterPanel
                 try { if (np?.PlayerID != null) sid = np.PlayerID.SmallID; } catch { /* */ }
 
                 string raw = null;
-                try
-                {
-                    // Prefer platform username — animated Nickname (AdminNick / rich color) is menu poison.
-                    raw = np.PlayerID?.Metadata?.Username?.GetValueOrEmpty();
-                }
-                catch { /* */ }
-
+                try { raw = np.Username; } catch { /* */ }
                 if (string.IsNullOrWhiteSpace(raw))
                 {
-                    try { raw = np.Username; } catch { /* */ }
+                    try { raw = np.PlayerID?.Metadata?.Username?.GetValueOrEmpty(); } catch { /* */ }
                 }
 
-                return CleanForMenu(raw, sid);
+                return CleanKeepColor(raw, sid);
             }
 
-            private static string CleanForMenu(string username, byte sid)
+            private static string CleanKeepColor(string username, byte sid)
             {
                 if (string.IsNullOrEmpty(username))
-                    return "Player" + sid;
+                    return "Player " + sid;
 
                 var sb = new StringBuilder(username.Length);
-                bool inTag = false;
                 foreach (char c in username)
                 {
-                    if (c == '<') { inTag = true; continue; }
-                    if (c == '>') { inTag = false; continue; }
-                    if (inTag) continue;
-                    // Drop zero-width / control / non-ASCII (BoneMenu latin-only glyphs).
-                    if (c < 32 || c == 127 || c == '\u200B' || c == '\uFEFF' || c > 126)
+                    if (c < 32 || c == 127 || c == '\u200B' || c == '\uFEFF')
                         continue;
-                    // Keep readable handle chars only.
-                    if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
-                        || c == ' ' || c == '.' || c == '_' || c == '-' || c == '+')
-                        sb.Append(c);
+                    sb.Append(c);
                 }
 
                 string s = sb.ToString().Trim();
-                while (s.Contains("  ")) s = s.Replace("  ", " ");
-                if (s.StartsWith("~")) s = s.TrimStart('~').Trim();
-                if (s.Length == 0) return "Player" + sid;
-                if (s.Length > 20) s = s.Substring(0, 20);
-                return s;
+                return s.Length == 0 ? ("Player " + sid) : s;
             }
 
             private static bool IsSaneWorldPos(Vector3 v)
