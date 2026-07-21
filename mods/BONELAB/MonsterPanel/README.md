@@ -9,7 +9,7 @@
 
 ## Anti-OOB (2.30.26+)
 
-Silent Fusion shield (no BoneMenu text): blocks / clamps malicious `PlayerRepTeleport` and replaces Fusion's OOB disconnect+reload with checkpoint recover.
+Silent Fusion shield (no BoneMenu text): blocks / clamps malicious `PlayerRepTeleport`, sanitizes local `RigManager` teleports, replaces Fusion's OOB disconnect+reload with checkpoint recover, and blocks leftover `Disconnect("Left Bounds")`.
 
 Uses LabFusion from Checkerb0ard 0.0.5 (EOS), not Steam.
 
