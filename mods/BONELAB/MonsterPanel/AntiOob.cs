@@ -67,77 +67,74 @@ internal static class AntiOob
         int ok = 0;
         int critical = 0;
 
+        // Each patch is isolated — one failure must not abort Install after others
+        // already applied (half-shield with Tick dead is worse than no shield).
+        ok += Patch(harmony, AccessTools.Method(typeof(PlayerRepTeleportMessage), "OnHandleMessage"),
+            nameof(TeleportMessagePrefix));
+
+        ok += Patch(harmony,
+            AccessTools.Method(typeof(LocalPlayer), nameof(LocalPlayer.TeleportToPosition), new[] { typeof(Vector3) }),
+            nameof(TeleportToPositionPrefix));
+        ok += Patch(harmony,
+            AccessTools.Method(typeof(LocalPlayer), nameof(LocalPlayer.TeleportToPosition),
+                new[] { typeof(Vector3), typeof(Vector3) }),
+            nameof(TeleportToPositionForwardPrefix));
+
+        ok += Patch(harmony,
+            AccessTools.Method(typeof(LabFusion.Extensions.RigManagerExtensions), "TeleportToPosition",
+                new[] { typeof(RigManager), typeof(Vector3), typeof(bool) }),
+            nameof(RigTeleportPrefix));
+        ok += Patch(harmony,
+            AccessTools.Method(typeof(LabFusion.Extensions.RigManagerExtensions), "TeleportToPosition",
+                new[] { typeof(RigManager), typeof(Vector3), typeof(Vector3), typeof(bool) }),
+            nameof(RigTeleportForwardPrefix));
+
+        if (Patch(harmony,
+                AccessTools.Method(typeof(FusionPlayer), "CheckFloatingPoint"),
+                nameof(CheckFloatingPointPrefix)) > 0)
+            critical++;
+
+        if (Patch(harmony,
+                AccessTools.Method(typeof(NetworkHelper), nameof(NetworkHelper.Disconnect), new[] { typeof(string) }),
+                nameof(DisconnectPrefix)) > 0)
+            critical++;
+
+        // Hosts still call SceneStreamer.Reload on OOB; clients get physics-off
+        // without reload (Fusion already blocks client Reload). Block both.
+        ok += Patch(harmony,
+            AccessTools.Method(typeof(SceneStreamer), nameof(SceneStreamer.Reload)),
+            nameof(SceneReloadPrefix));
+
+        // NOTE: do NOT Harmony-patch Physics.autoSimulation setter.
+        // It is a Unity engine property (often IL2CPP icall without a detourable stub);
+        // a failed Patch() used to abort Install after critical patches already applied,
+        // leaving Tick/_installed dead — worse than no shield. Tick() forces sim ON instead.
+
+        ok += Patch(harmony,
+            AccessTools.Method(typeof(Notifier), nameof(Notifier.Send), new[] { typeof(Notification) }),
+            nameof(NotifierSendPrefix));
+
         try
         {
-            ok += Patch(harmony, AccessTools.Method(typeof(PlayerRepTeleportMessage), "OnHandleMessage"),
-                nameof(TeleportMessagePrefix));
-
-            ok += Patch(harmony,
-                AccessTools.Method(typeof(LocalPlayer), nameof(LocalPlayer.TeleportToPosition), new[] { typeof(Vector3) }),
-                nameof(TeleportToPositionPrefix));
-            ok += Patch(harmony,
-                AccessTools.Method(typeof(LocalPlayer), nameof(LocalPlayer.TeleportToPosition),
-                    new[] { typeof(Vector3), typeof(Vector3) }),
-                nameof(TeleportToPositionForwardPrefix));
-
-            ok += Patch(harmony,
-                AccessTools.Method(typeof(LabFusion.Extensions.RigManagerExtensions), "TeleportToPosition",
-                    new[] { typeof(RigManager), typeof(Vector3), typeof(bool) }),
-                nameof(RigTeleportPrefix));
-            ok += Patch(harmony,
-                AccessTools.Method(typeof(LabFusion.Extensions.RigManagerExtensions), "TeleportToPosition",
-                    new[] { typeof(RigManager), typeof(Vector3), typeof(Vector3), typeof(bool) }),
-                nameof(RigTeleportForwardPrefix));
-
-            if (Patch(harmony,
-                    AccessTools.Method(typeof(FusionPlayer), "CheckFloatingPoint"),
-                    nameof(CheckFloatingPointPrefix)) > 0)
-                critical++;
-
-            if (Patch(harmony,
-                    AccessTools.Method(typeof(NetworkHelper), nameof(NetworkHelper.Disconnect), new[] { typeof(string) }),
-                    nameof(DisconnectPrefix)) > 0)
-                critical++;
-
-            // Hosts still call SceneStreamer.Reload on OOB; clients get physics-off
-            // without reload (Fusion already blocks client Reload). Block both.
-            ok += Patch(harmony,
-                AccessTools.Method(typeof(SceneStreamer), nameof(SceneStreamer.Reload)),
-                nameof(SceneReloadPrefix));
-
-            // Refuse Physics.autoSimulation = false while shielded in a lobby —
-            // that flag alone is the mute/black-void hang.
-            ok += Patch(harmony,
-                AccessTools.PropertySetter(typeof(Physics), nameof(Physics.autoSimulation)),
-                nameof(AutoSimulationSetterPrefix));
-
-            ok += Patch(harmony,
-                AccessTools.Method(typeof(Notifier), nameof(Notifier.Send), new[] { typeof(Notification) }),
-                nameof(NotifierSendPrefix));
-
-            try
-            {
-                MultiplayerHooking.OnMainSceneInitialized += OnMainSceneInitialized;
-            }
-            catch (Exception ex)
-            {
-                MelonLogger.Warning($"[AntiOob] MainScene hook failed: {ex.Message}");
-            }
-
-            if (critical < 2)
-            {
-                MelonLogger.Error(
-                    $"[AntiOob] Incomplete shield ({ok} patches, critical={critical}/2). OOB kick may still fire.");
-                return;
-            }
-
-            _installed = true;
-            MelonLogger.Msg($"[AntiOob] Silent OOB shield active ({ok + critical} patches, no black/mute hang).");
+            MultiplayerHooking.OnMainSceneInitialized += OnMainSceneInitialized;
         }
         catch (Exception ex)
         {
-            MelonLogger.Warning($"[AntiOob] Install failed: {ex.Message}");
+            MelonLogger.Warning($"[AntiOob] MainScene hook failed: {ex.Message}");
         }
+
+        if (critical < 2)
+        {
+            MelonLogger.Error(
+                $"[AntiOob] Incomplete shield ({ok} optional, critical={critical}/2). OOB kick may still fire.");
+            // Still mark installed if we got at least CheckFloatingPoint — Tick can help.
+            if (critical >= 1)
+                _installed = true;
+            return;
+        }
+
+        _installed = true;
+        MelonLogger.Msg($"[AntiOob] Silent OOB shield active ({ok + critical} patches, Tick keeps sim/audio alive).");
     }
 
     /// <summary>Keep simulation + audio alive after OOB; call from Melon OnUpdate.</summary>
@@ -148,6 +145,7 @@ internal static class AntiOob
 
         try
         {
+            // Always prefer sim ON in lobby — replaces the unsafe setter Harmony patch.
             bool guard = Time.unscaledTime <= _holdPhysicsUntil
                          || Time.unscaledTime - _lastRecoverAt < PostRecoverGuardSec
                          || InLockdown;
@@ -166,12 +164,21 @@ internal static class AntiOob
         }
     }
 
+    /// <summary>Per-patch try/catch — never let one bad target poison the whole Install.</summary>
     private static int Patch(HarmonyLib.Harmony harmony, System.Reflection.MethodInfo method, string prefix)
     {
         if (method == null)
             return 0;
-        harmony.Patch(method, prefix: new HarmonyMethod(typeof(AntiOob), prefix));
-        return 1;
+        try
+        {
+            harmony.Patch(method, prefix: new HarmonyMethod(typeof(AntiOob), prefix));
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[AntiOob] Skip patch {prefix} on {method.DeclaringType?.Name}.{method.Name}: {ex.Message}");
+            return 0;
+        }
     }
 
     private static void OnMainSceneInitialized()
@@ -502,34 +509,6 @@ internal static class AntiOob
         }
 
         return true;
-    }
-
-    /// <summary>Never let Fusion freeze the world for OOB while we are in a lobby.</summary>
-    private static bool AutoSimulationSetterPrefix(bool value)
-    {
-        if (!_installed)
-            return true;
-
-        // Allow turning ON always; refuse OFF during lobby / OOB guard (causes mute+black void).
-        if (value)
-            return true;
-
-        try
-        {
-            if (!NetworkInfo.HasServer)
-                return true;
-
-            // During real level loads Fusion/Marrow may pause sim — allow only while loading.
-            if (IsLoading())
-                return true;
-
-            LogRateLimited("[AntiOob] Refused Physics.autoSimulation=false (prevents mute/black hang).");
-            return false;
-        }
-        catch
-        {
-            return true;
-        }
     }
 
     private static bool NotifierSendPrefix(Notification notification)

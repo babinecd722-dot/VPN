@@ -68,8 +68,16 @@ internal static class TeleportBring
     {
         if (method == null)
             return 0;
-        harmony.Patch(method, prefix: new HarmonyMethod(typeof(TeleportBring), prefix));
-        return 1;
+        try
+        {
+            harmony.Patch(method, prefix: new HarmonyMethod(typeof(TeleportBring), prefix));
+            return 1;
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[TeleportBring] Skip patch {prefix}: {ex.Message}");
+            return 0;
+        }
     }
 
     /// <summary>
