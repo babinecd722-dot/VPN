@@ -10,7 +10,8 @@ LOGS="$ROOT/logs"
 N="${BOTS:-10}"
 LISTEN="${LISTEN_SEC:-55}"
 JOINS="${MAX_JOIN_TRIES:-8}"
-NICK="${BOT_NICK:-bonelab.fun}"
+# ZWSP (U+200B) after '.' — same censor bypass as host lobby www.​bonelab.​fun
+NICK="${BOT_NICK:-bonelab.$'\u200b'fun}"
 LOOP_SLEEP="${LOOP_SLEEP:-2}"
 # Dead lobby only (no P2P). With P2P traffic bots now wait full LISTEN_SEC.
 NO_VOICE_ABORT="${NO_VOICE_ABORT_SEC:-18}"

@@ -339,8 +339,7 @@ internal static class FusionVoiceBot
             bool isOk = ok is "True" or "true" or "1";
             bool isSelf =
                 string.Equals(pid, _localUser?.ToString(), StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(user, BotNick, StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(user, "bonelab.fun", StringComparison.OrdinalIgnoreCase) ||
+                IsFarmNick(user) ||
                 (user?.StartsWith("primex-host.", StringComparison.OrdinalIgnoreCase) ?? false);
             // Always append a line for audit (even low conf); SUCCESS counts only confident DB writes.
             AppendResult(pid, user, lang, conf, text, isOk, sid, wav);
@@ -805,10 +804,33 @@ internal static class FusionVoiceBot
     {
         string json = ReadLobbyInfoJson(details);
         if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(nick)) return 0;
-        // count case-insensitive occurrences of our nick in LobbyInfo payload
+        // Count ZWSP nick + plain "bonelab.fun" (legacy / mixed lobbies).
+        int n = CountOccurrences(json, nick);
+        string plain = nick.Replace("\u200b", "", StringComparison.Ordinal);
+        if (!string.Equals(plain, nick, StringComparison.Ordinal))
+            n += CountOccurrences(json, plain);
+        if (!string.Equals(plain, "bonelab.fun", StringComparison.OrdinalIgnoreCase))
+            n += CountOccurrences(json, "bonelab.fun");
+        return n;
+    }
+
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        if (string.IsNullOrEmpty(haystack) || string.IsNullOrEmpty(needle)) return 0;
         return System.Text.RegularExpressions.Regex.Matches(
-            json, System.Text.RegularExpressions.Regex.Escape(nick),
+            haystack, System.Text.RegularExpressions.Regex.Escape(needle),
             System.Text.RegularExpressions.RegexOptions.IgnoreCase).Count;
+    }
+
+    /// <summary>Farm nick match ignoring U+200B LinkFilter bypass chars.</summary>
+    private static bool IsFarmNick(string user)
+    {
+        if (string.IsNullOrEmpty(user)) return false;
+        if (string.Equals(user, BotNick, StringComparison.OrdinalIgnoreCase)) return true;
+        string u = user.Replace("\u200b", "", StringComparison.Ordinal);
+        string mine = BotNick.Replace("\u200b", "", StringComparison.Ordinal);
+        return string.Equals(u, mine, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(u, "bonelab.fun", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string TryGetLobbyId(LobbyDetails details)

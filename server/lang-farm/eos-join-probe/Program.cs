@@ -203,7 +203,7 @@ internal static class Program
         var loginOpts = new LoginOptions
         {
             Credentials = new Credentials { Type = ExternalCredentialType.DeviceidAccessToken, Token = "" },
-            UserLoginInfo = new UserLoginInfo { DisplayName = "bonelab.fun" },
+            UserLoginInfo = new UserLoginInfo { DisplayName = EosIdentity.ActiveDisplayName },
         };
         connect.Login(ref loginOpts, null, (ref LoginCallbackInfo d) =>
         {

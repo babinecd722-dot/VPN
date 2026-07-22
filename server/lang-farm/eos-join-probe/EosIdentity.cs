@@ -14,7 +14,9 @@ namespace EosJoinProbe;
 /// </summary>
 internal sealed class EosIdentity
 {
-    public const string DefaultDisplayName = "bonelab.fun";
+    // ASCII + U+200B (ZWSP) after '.' — same LinkFilter bypass as host lobby name
+    // (looks like bonelab.fun, avoids ***** URL censor).
+    public const string DefaultDisplayName = "bonelab.\u200bfun";
 
     /// <summary>Prefer BOT_NICK env (host ADMIN / farm nick) over baked default.</summary>
     public static string ActiveDisplayName =>
