@@ -678,13 +678,73 @@ internal static class FusionVoiceBot
         return BuildNetMessage(TagConnectionRequest, payload.ToArray());
     }
 
+    // ServerPrivacy: PUBLIC=0 PRIVATE=1 FRIENDS_ONLY=2 LOCKED=3
+    // Search all shards (like the VPS scraper) so LID covers more than public-only.
+    private static readonly string[] PrivacyShards = ParsePrivacyShards();
+
+    private static string[] ParsePrivacyShards()
+    {
+        // JOIN_PRIVACY=0,1,2,3 (default all). Example: JOIN_PRIVACY=0,1 for public+private only.
+        string raw = Env("JOIN_PRIVACY", "0,1,2,3");
+        var list = new List<string>();
+        foreach (string part in raw.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (part is "0" or "1" or "2" or "3")
+                list.Add(part);
+        }
+        return list.Count > 0 ? list.ToArray() : new[] { "0", "1", "2", "3" };
+    }
+
+    private static string PrivacyLabel(string privacyEq) => privacyEq switch
+    {
+        "0" => "public",
+        "1" => "private",
+        "2" => "friends",
+        "3" => "locked",
+        _ => privacyEq,
+    };
+
     private static List<LobbyDetails> FindPublicLobbies(int want)
     {
+        var scored = new List<(LobbyDetails d, int score, int players, int ours, string privacy)>();
+        var seenIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Full=False first (joinable), then Full=True (attr can be stale / still has slots).
+        foreach (string privacy in PrivacyShards)
+        {
+            foreach (string full in new[] { "False", "True" })
+            {
+                CollectLobbyShard(scored, seenIds, privacy, full);
+            }
+        }
+
+        Console.WriteLine(
+            $"[langfarm] pool={scored.Count} privacy=[{string.Join(',', PrivacyShards.Select(PrivacyLabel))}] want={want}");
+
         var list = new List<LobbyDetails>();
+        foreach (var item in scored.OrderByDescending(x => x.score).Take(want))
+        {
+            Console.WriteLine(
+                $"[langfarm] candidate {PrivacyLabel(item.privacy)} players≈{item.players} ours≈{item.ours} score={item.score}");
+            list.Add(item.d);
+        }
+        foreach (var item in scored.OrderByDescending(x => x.score).Skip(want))
+            SafeRelease(item.d);
+        return list;
+    }
+
+    private static void CollectLobbyShard(
+        List<(LobbyDetails d, int score, int players, int ours, string privacy)> scored,
+        HashSet<string> seenIds,
+        string privacyEq,
+        string fullEq)
+    {
         var lobby = _platform.GetLobbyInterface();
         var createOpts = new CreateLobbySearchOptions { MaxResults = 50 };
         if (lobby.CreateLobbySearch(ref createOpts, out LobbySearch search) != Result.Success || search == null)
-            return list;
+            return;
+
+        string label = $"{PrivacyLabel(privacyEq)}/full={fullEq}";
         try
         {
             void Set(string key, string val)
@@ -694,42 +754,52 @@ internal static class FusionVoiceBot
                 search.SetParameter(ref o);
             }
             Set("Game", GameName);
-            Set("Privacy", "0");
-            Set("Full", "False");
+            Set("Privacy", privacyEq);
+            Set("Full", fullEq);
 
             bool done = false;
             Result fr = Result.UnexpectedError;
             var findOpts = new LobbySearchFindOptions { LocalUserId = _localUser };
             search.Find(ref findOpts, null, (ref LobbySearchFindCallbackInfo info) => { fr = info.ResultCode; done = true; });
-            if (!PumpUntil(() => done, 45, "FindLobbies"))
+            if (!PumpUntil(() => done, 45, $"Find:{label}"))
             {
-                Console.WriteLine("[langfarm] Find: timeout");
-                return list;
+                Console.WriteLine($"[langfarm] Find({label}): timeout");
+                return;
             }
-            Console.WriteLine($"[langfarm] Find: {fr}");
-            if (fr != Result.Success) return list;
+            Console.WriteLine($"[langfarm] Find({label}): {fr}");
+            if (fr != Result.Success) return;
 
             var countOpts = default(LobbySearchGetSearchResultCountOptions);
             uint count = search.GetSearchResultCount(ref countOpts);
-            Console.WriteLine($"[langfarm] find count={count}");
+            Console.WriteLine($"[langfarm] find({label}) count={count}");
 
-            // Prefer fuller lobbies, but avoid ones already packed with our bots / claimed
-            var scored = new List<(LobbyDetails d, int score, int players, int ours)>();
+            string forceName = Environment.GetEnvironmentVariable("FORCE_LOBBY_NAME");
+            string forceCode = Environment.GetEnvironmentVariable("FORCE_LOBBY_CODE");
+
             for (uint i = 0; i < count; i++)
             {
                 var copyOpts = new LobbySearchCopySearchResultByIndexOptions { LobbyIndex = i };
                 if (search.CopySearchResultByIndex(ref copyOpts, out LobbyDetails details) != Result.Success || details == null)
                     continue;
+
+                string id = TryGetLobbyId(details);
+                // Dedupe across privacy/full shards (same lobby can appear twice).
+                string dedupeKey = !string.IsNullOrEmpty(id)
+                    ? id
+                    : $"idx:{privacyEq}:{fullEq}:{i}:{GetLobbyAttr(details, "LobbyName")}";
+                if (!seenIds.Add(dedupeKey))
+                {
+                    SafeRelease(details);
+                    continue;
+                }
+
                 int players = EstimatePlayers(details);
                 int ours = CountNickInLobbyInfo(details, BotNick);
-                string id = TryGetLobbyId(details);
                 bool claimed = !string.IsNullOrEmpty(id) && IsLobbyClaimed(id);
-                // Heavy penalty if our nick already there or another farm bot claimed it
-                int score = players * 10 - ours * 50 - (claimed ? 100 : 0);
-                // Optional pin: FORCE_LOBBY_CODE (exact) and/or FORCE_LOBBY_NAME.
-                // When CODE is set, non-matching lobbies are discarded (avoids stale same-name ghosts).
-                string forceName = Environment.GetEnvironmentVariable("FORCE_LOBBY_NAME");
-                string forceCode = Environment.GetEnvironmentVariable("FORCE_LOBBY_CODE");
+                // Prefer fuller lobbies; soft boost non-public so we actually sample them.
+                int privacyBoost = privacyEq == "0" ? 0 : 15;
+                int score = players * 10 - ours * 50 - (claimed ? 100 : 0) + privacyBoost;
+
                 if (!string.IsNullOrEmpty(forceName) || !string.IsNullOrEmpty(forceCode))
                 {
                     string json = ReadLobbyInfoJson(details) ?? "";
@@ -752,18 +822,11 @@ internal static class FusionVoiceBot
                     else if (namePin) score += 100000;
                     else score -= 100000;
                 }
-                scored.Add((details, score, players, ours));
+
+                scored.Add((details, score, players, ours, privacyEq));
             }
-            foreach (var item in scored.OrderByDescending(x => x.score).Take(want))
-            {
-                Console.WriteLine($"[langfarm] candidate players≈{item.players} ours≈{item.ours} score={item.score}");
-                list.Add(item.d);
-            }
-            foreach (var item in scored.OrderByDescending(x => x.score).Skip(want))
-                SafeRelease(item.d);
         }
         finally { search.Release(); }
-        return list;
     }
 
     private static int EstimatePlayers(LobbyDetails details)
