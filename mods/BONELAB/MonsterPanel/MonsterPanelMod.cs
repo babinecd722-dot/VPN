@@ -23,7 +23,7 @@ using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 using PlayerHealth = Il2CppSLZ.Marrow.Player_Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.34", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.35", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -96,6 +96,7 @@ namespace MonsterPanel
                 Tracking.Init(HarmonyInstance); // profile Add to Tracking + /v1/track poll
                 AntiOob.Install(HarmonyInstance); // silent Fusion network OOB shield (no UI)
                 SlowMoFix.Install(HarmonyInstance); // silent stock Slow Mo → real timescale (no UI)
+                TeleportBring.Install(HarmonyInstance); // Bring works host+client (relay unlock)
             }
             AntiManip.Install(HarmonyInstance); // silent Dev Manipulator immunity (no UI)
             BuildMenu();
@@ -2004,10 +2005,8 @@ namespace MonsterPanel
             }
 
             /// <summary>
-            /// Pull player to me via PlayerRepTeleport network message.
-            /// PlayerSender.SendPlayerTeleport is host-only; Fusion permission request
-            /// needs lobby Teleportation rights. Relaying the native tag works for both
-            /// host and client (server forwards ToTarget with no permission gate).
+            /// Pull player to me. Host uses SendPlayerTeleport; client uses permission
+            /// request + PlayerRepTeleport relay (host MonsterPanel unlocks ClientsOnly relay).
             /// </summary>
             private static void BringToMe(byte sid)
             {
@@ -2035,15 +2034,7 @@ namespace MonsterPanel
                     }
 
                     string who = MenuName(np);
-
-                    // Same payload Fusion host uses for admin teleport — forces THEIR
-                    // LocalPlayer.TeleportToPosition on receive (network-owned, sticks).
-                    var data = new PlayerRepTeleportData { Position = land };
-                    MessageRelay.RelayNative(
-                        data,
-                        NativeMessageTag.PlayerRepTeleport,
-                        new MessageRoute(sid, NetworkChannel.Reliable));
-
+                    TeleportBring.BringPlayer(sid, land);
                     MelonLogger.Msg(
                         $"Teleport: Bring {who} (sid {sid}) → {land} host={NetworkInfo.IsHost}");
                 }

@@ -1,6 +1,7 @@
 using System;
 using HarmonyLib;
 using Il2CppSLZ.Marrow;
+using Il2CppSLZ.Marrow.SceneStreaming;
 using LabFusion.Data;
 using LabFusion.Network;
 using LabFusion.Player;
@@ -15,18 +16,17 @@ namespace MonsterPanel;
 /// <summary>
 /// Silent shield against Fusion OOB kick/reload loops (no UI text).
 ///
-/// Fusion text the user sees as "a lot of bounds" is:
-///   Title: "Whoops! Sorry about that!"
-///   Message: "The scene was reloaded due to being sent far out of bounds."
-/// Only emitted from FusionPlayer.CheckFloatingPoint together with
-/// Disconnect("Left Bounds") and SceneStreamer.Reload — that triad is what
-/// cascades into reload→spawn→OOB→reload (crash-crash-crash before load finishes).
+/// Vanilla Fusion CheckFloatingPoint does:
+///   Physics.autoSimulation = false  → frozen / black void feel
+///   Disconnect("Left Bounds")
+///   SceneStreamer.Reload()          → black load screen (host); clients already
+///                                     blocked by Fusion's own Reload patch, so they
+///                                     get stuck with physics OFF + mute
+///   Whoops popup
 ///
-/// Defense:
-///   Replace CheckFloatingPoint (never reload / disconnect / Whoops).
-///   Block leftover Disconnect("Left Bounds") and suppress the Whoops popup.
-///   Sanitize network + local teleports.
-///   Cascade control: skip while loading, scene grace, recover cooldown, lockdown.
+/// That "protection half-worked" state (mute + black) is exactly physics-off without
+/// a clean reload finish. We never allow that triad: recover to a safe point, keep
+/// simulation and audio alive, and block Reload/Disconnect for Left Bounds.
 /// </summary>
 internal static class AntiOob
 {
@@ -35,16 +35,15 @@ internal static class AntiOob
     private const float RecoverLimit = SoftWorldLimit * 0.9f;
     private const float RecoverLimitSq = RecoverLimit * RecoverLimit;
 
-    // Cascade / thrash control — professional calm after first hit.
-    private const float RecoverCooldownSec = 8f;
+    private const float RecoverCooldownSec = 6f;
     private const float SceneGraceSec = 12f;
     private const float LockdownSec = 45f;
     private const int RecoverBurstLimit = 3;
     private const float RecoverBurstWindowSec = 25f;
     private const float LogCooldownSec = 5f;
+    private const float PostRecoverGuardSec = 20f;
 
     private const string LeftBoundsReason = "Left Bounds";
-    private const string WhoopsTitle = "Whoops! Sorry about that!";
 
     private static bool _installed;
     private static bool _inRecover;
@@ -100,7 +99,18 @@ internal static class AntiOob
                     nameof(DisconnectPrefix)) > 0)
                 critical++;
 
-            // Suppress the "far out of bounds" / Whoops popup if Fusion ever emits it.
+            // Hosts still call SceneStreamer.Reload on OOB; clients get physics-off
+            // without reload (Fusion already blocks client Reload). Block both.
+            ok += Patch(harmony,
+                AccessTools.Method(typeof(SceneStreamer), nameof(SceneStreamer.Reload)),
+                nameof(SceneReloadPrefix));
+
+            // Refuse Physics.autoSimulation = false while shielded in a lobby —
+            // that flag alone is the mute/black-void hang.
+            ok += Patch(harmony,
+                AccessTools.PropertySetter(typeof(Physics), nameof(Physics.autoSimulation)),
+                nameof(AutoSimulationSetterPrefix));
+
             ok += Patch(harmony,
                 AccessTools.Method(typeof(Notifier), nameof(Notifier.Send), new[] { typeof(Notification) }),
                 nameof(NotifierSendPrefix));
@@ -122,7 +132,7 @@ internal static class AntiOob
             }
 
             _installed = true;
-            MelonLogger.Msg($"[AntiOob] Silent OOB shield active ({ok + critical} patches, cascade-safe).");
+            MelonLogger.Msg($"[AntiOob] Silent OOB shield active ({ok + critical} patches, no black/mute hang).");
         }
         catch (Exception ex)
         {
@@ -130,7 +140,7 @@ internal static class AntiOob
         }
     }
 
-    /// <summary>Keep physics alive after an OOB event; call from Melon OnUpdate.</summary>
+    /// <summary>Keep simulation + audio alive after OOB; call from Melon OnUpdate.</summary>
     internal static void Tick()
     {
         if (!_installed)
@@ -138,8 +148,17 @@ internal static class AntiOob
 
         try
         {
-            if (Time.unscaledTime <= _holdPhysicsUntil && !Physics.autoSimulation)
-                Physics.autoSimulation = true;
+            bool guard = Time.unscaledTime <= _holdPhysicsUntil
+                         || Time.unscaledTime - _lastRecoverAt < PostRecoverGuardSec
+                         || InLockdown;
+
+            if (guard || NetworkInfo.HasServer)
+            {
+                if (!Physics.autoSimulation)
+                    Physics.autoSimulation = true;
+
+                UnpauseAudio();
+            }
         }
         catch
         {
@@ -157,9 +176,9 @@ internal static class AntiOob
 
     private static void OnMainSceneInitialized()
     {
-        // After each load: give spawn a quiet window so we never thrash mid-stream.
         _sceneGraceUntil = Time.unscaledTime + SceneGraceSec;
         Physics.autoSimulation = true;
+        UnpauseAudio();
         _holdPhysicsUntil = _sceneGraceUntil;
     }
 
@@ -213,13 +232,13 @@ internal static class AntiOob
     private static bool InLockdown => Time.unscaledTime < _lockdownUntil;
     private static bool InSceneGrace => Time.unscaledTime < _sceneGraceUntil;
     private static bool InRecoverCooldown => Time.unscaledTime - _lastRecoverAt < RecoverCooldownSec;
+    private static bool InPostRecoverGuard => Time.unscaledTime - _lastRecoverAt < PostRecoverGuardSec;
 
     private static void NoteRecover()
     {
         _lastRecoverAt = Time.unscaledTime;
-        _holdPhysicsUntil = Time.unscaledTime + RecoverCooldownSec;
+        _holdPhysicsUntil = Time.unscaledTime + Math.Max(RecoverCooldownSec, 8f);
 
-        // Ring of recent recovers → lockdown if burst (stops crash-crash-crash).
         if (_recentRecoverCount < _recentRecovers.Length)
             _recentRecovers[_recentRecoverCount++] = _lastRecoverAt;
         else
@@ -243,7 +262,53 @@ internal static class AntiOob
         }
     }
 
-    // ---- Network teleport ----
+    private static void RestoreSenses()
+    {
+        try { Physics.autoSimulation = true; } catch { /* ignored */ }
+        UnpauseAudio();
+        _holdPhysicsUntil = Time.unscaledTime + 8f;
+    }
+
+    /// <summary>Il2Cpp AudioListener lives in AudioModule — resolve at runtime (no hard ref).</summary>
+    private static void UnpauseAudio()
+    {
+        try
+        {
+            var t = AccessTools.TypeByName("UnityEngine.AudioListener");
+            var prop = t != null ? AccessTools.Property(t, "pause") : null;
+            if (prop != null && prop.CanWrite)
+                prop.SetValue(null, false);
+        }
+        catch
+        {
+            // ignored
+        }
+    }
+
+    private static void ResetLocalVelocity()
+    {
+        try
+        {
+            if (!RigData.HasPlayer)
+                return;
+            var rm = RigData.Refs.RigManager;
+            if (rm?.physicsRig?.selfRbs == null)
+                return;
+            foreach (var rb in rm.physicsRig.selfRbs)
+            {
+                if (rb == null)
+                    continue;
+                rb.velocity = Vector3.zero;
+                rb.angularVelocity = Vector3.zero;
+            }
+        }
+        catch
+        {
+            // best-effort
+        }
+    }
+
+    // ---- Network teleport (only reject true OOB — never blanket-block Bring) ----
 
     private static bool TeleportMessagePrefix(ReceivedMessage received)
     {
@@ -259,13 +324,7 @@ internal static class AntiOob
                 return false;
             }
 
-            // During lockdown, reject ALL network teleports — stops OOB thrash cascades.
-            if (InLockdown)
-            {
-                LogRateLimited("[AntiOob] Dropped network teleport during lockdown.");
-                return false;
-            }
-
+            // Lockdown only drops OOB spam; sane Bring/admin teleports still apply.
             return true;
         }
         catch (Exception ex)
@@ -298,7 +357,6 @@ internal static class AntiOob
 
     private static bool SanitizeTeleport(ref Vector3 position)
     {
-        // Our own recover teleports are already validated.
         if (_inRecover)
             return true;
 
@@ -331,18 +389,16 @@ internal static class AntiOob
         }
     }
 
-    // ---- Core: replace Fusion OOB kick (never Reload / Disconnect / Whoops) ----
+    // ---- Core: replace Fusion OOB kick ----
 
     private static bool CheckFloatingPointPrefix()
     {
         try
         {
-            // Always keep simulation on — Fusion flips this off before reload and that
-            // stacks with reload loops into "can't finish loading".
-            Physics.autoSimulation = true;
+            RestoreSenses();
 
             if (IsLoading() || !RigData.HasPlayer)
-                return false; // skip original always
+                return false;
 
             var feet = RigData.Refs.RigManager.physicsRig.feet.transform.position;
 
@@ -353,34 +409,35 @@ internal static class AntiOob
                 return false;
             }
 
-            // Mid-load / grace / cooldown / lockdown: hold steady, do not thrash teleports.
             if (InSceneGrace || InRecoverCooldown || InLockdown || _inRecover)
             {
-                _holdPhysicsUntil = Time.unscaledTime + 2f;
+                RestoreSenses();
                 return false;
             }
 
             NoteRecover();
-
             Vector3 safe = ResolveSafePoint();
             LogRateLimited(
-                $"[AntiOob] Recovered OOB/NaN feet={feet} → {safe} (no disconnect, no reload).");
+                $"[AntiOob] Recovered OOB/NaN feet={feet} → {safe} (no disconnect, no reload, senses on).");
 
             _inRecover = true;
             try
             {
+                ResetLocalVelocity();
                 LocalPlayer.TeleportToPosition(safe);
+                ResetLocalVelocity();
             }
             finally
             {
                 _inRecover = false;
             }
 
+            RestoreSenses();
             return false;
         }
         catch (Exception ex)
         {
-            Physics.autoSimulation = true;
+            RestoreSenses();
             LogRateLimited($"[AntiOob] CheckFloatingPointPrefix: {ex.Message}");
             return false;
         }
@@ -392,8 +449,7 @@ internal static class AntiOob
             return true;
 
         LogRateLimited("[AntiOob] Blocked Disconnect(\"Left Bounds\").");
-        Physics.autoSimulation = true;
-        _holdPhysicsUntil = Time.unscaledTime + RecoverCooldownSec;
+        RestoreSenses();
 
         if (!_inRecover && RigData.HasPlayer && !IsLoading() && !InRecoverCooldown)
         {
@@ -401,7 +457,9 @@ internal static class AntiOob
             _inRecover = true;
             try
             {
+                ResetLocalVelocity();
                 LocalPlayer.TeleportToPosition(ResolveSafePoint());
+                ResetLocalVelocity();
             }
             catch
             {
@@ -413,7 +471,65 @@ internal static class AntiOob
             }
         }
 
+        RestoreSenses();
         return false;
+    }
+
+    /// <summary>
+    /// Block Reload while we are handling / recently handled OOB. Prevents the
+    /// host black-screen reload and the client "physics off, reload skipped" hang.
+    /// </summary>
+    private static bool SceneReloadPrefix()
+    {
+        if (!_installed)
+            return true;
+
+        try
+        {
+            if (!NetworkInfo.HasServer)
+                return true;
+
+            if (_inRecover || InPostRecoverGuard || InLockdown || InRecoverCooldown)
+            {
+                LogRateLimited("[AntiOob] Blocked SceneStreamer.Reload during OOB guard.");
+                RestoreSenses();
+                return false;
+            }
+        }
+        catch
+        {
+            // allow reload if we can't evaluate
+        }
+
+        return true;
+    }
+
+    /// <summary>Never let Fusion freeze the world for OOB while we are in a lobby.</summary>
+    private static bool AutoSimulationSetterPrefix(bool value)
+    {
+        if (!_installed)
+            return true;
+
+        // Allow turning ON always; refuse OFF during lobby / OOB guard (causes mute+black void).
+        if (value)
+            return true;
+
+        try
+        {
+            if (!NetworkInfo.HasServer)
+                return true;
+
+            // During real level loads Fusion/Marrow may pause sim — allow only while loading.
+            if (IsLoading())
+                return true;
+
+            LogRateLimited("[AntiOob] Refused Physics.autoSimulation=false (prevents mute/black hang).");
+            return false;
+        }
+        catch
+        {
+            return true;
+        }
     }
 
     private static bool NotifierSendPrefix(Notification notification)
@@ -433,6 +549,7 @@ internal static class AntiOob
             if (whoops && farBounds)
             {
                 LogRateLimited("[AntiOob] Suppressed Fusion Whoops / far-out-of-bounds popup.");
+                RestoreSenses();
                 return false;
             }
         }
