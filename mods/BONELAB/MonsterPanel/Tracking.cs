@@ -1031,11 +1031,11 @@ namespace MonsterPanel
                         info,
                         (Action)(() => { }));
                     _detailPage.CreateFunction(
-                        "Map  " + SafeMenu(NullDash(snap.Map), 20) + " · " + FormatDuration(snap.SessionSec),
+                        "Online  " + FormatDuration(snap.SessionSec),
                         info,
                         (Action)(() => { }));
                     _detailPage.CreateFunction(
-                        "Lobby  " + SafeMenu(NullDash(snap.LobbyCode), 12),
+                        "Map  " + SafeMenu(NullDash(snap.Map), 22) + " · lobby " + SafeMenu(NullDash(snap.LobbyCode), 10),
                         info,
                         (Action)(() => { }));
                 }
@@ -1043,7 +1043,11 @@ namespace MonsterPanel
                 {
                     _detailPage.CreateFunction("Status  OFFLINE", new Color(0.7f, 0.7f, 0.75f), (Action)(() => { }));
                     _detailPage.CreateFunction(
-                        "Lang  " + SafeMenu(NullDash(snap.Language), 14) + " · off " + FormatDuration(snap.OfflineSec),
+                        "Offline  " + FormatDuration(snap.OfflineSec),
+                        info,
+                        (Action)(() => { }));
+                    _detailPage.CreateFunction(
+                        "Lang  " + SafeMenu(NullDash(snap.Language), 22),
                         info,
                         (Action)(() => { }));
                 }
@@ -1336,20 +1340,63 @@ namespace MonsterPanel
         private static string FormatListTitle(TrackedEntry e, TrackSnapshot snap)
         {
             string name = DisplayName(e, snap);
-            if (name.Length > 16) name = name.Substring(0, 16);
+            if (name.Length > 14) name = name.Substring(0, 14);
             if (snap == null) return name + "  …";
             if (!snap.Found) return name + "  ?";
-            if (snap.Online) return name + "  ● LIVE";
-            return name + "  ○ off";
+            if (snap.Online) return name + "  ● " + FormatDurationCompact(snap.SessionSec);
+            return name + "  ○ " + FormatDurationCompact(snap.OfflineSec);
         }
 
+        /// <summary>
+        /// Human duration for detail rows.
+        ///   &lt;1m  → 45s
+        ///   &lt;1h  → 12m 5s
+        ///   &lt;24h → 5h 12m
+        ///   ≥24h → 2d 0h 2m
+        /// </summary>
         private static string FormatDuration(int? sec)
         {
             if (sec == null) return "…";
             int s = sec.Value;
+            if (s < 0) s = 0;
+
+            if (s < 60)
+                return s + "s";
+
+            int days = s / 86400;
+            int hours = (s % 86400) / 3600;
+            int mins = (s % 3600) / 60;
+            int secs = s % 60;
+
+            if (days > 0)
+                return days + "d " + hours + "h " + mins + "m";
+            if (hours > 0)
+                return hours + "h " + mins + "m";
+            return mins + "m " + secs + "s";
+        }
+
+        /// <summary>Shorter form for friend-list titles (keeps BoneMenu row readable).</summary>
+        private static string FormatDurationCompact(int? sec)
+        {
+            if (sec == null) return "…";
+            int s = sec.Value;
+            if (s < 0) s = 0;
+
             if (s < 60) return s + "s";
-            if (s < 3600) return (s / 60) + "m " + (s % 60) + "s";
-            return (s / 3600) + "h " + ((s % 3600) / 60) + "m";
+
+            int days = s / 86400;
+            int hours = (s % 86400) / 3600;
+            int mins = (s % 3600) / 60;
+
+            if (days > 0)
+            {
+                // 2d2h — drop zero hours; keep minutes only when no hours
+                if (hours > 0) return days + "d" + hours + "h";
+                if (mins > 0) return days + "d" + mins + "m";
+                return days + "d";
+            }
+            if (hours > 0) return hours + "h" + mins + "m";
+            return mins + "m";
         }
 
         private static void InstallFusionProfileHook(HarmonyLib.Harmony harmony)
