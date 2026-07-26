@@ -23,7 +23,7 @@ using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 using PlayerHealth = Il2CppSLZ.Marrow.Player_Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.36", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.37", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -115,7 +115,7 @@ namespace MonsterPanel
             {
                 Freedom.Tick();   // снимаем ЧУЖИЕ констрейны с тебя и предметов рядом (свои не трогаем)
                 AntiManip.Tick(); // backup: release manipulator locks on our rig
-                AntiOob.Tick();   // keep physics on after OOB events (no reload cascade)
+                AntiOob.Tick();   // reactive: only if sim died / short post-OOB guard
                 SlowMoFix.Tick(); // keep stock Slow Mo armed + non-host bypass
                 if (KillAura) Aura.KillTick();
                 if (Disarm) Aura.DisarmTick();

@@ -1,4 +1,5 @@
 using System;
+using System.Reflection;
 using HarmonyLib;
 using Il2CppSLZ.Marrow;
 using Il2CppSLZ.Marrow.SceneStreaming;
@@ -25,8 +26,9 @@ namespace MonsterPanel;
 ///   Whoops popup
 ///
 /// That "protection half-worked" state (mute + black) is exactly physics-off without
-/// a clean reload finish. We never allow that triad: recover to a safe point, keep
-/// simulation and audio alive, and block Reload/Disconnect for Left Bounds.
+/// a clean reload finish. We recover to a safe point and block Reload/Disconnect for
+/// Left Bounds. Sim/audio restore is event-driven (OOB + reactive if sim is off) —
+/// never a per-frame reflection hammer in a healthy lobby.
 /// </summary>
 internal static class AntiOob
 {
@@ -42,6 +44,7 @@ internal static class AntiOob
     private const float RecoverBurstWindowSec = 25f;
     private const float LogCooldownSec = 5f;
     private const float PostRecoverGuardSec = 20f;
+    private const float AudioGuardPollSec = 0.5f;
 
     private const string LeftBoundsReason = "Left Bounds";
 
@@ -55,6 +58,10 @@ internal static class AntiOob
     private static float _lockdownUntil;
     private static float _holdPhysicsUntil;
     private static float _lastLogAt = -999f;
+    private static float _nextAudioGuardAt;
+
+    private static PropertyInfo _audioPauseProp;
+    private static bool _audioPauseResolved;
 
     private static readonly float[] _recentRecovers = new float[RecoverBurstLimit];
     private static int _recentRecoverCount;
@@ -134,10 +141,14 @@ internal static class AntiOob
         }
 
         _installed = true;
-        MelonLogger.Msg($"[AntiOob] Silent OOB shield active ({ok + critical} patches, Tick keeps sim/audio alive).");
+        MelonLogger.Msg(
+            $"[AntiOob] Silent OOB shield active ({ok + critical} patches; reactive sim/audio recover only).");
     }
 
-    /// <summary>Keep simulation + audio alive after OOB; call from Melon OnUpdate.</summary>
+    /// <summary>
+    /// Cheap idle tick: only touch physics/audio when sim was killed or during a short
+    /// post-OOB guard. Never run reflection every frame in a healthy lobby.
+    /// </summary>
     internal static void Tick()
     {
         if (!_installed)
@@ -145,24 +156,35 @@ internal static class AntiOob
 
         try
         {
-            // Always prefer sim ON in lobby — replaces the unsafe setter Harmony patch.
-            bool guard = Time.unscaledTime <= _holdPhysicsUntil
-                         || Time.unscaledTime - _lastRecoverAt < PostRecoverGuardSec
-                         || InLockdown;
-
-            if (guard || NetworkInfo.HasServer)
+            // Hot path: one bool read. Healthy lobby → return immediately.
+            if (!Physics.autoSimulation)
             {
-                if (!Physics.autoSimulation)
-                    Physics.autoSimulation = true;
-
-                UnpauseAudio();
+                Physics.autoSimulation = true;
+                UnpauseAudioIfPaused();
+                return;
             }
+
+            // Post-OOB guard only — do NOT poll for the entire session / HasServer.
+            if (!InActiveOobGuard)
+                return;
+
+            float now = Time.unscaledTime;
+            if (now < _nextAudioGuardAt)
+                return;
+            _nextAudioGuardAt = now + AudioGuardPollSec;
+            UnpauseAudioIfPaused();
         }
         catch
         {
             // ignored
         }
     }
+
+    /// <summary>True only while recovering from a real OOB event (not every lobby frame).</summary>
+    private static bool InActiveOobGuard =>
+        Time.unscaledTime <= _holdPhysicsUntil
+        || Time.unscaledTime - _lastRecoverAt < PostRecoverGuardSec
+        || InLockdown;
 
     /// <summary>Per-patch try/catch — never let one bad target poison the whole Install.</summary>
     private static int Patch(HarmonyLib.Harmony harmony, System.Reflection.MethodInfo method, string prefix)
@@ -184,9 +206,9 @@ internal static class AntiOob
     private static void OnMainSceneInitialized()
     {
         _sceneGraceUntil = Time.unscaledTime + SceneGraceSec;
-        Physics.autoSimulation = true;
-        UnpauseAudio();
-        _holdPhysicsUntil = _sceneGraceUntil;
+        // One-shot sense restore on scene load — do not extend OOB guard for the whole grace.
+        EnsureSimulationOn();
+        UnpauseAudioIfPaused();
     }
 
     private static bool IsFinite(Vector3 v) =>
@@ -269,22 +291,62 @@ internal static class AntiOob
         }
     }
 
+    /// <summary>Called only on real OOB recover paths — arms a short Tick guard.</summary>
     private static void RestoreSenses()
     {
-        try { Physics.autoSimulation = true; } catch { /* ignored */ }
-        UnpauseAudio();
+        EnsureSimulationOn();
+        UnpauseAudioIfPaused();
         _holdPhysicsUntil = Time.unscaledTime + 8f;
+        _nextAudioGuardAt = 0f;
     }
 
-    /// <summary>Il2Cpp AudioListener lives in AudioModule — resolve at runtime (no hard ref).</summary>
-    private static void UnpauseAudio()
+    private static void EnsureSimulationOn()
     {
         try
         {
+            if (!Physics.autoSimulation)
+                Physics.autoSimulation = true;
+        }
+        catch
+        {
+            // ignored
+        }
+    }
+
+    private static void ResolveAudioPauseProp()
+    {
+        if (_audioPauseResolved)
+            return;
+        _audioPauseResolved = true;
+        try
+        {
+            // Il2Cpp AudioListener lives in AudioModule — resolve once (no hard ref).
             var t = AccessTools.TypeByName("UnityEngine.AudioListener");
-            var prop = t != null ? AccessTools.Property(t, "pause") : null;
-            if (prop != null && prop.CanWrite)
-                prop.SetValue(null, false);
+            _audioPauseProp = t != null ? AccessTools.Property(t, "pause") : null;
+        }
+        catch
+        {
+            _audioPauseProp = null;
+        }
+    }
+
+    /// <summary>Write AudioListener.pause=false only when it is actually paused.</summary>
+    private static void UnpauseAudioIfPaused()
+    {
+        try
+        {
+            ResolveAudioPauseProp();
+            if (_audioPauseProp == null || !_audioPauseProp.CanWrite)
+                return;
+
+            if (_audioPauseProp.CanRead)
+            {
+                object cur = _audioPauseProp.GetValue(null);
+                if (cur is bool paused && !paused)
+                    return;
+            }
+
+            _audioPauseProp.SetValue(null, false);
         }
         catch
         {
@@ -402,10 +464,13 @@ internal static class AntiOob
     {
         try
         {
-            RestoreSenses();
-
+            // Fusion calls this often — never RestoreSenses() on the happy path
+            // (that used to re-arm the audio guard every tick → 1 FPS).
             if (IsLoading() || !RigData.HasPlayer)
+            {
+                EnsureSimulationOn();
                 return false;
+            }
 
             var feet = RigData.Refs.RigManager.physicsRig.feet.transform.position;
 
@@ -413,6 +478,8 @@ internal static class AntiOob
             {
                 _lastGoodFeet = feet;
                 _hasLastGood = true;
+                // Reactive only: if Fusion already froze sim, flip it back. No audio spam.
+                EnsureSimulationOn();
                 return false;
             }
 
