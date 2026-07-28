@@ -17,6 +17,14 @@ Silent Fusion shield against the **Whoops / far out of bounds** kick (no BoneMen
 
 Uses LabFusion from Checkerb0ard 0.0.5 (EOS), not Steam.
 
+## Host tools unlock (2.30.39+)
+
+Silent (no BoneMenu) — stock Fusion tools work even when the lobby locks them:
+- **Dev Tools / Spawn Gun / Nimbus** — bypass `FusionDevTools` permission + gamemode disable for the local player
+- **Constrainer** — keep the gun when `Constrainer` permission is locked; allow player-constrain locally (`PlayerConstraining`)
+
+Same pattern as Slow Mo / Despawn All unlocks.
+
 ---
 
 Страница **MONSTER Panel** в BoneMenu, два тумблера (без кнопок — вкл/выкл):
