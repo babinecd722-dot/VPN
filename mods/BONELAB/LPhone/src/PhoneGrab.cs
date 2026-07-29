@@ -37,9 +37,11 @@ namespace LPhone
         /// <summary>Аварийный переворот стороны ладони, если знак всё же не тот.</summary>
         public static bool FlipPalm = false;
 
-        // Берём с касания, как любой предмет игры: двадцать сантиметров — это
-        // не «взял», это «телефон прыгнул в руку сам».
-        private const float GrabRange = 0.055f;
+        // Радиус хвата. Меряем от БЛИЖАЙШЕЙ точки руки — кончика пальца или
+        // ладони, смотря что ближе. Пять сантиметров от центра ладони не
+        // работали: ладонь сидит внутри кисти, и когда пальцы уже лежат на
+        // корпусе, её центр всё ещё в десятке сантиметров от него.
+        private const float GrabRange = 0.12f;
         private const float BlendTime = 0.08f;
 
         // Притягивание — по НАЖАТИЮ хвата с наведения, а не пока сжат кулак.
@@ -64,6 +66,42 @@ namespace LPhone
 
         private static readonly Dictionary<int, Held> _held = new Dictionary<int, Held>();
         private static float _pullingUntil;
+        private static float _nextGripLog;
+        private static readonly Vector3[] _tips = new Vector3[3];
+
+        /// <summary>Расстояние от точки до поверхности корпуса.</summary>
+        private static float Near(Collider col, Transform root, Vector3 p)
+        {
+            try { return Vector3.Distance(p, col != null ? col.ClosestPoint(p) : root.position); }
+            catch { return Vector3.Distance(p, root.position); }
+        }
+
+        /// <summary>Подушечки указательного, среднего и большого пальцев.</summary>
+        private static int FingerTips(Hand hand, Vector3[] into)
+        {
+            int n = 0;
+            try
+            {
+                var a = hand.Animator;
+                if (a == null) return 0;
+                if (a.index3 != null) into[n++] = a.index3.position;
+                if (a.middle3 != null) into[n++] = a.middle3.position;
+                if (a.thumb3 != null) into[n++] = a.thumb3.position;
+            }
+            catch { return n; }
+            return n;
+        }
+
+        /// <summary>Сырая сила сжатия — для лога.</summary>
+        private static float RawGrip(Hand hand)
+        {
+            try
+            {
+                var c = hand.Controller;
+                return c == null ? -1f : Mathf.Max(c._gripForce, c._solvedGrip);
+            }
+            catch { return -1f; }
+        }
 
         // Фронт нажатия хвата, по одному разу за кадр на каждую руку.
         private static bool _grabR, _grabL, _prevR, _prevL, _evR, _evL;
@@ -197,10 +235,15 @@ namespace LPhone
 
                     var f = HandFrame.Of(hand);
                     Vector3 handPos = f.Valid ? f.Palm : hand.transform.position;
+                    float dist = Near(col, root, handPos);
 
-                    float dist;
-                    try { dist = Vector3.Distance(handPos, col != null ? col.ClosestPoint(handPos) : root.position); }
-                    catch { dist = Vector3.Distance(handPos, root.position); }
+                    // кончики пальцев ближе ладони — по ним и решаем
+                    int nt = FingerTips(hand, _tips);
+                    for (int t = 0; t < nt; t++)
+                    {
+                        float d2 = Near(col, root, _tips[t]);
+                        if (d2 < dist) dist = d2;
+                    }
 
                     if (dist > GrabRange)
                     {
@@ -208,10 +251,23 @@ namespace LPhone
                         if (GrabDown(hand)) TryPull(phone, hand, dist);
                         continue;
                     }
-                    if (!GrabHeld(hand)) continue;
 
-                    // рука занята штатным предметом — не перехватываем
-                    try { if (BoneLib.Player.GetObjectInHand(hand) != null) continue; } catch { }
+                    bool held = GrabHeld(hand);
+                    bool busy = false;
+                    try { busy = BoneLib.Player.GetObjectInHand(hand) != null; } catch { }
+
+                    if (!held || busy)
+                    {
+                        // Рука у телефона, а взять не выходит — пишем причину и
+                        // реальные цифры, иначе это не отладить вслепую.
+                        if (Time.time > _nextGripLog)
+                        {
+                            _nextGripLog = Time.time + 2f;
+                            MelonLogger.Msg($"[LPhone] рядом d={dist:0.000} grip={RawGrip(hand):0.00} " +
+                                            $"held={held} занята={busy}");
+                        }
+                        continue;
+                    }
 
                     var rb = phone.Root.GetComponent<Rigidbody>();
                     if (rb != null)
