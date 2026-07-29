@@ -37,11 +37,12 @@ namespace LPhone
         /// <summary>Аварийный переворот стороны ладони, если знак всё же не тот.</summary>
         public static bool FlipPalm = false;
 
-        // Радиус хвата. Меряем от БЛИЖАЙШЕЙ точки руки — кончика пальца или
-        // ладони, смотря что ближе. Пять сантиметров от центра ладони не
-        // работали: ладонь сидит внутри кисти, и когда пальцы уже лежат на
-        // корпусе, её центр всё ещё в десятке сантиметров от него.
-        private const float GrabRange = 0.12f;
+        // Ровно как в версии, где хват работал: расстояние от ЛАДОНИ, 20 см,
+        // и гистерезис по силе сжатия. Попытки «сделать строже» — мерить по
+        // кончикам пальцев и резать радиус — ломали хват, а не улучшали его.
+        private const float GrabRange = 0.20f;
+        private const float GripOn  = 0.32f;   // взять
+        private const float GripOff = 0.18f;   // отпустить
         private const float BlendTime = 0.08f;
 
         // Притягивание — по НАЖАТИЮ хвата с наведения, а не пока сжат кулак.
@@ -67,29 +68,12 @@ namespace LPhone
         private static readonly Dictionary<int, Held> _held = new Dictionary<int, Held>();
         private static float _pullingUntil;
         private static float _nextGripLog;
-        private static readonly Vector3[] _tips = new Vector3[3];
 
         /// <summary>Расстояние от точки до поверхности корпуса.</summary>
         private static float Near(Collider col, Transform root, Vector3 p)
         {
             try { return Vector3.Distance(p, col != null ? col.ClosestPoint(p) : root.position); }
             catch { return Vector3.Distance(p, root.position); }
-        }
-
-        /// <summary>Подушечки указательного, среднего и большого пальцев.</summary>
-        private static int FingerTips(Hand hand, Vector3[] into)
-        {
-            int n = 0;
-            try
-            {
-                var a = hand.Animator;
-                if (a == null) return 0;
-                if (a.index3 != null) into[n++] = a.index3.position;
-                if (a.middle3 != null) into[n++] = a.middle3.position;
-                if (a.thumb3 != null) into[n++] = a.thumb3.position;
-            }
-            catch { return n; }
-            return n;
         }
 
         /// <summary>Сырая сила сжатия — для лога.</summary>
@@ -237,14 +221,6 @@ namespace LPhone
                     Vector3 handPos = f.Valid ? f.Palm : hand.transform.position;
                     float dist = Near(col, root, handPos);
 
-                    // кончики пальцев ближе ладони — по ним и решаем
-                    int nt = FingerTips(hand, _tips);
-                    for (int t = 0; t < nt; t++)
-                    {
-                        float d2 = Near(col, root, _tips[t]);
-                        if (d2 < dist) dist = d2;
-                    }
-
                     if (dist > GrabRange)
                     {
                         // издалека — только по свежему нажатию и точному наведению
@@ -252,7 +228,7 @@ namespace LPhone
                         continue;
                     }
 
-                    bool held = GrabHeld(hand);
+                    bool held = RawGrip(hand) >= GripOn;
                     bool busy = false;
                     try { busy = BoneLib.Player.GetObjectInHand(hand) != null; } catch { }
 
@@ -363,7 +339,7 @@ namespace LPhone
                 root.position = target;
                 root.rotation = ht.rotation * lr;
 
-                if (!GrabHeld(h.Hand)) Release(phone, h, id);
+                if (RawGrip(h.Hand) < GripOff) Release(phone, h, id);
             }
             catch (Exception e)
             {
