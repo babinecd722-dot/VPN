@@ -287,6 +287,8 @@ namespace LPhone
         public readonly Transform ScreenTransform;
         public readonly Gfx Screen;
         public readonly PhoneOS OS;
+        /// <summary>true — собран модом; false — пришёл из паллета (хват/физика от SLZ).</summary>
+        public bool RuntimeBuilt;
 
         public PhoneInstance(GameObject root, Renderer screen, Transform screenTf)
         {

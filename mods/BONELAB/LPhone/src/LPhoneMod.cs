@@ -4,7 +4,7 @@ using BoneLib.BoneMenu;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.2.1", "BE PRIME")]
+[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.3.0", "BE PRIME")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace LPhone
@@ -25,28 +25,25 @@ namespace LPhone
 
         public override void OnUpdate()
         {
+            PalletBinder.Scan();      // телефоны, заспавненные из паллета
+
+            foreach (var p in PalletBinder.Bound)
+            {
+                if (p == null || !p.Alive) continue;
+                try
+                {
+                    // Хват/физику у паллета делает сам SLZ — нам остаётся экран и тач.
+                    if (p.RuntimeBuilt) PhoneGrab.Tick(p);
+                    if (EnableTouch) TouchInput.Tick(p);
+                    p.OS.Tick();
+                }
+                catch (Exception e) { MelonLogger.Warning("[LPhone] tick: " + e.Message); }
+            }
+
             for (int i = _phones.Count - 1; i >= 0; i--)
             {
                 var p = _phones[i];
                 if (!p.Alive) { _phones.RemoveAt(i); continue; }
-                try
-                {
-                    if (_ticks < 3)
-                    {
-                        _ticks++;
-                        MelonLogger.Msg($"[LPhone] ... кадр {_ticks}: тач");
-                    }
-                    PhoneGrab.Tick(p);
-                    if (EnableTouch) TouchInput.Tick(p);
-
-                    if (_ticks <= 3) MelonLogger.Msg($"[LPhone] ... кадр {_ticks}: отрисовка");
-                    p.OS.Tick();
-                    if (_ticks <= 3) MelonLogger.Msg($"[LPhone] ... кадр {_ticks}: ок");
-                }
-                catch (Exception e)
-                {
-                    MelonLogger.Warning("[LPhone] tick: " + e.Message);
-                }
             }
         }
 
@@ -55,7 +52,7 @@ namespace LPhone
             try
             {
                 var root = Page.Root.CreatePage("Phone", new Color(0.95f, 0.45f, 0.12f), 0, true);
-                root.CreateFunction("Spawn LPhone 17 PRO MAX", new Color(0.3f, 0.85f, 1f),
+                root.CreateFunction("Spawn LPhone (без паллета)", new Color(0.3f, 0.85f, 1f),
                     (Action)SpawnInFront);
                 root.CreateFunction("Despawn all", new Color(1f, 0.4f, 0.35f),
                     (Action)DespawnAll);
@@ -116,6 +113,8 @@ namespace LPhone
                 }
 
                 var phone = PhoneBuilder.Build(pos, rot);
+                phone.RuntimeBuilt = true;
+                PalletBinder.Register(phone);
                 _phones.Add(phone);
             }
             catch (Exception e)
@@ -126,7 +125,7 @@ namespace LPhone
 
         public static void DespawnAll()
         {
-            foreach (var p in _phones) { PhoneGrab.Forget(p); p.Destroy(); }
+            foreach (var p in _phones) { PhoneGrab.Forget(p); PalletBinder.Forget(p); p.Destroy(); }
             _phones.Clear();
             MelonLogger.Msg("[LPhone] все телефоны убраны");
         }
