@@ -17,10 +17,6 @@ namespace LPhone
     /// </summary>
     internal static class PhoneBuilder
     {
-        /// <summary>Ставить ли SLZ-хват. Компоненты SLZ в рантайме — частая причина
-        /// нативных крашей, поэтому по умолчанию выключено (телефон = физ-предмет).</summary>
-        public static bool EnableGrip = false;
-
         private static Shader _shader;
         private static bool _shaderSearched;
 
@@ -57,18 +53,38 @@ namespace LPhone
             try
             {
                 var rends = UnityEngine.Object.FindObjectsOfType<MeshRenderer>();
+                Shader any = null;
                 if (rends != null)
                 {
                     for (int i = 0; i < rends.Length; i++)
                     {
                         var m = rends[i] != null ? rends[i].sharedMaterial : null;
-                        if (m != null && m.shader != null)
+                        var sh2 = m != null ? m.shader : null;
+                        if (sh2 == null) continue;
+                        string n2 = sh2.name ?? "";
+                        // отсеиваем UI/прозрачные/эффектные — для корпуса нужен обычный Lit
+                        if (n2.IndexOf("UI", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            n2.IndexOf("Dither", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            n2.IndexOf("Particle", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            n2.IndexOf("Text", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            n2.IndexOf("Skybox", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            n2.IndexOf("Decal", StringComparison.OrdinalIgnoreCase) >= 0)
+                        { if (any == null) any = sh2; continue; }
+
+                        if (n2.IndexOf("Lit", StringComparison.OrdinalIgnoreCase) >= 0)
                         {
-                            _shader = m.shader;
-                            MelonLogger.Msg("[LPhone] шейдер взят из сцены: " + _shader.name);
+                            _shader = sh2;
+                            MelonLogger.Msg("[LPhone] шейдер взят из сцены: " + n2);
                             return _shader;
                         }
+                        if (any == null) any = sh2;
                     }
+                }
+                if (any != null)
+                {
+                    _shader = any;
+                    MelonLogger.Msg("[LPhone] шейдер из сцены (запасной): " + any.name);
+                    return _shader;
                 }
             }
             catch (Exception e) { MelonLogger.Warning("[LPhone] поиск шейдера: " + e.Message); }
@@ -194,10 +210,8 @@ namespace LPhone
                 rb.angularDrag = 0.35f;
                 rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
                 rb.interpolation = RigidbodyInterpolation.Interpolate;
-                Step("физика ок");
 
-                if (EnableGrip) TryAddGrip(root, bc);
-                else Step("хват выключен (EnableGrip=false)");
+                Step("физика ок, хват — свой (PhoneGrab)");
             }
             catch (Exception e)
             {
@@ -210,36 +224,6 @@ namespace LPhone
             return inst;
         }
 
-        /// <summary>
-        /// SLZ-хват. Внимание: InteractableHost.Awake() рассчитывает на настройку из SDK
-        /// и в рантайме может уронить игру НАТИВНО (managed try/catch не спасёт).
-        /// Поэтому включается вручную тумблером в меню.
-        /// </summary>
-        private static void TryAddGrip(GameObject root, BoxCollider bc)
-        {
-            try
-            {
-                Step("ставлю BoxGrip");
-                var grip = root.AddComponent<BoxGrip>();
-                try { grip.isThrowable = true; } catch { }
-                try
-                {
-                    var cols = new Il2CppReferenceArray<Collider>(1);
-                    cols[0] = bc;
-                    grip.gripColliders = cols;
-                } catch { }
-
-                Step("ставлю InteractableHost");
-                var host = root.AddComponent<InteractableHost>();
-                try { host.DecorateHostOnChildGrips(root.transform); } catch { }
-
-                MelonLogger.Msg("[LPhone] хват установлен");
-            }
-            catch (Exception e)
-            {
-                MelonLogger.Warning("[LPhone] хват не установлен: " + e.Message);
-            }
-        }
     }
 
     internal sealed class PhoneInstance

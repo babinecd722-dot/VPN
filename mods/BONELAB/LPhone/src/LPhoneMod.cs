@@ -4,7 +4,7 @@ using BoneLib.BoneMenu;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.1.2", "BE PRIME")]
+[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.2.0", "BE PRIME")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace LPhone
@@ -36,6 +36,7 @@ namespace LPhone
                         _ticks++;
                         MelonLogger.Msg($"[LPhone] ... кадр {_ticks}: тач");
                     }
+                    PhoneGrab.Tick(p);
                     if (EnableTouch) TouchInput.Tick(p);
 
                     if (_ticks <= 3) MelonLogger.Msg($"[LPhone] ... кадр {_ticks}: отрисовка");
@@ -66,13 +67,24 @@ namespace LPhone
                         EnableTouch = v;
                         MelonLogger.Msg("[LPhone] тач: " + (v ? "ВКЛ" : "выкл"));
                     }));
-                root.CreateBool("Grip (экспериментально)", new Color(0.9f, 0.8f, 0.2f),
-                    PhoneBuilder.EnableGrip,
+                root.CreateBool("Хват рукой", new Color(0.9f, 0.8f, 0.2f), PhoneGrab.Enabled,
                     (Action<bool>)((v) =>
                     {
-                        PhoneBuilder.EnableGrip = v;
+                        PhoneGrab.Enabled = v;
                         MelonLogger.Msg("[LPhone] хват: " + (v ? "ВКЛ" : "выкл"));
                     }));
+
+                // Позу удержания можно довести прямо на устройстве.
+                var hold = root.CreatePage("Поза в руке", new Color(0.6f, 0.75f, 1f), 0, true);
+                hold.CreateFloat("Выше кисти, см", new Color(0.8f, 0.85f, 1f),
+                    PhoneGrab.HoldUp * 100f, 0.5f, -6f, 12f,
+                    (Action<float>)((v) => PhoneGrab.HoldUp = v / 100f));
+                hold.CreateFloat("Вперёд, см", new Color(0.8f, 0.85f, 1f),
+                    PhoneGrab.HoldForward * 100f, 0.5f, -6f, 12f,
+                    (Action<float>)((v) => PhoneGrab.HoldForward = v / 100f));
+                hold.CreateFloat("Наклон, град", new Color(0.8f, 0.85f, 1f),
+                    PhoneGrab.HoldTilt, 2f, -40f, 40f,
+                    (Action<float>)((v) => PhoneGrab.HoldTilt = v));
             }
             catch (Exception e)
             {
@@ -111,7 +123,7 @@ namespace LPhone
 
         public static void DespawnAll()
         {
-            foreach (var p in _phones) p.Destroy();
+            foreach (var p in _phones) { PhoneGrab.Forget(p); p.Destroy(); }
             _phones.Clear();
             MelonLogger.Msg("[LPhone] все телефоны убраны");
         }
