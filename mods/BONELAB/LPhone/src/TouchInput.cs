@@ -50,8 +50,9 @@ namespace LPhone
             Vector3 bestLocal = Vector3.zero;
             float bestDepth = float.MaxValue;
 
-            foreach (var hand in new[] { BoneLib.Player.LeftHand, BoneLib.Player.RightHand })
+            for (int hi = 0; hi < 2; hi++)
             {
+                var hand = hi == 0 ? BoneLib.Player.LeftHand : BoneLib.Player.RightHand;
                 if (hand == null || hand == holder) continue;
                 int cnt = FillTips(hand);
                 for (int k = 0; k < cnt; k++)

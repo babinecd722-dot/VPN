@@ -66,7 +66,7 @@ namespace LPhone
         private static float _pullingUntil;
 
         // Фронт нажатия хвата, по одному разу за кадр на каждую руку.
-        private static bool _grabR, _grabL, _prevR, _prevL;
+        private static bool _grabR, _grabL, _prevR, _prevL, _evR, _evL;
         private static int _inputFrame = -1;
 
         /// <summary>
@@ -82,8 +82,15 @@ namespace LPhone
             _prevR = _grabR; _prevL = _grabL;
             _grabR = Pressed(BoneLib.Player.RightHand);
             _grabL = Pressed(BoneLib.Player.LeftHand);
+            _evR = PressedEvent(BoneLib.Player.RightHand);
+            _evL = PressedEvent(BoneLib.Player.LeftHand);
         }
 
+        /// <summary>
+        /// Хват УДЕРЖИВАЕТСЯ. Именно сила сжатия, а не isGrabInputPressedFinal:
+        /// то поле — событие «нажали» и живёт один кадр, поэтому на нём телефон
+        /// нельзя было ни взять, ни удержать.
+        /// </summary>
         private static bool Pressed(Hand hand)
         {
             if (hand == null) return false;
@@ -91,9 +98,22 @@ namespace LPhone
             {
                 var c = hand.Controller;
                 if (c == null) return false;
-                bool grab = c.isGrabInputPressedFinal;
+                float g = Mathf.Max(c._gripForce, c._solvedGrip);
+                bool grab = g >= 0.25f;
                 if (RequireTrigger) grab = grab && c._primaryInteractionButton;
                 return grab;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>Штатное событие «хват нажали» — для притягивания.</summary>
+        private static bool PressedEvent(Hand hand)
+        {
+            if (hand == null) return false;
+            try
+            {
+                var c = hand.Controller;
+                return c != null && c.isGrabInputPressedFinal;
             }
             catch { return false; }
         }
@@ -106,9 +126,10 @@ namespace LPhone
         /// <summary>Хват зажат сейчас.</summary>
         private static bool GrabHeld(Hand h) => IsRightHand(h) ? _grabR : _grabL;
 
-        /// <summary>Хват нажали именно в этом кадре.</summary>
+        /// <summary>Хват нажали именно в этом кадре: либо штатное событие SLZ,
+        /// либо переход силы сжатия через порог.</summary>
         private static bool GrabDown(Hand h) =>
-            IsRightHand(h) ? (_grabR && !_prevR) : (_grabL && !_prevL);
+            IsRightHand(h) ? (_evR || (_grabR && !_prevR)) : (_evL || (_grabL && !_prevL));
 
         public static bool IsHeld(PhoneInstance p) =>
             p?.Root != null && _held.ContainsKey(p.Root.GetInstanceID());
@@ -169,8 +190,9 @@ namespace LPhone
                 var root = phone.Root.transform;
                 var col = phone.Root.GetComponent<Collider>();
 
-                foreach (var hand in new[] { BoneLib.Player.RightHand, BoneLib.Player.LeftHand })
+                for (int hi = 0; hi < 2; hi++)
                 {
+                    var hand = hi == 0 ? BoneLib.Player.RightHand : BoneLib.Player.LeftHand;
                     if (hand == null) continue;
 
                     var f = HandFrame.Of(hand);

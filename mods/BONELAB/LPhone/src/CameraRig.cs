@@ -6,18 +6,24 @@ namespace LPhone
 {
     /// <summary>
     /// Камера телефона: Unity-камера на корпусе рисует в RenderTexture,
-    /// а кадр видоискателя читается в наш программный буфер.
+    /// а видоискатель — квад поверх экрана, показывающий эту текстуру напрямую.
     ///
-    /// Главное про производительность. Включённая камера заставляет URP гонять
-    /// ВСЮ сцену ещё раз каждый кадр — при 72 FPS это 72 лишних прохода рендера
-    /// в секунду, отчего игра и падала до одного кадра. Поэтому камера живёт
-    /// ровно один кадр на каждый снимок видоискателя: включаем, на следующем
-    /// кадре забираем готовую текстуру и сразу гасим. Восемь проходов в секунду
-    /// вместо семидесяти двух.
+    /// Две вещи, которые роняли FPS, и почему сделано именно так.
     ///
-    /// Квада с RenderTexture здесь нет намеренно: он зависел и от свойств
-    /// занятого у сцены шейдера SLZ/LitMAS, и от того, рисует ли URP нашу
-    /// камеру, и оставался чёрным. Чтение пикселей от этого не зависит.
+    /// Первое: включённая камера заставляет URP гонять ВСЮ сцену ещё раз каждый
+    /// кадр — при 72 FPS это 72 лишних прохода рендера в секунду. Поэтому
+    /// камера живёт ровно один кадр на обновление: включаем, на следующем кадре
+    /// гасим. Между обновлениями RenderTexture хранит последний кадр, и квад
+    /// продолжает его показывать.
+    ///
+    /// Второе: ReadPixels. На тайловом GPU Quest это принудительная
+    /// синхронизация — конвейер встаёт и ждёт завершения рендера. В видоискателе
+    /// его больше нет вообще: квад берёт текстуру напрямую, без единого
+    /// прочитанного пикселя. Читаем ровно один раз — в момент снимка.
+    ///
+    /// Раньше квад оставался чёрным не из-за шейдера, а потому что камера тогда
+    /// вообще не рисовала: стояло enabled = false, а Camera.Render() в URP
+    /// не поддерживается. Текстура просто была пустой.
     /// </summary>
     internal sealed class CameraRig
     {
@@ -31,16 +37,14 @@ namespace LPhone
         private const int VideoW = 96, VideoH = 128;
 
         private readonly PhoneInstance _phone;
-        private GameObject _camGo;
+        private GameObject _camGo, _quad;
         private Camera _cam;
+        private Material _quadMat;
         private RenderTexture _rt, _smallRt;
         private Texture2D _read, _small;
         private float _nextShot, _nextVideo;
-        private bool _on, _diagDone;
+        private bool _on;
         private int _phase;                 // 0 — ждём, 1 — камера включена на кадр
-
-        /// <summary>Последний кадр видоискателя. Буфер переиспользуется.</summary>
-        public TexData Preview { get; private set; }
 
         public bool Front;                 // селфи-камера
         public int Lens = 1;               // 0 = 0.5x, 1 = 1x, 2 = 3x
@@ -53,8 +57,8 @@ namespace LPhone
 
         // ─────────────── жизненный цикл ───────────────
 
-        /// <summary>Приложение открыто. Саму камеру пока НЕ включаем.</summary>
-        public void Enable()
+        /// <summary>Приложение открыто: показываем квад, камеру включаем импульсами.</summary>
+        public void Enable(bool viewfinder = true)
         {
             try
             {
@@ -63,6 +67,7 @@ namespace LPhone
                 _on = true;
                 _nextShot = 0f;
                 Place();
+                if (_quad != null && _quad.activeSelf != viewfinder) _quad.SetActive(viewfinder);
             }
             catch (Exception e) { MelonLogger.Warning("[LPhone] камера вкл: " + e.Message); }
         }
@@ -72,13 +77,15 @@ namespace LPhone
             _on = false;
             _phase = 0;
             try { if (_cam != null) _cam.enabled = false; } catch { }
+            try { if (_quad != null) _quad.SetActive(false); } catch { }
         }
 
         public void Destroy()
         {
             try { if (_camGo != null) UnityEngine.Object.Destroy(_camGo); } catch { }
+            try { if (_quad != null) UnityEngine.Object.Destroy(_quad); } catch { }
             Release(ref _rt); Release(ref _smallRt);
-            _camGo = null; _cam = null;
+            _camGo = null; _cam = null; _quad = null;
         }
 
         private static void Release(ref RenderTexture rt)
@@ -125,7 +132,64 @@ namespace LPhone
             }
             catch { }
 
+            BuildQuad();
             MelonLogger.Msg("[LPhone] камера создана");
+        }
+
+        /// <summary>
+        /// Квад видоискателя ровно поверх области предпросмотра. Материал
+        /// настраиваем так же, как экран телефона — там этот путь работает,
+        /// значит и здесь текстура покажется.
+        /// </summary>
+        private void BuildQuad()
+        {
+            var parent = _phone.ScreenTransform != null ? _phone.ScreenTransform : _phone.Root.transform;
+            Vector3 c = _phone.ScreenCenter;
+
+            float top = c.y + Phone.ScreenH * (0.5f - VfTop / 1600f);
+            float bottom = c.y + Phone.ScreenH * (0.5f - (VfTop + VfH) / 1600f);
+            float hw = Phone.ScreenW * 0.5f;
+            float z = c.z + 0.0006f;
+
+            var mesh = new Mesh { hideFlags = HideFlags.HideAndDontSave };
+            mesh.vertices = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Vector3>(new[]
+            {
+                new Vector3(-hw, bottom, z), new Vector3(hw, bottom, z),
+                new Vector3( hw, top,    z), new Vector3(-hw, top,   z),
+            });
+            // UV зеркалим по горизонтали: игрок смотрит на экран со стороны +Z,
+            // где ось +X меша идёт для него влево — как и у самого экрана.
+            mesh.uv = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Vector2>(new[]
+            {
+                new Vector2(1f, 0f), new Vector2(0f, 0f),
+                new Vector2(0f, 1f), new Vector2(1f, 1f),
+            });
+            mesh.triangles = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<int>(
+                new[] { 0, 2, 1, 0, 3, 2 });
+            mesh.RecalculateNormals();
+            mesh.RecalculateBounds();
+
+            _quad = new GameObject("LPhone_Viewfinder");
+            _quad.transform.SetParent(parent, false);
+            _quad.transform.localPosition = Vector3.zero;
+            _quad.transform.localRotation = Quaternion.identity;
+            _quad.layer = parent.gameObject.layer;
+            _quad.AddComponent<MeshFilter>().sharedMesh = mesh;
+
+            var sh = PhoneBuilder.GetShader();
+            if (sh != null)
+            {
+                _quadMat = new Material(sh) { hideFlags = HideFlags.HideAndDontSave };
+                try { _quadMat.mainTexture = _rt; } catch { }
+                try { _quadMat.SetTexture("_BaseMap", _rt); } catch { }
+                try { _quadMat.EnableKeyword("_EMISSION"); } catch { }
+                try { _quadMat.SetTexture("_EmissionMap", _rt); } catch { }
+                try { _quadMat.SetColor("_EmissionColor", Color.white); } catch { }
+                try { _quadMat.SetFloat("_Metallic", 0f); } catch { }
+                try { _quadMat.SetFloat("_Smoothness", 0f); } catch { }
+                _quad.AddComponent<MeshRenderer>().sharedMaterial = _quadMat;
+            }
+            _quad.SetActive(false);
         }
 
         private void Place()
@@ -160,29 +224,36 @@ namespace LPhone
         // ─────────────── видоискатель ───────────────
 
         /// <summary>
-        /// Двухтактный цикл: на одном кадре включаем камеру, на следующем
-        /// забираем результат и гасим. true — появился новый кадр.
+        /// Двухтактный импульс: на одном кадре включаем камеру, на следующем
+        /// гасим. Пиксели не читаются — картинку показывает квад напрямую.
         /// </summary>
-        public bool UpdatePreview(float hz = 8f)
+        public void Pulse(float hz = 8f)
         {
-            if (_cam == null || !_on) return false;
+            if (_cam == null || !_on) return;
 
             if (_phase == 1)
             {
                 _phase = 0;
                 _cam.enabled = false;         // один проход рендера — и хватит
-                return ReadPreview();
+                return;
             }
 
-            if (Time.unscaledTime < _nextShot) return false;
+            if (Time.unscaledTime < _nextShot) return;
             _nextShot = Time.unscaledTime + 1f / Mathf.Max(1f, hz);
             _cam.enabled = true;
             _phase = 1;
-            return false;
         }
 
-        private bool ReadPreview()
+        // ─────────────── снимок ───────────────
+
+        /// <summary>
+        /// Спуск затвора. Берём последний кадр видоискателя — он не старше
+        /// одной восьмой секунды. Кодируем ТОЛЬКО в JPEG: PNG на 110 тысяч
+        /// пикселей кодируется десятки миллисекунд и давал заметный фриз.
+        /// </summary>
+        public Photo Capture()
         {
+            if (_rt == null) return null;
             try
             {
                 if (_read == null)
@@ -195,49 +266,6 @@ namespace LPhone
                 _read.Apply(false);
                 RenderTexture.active = prev;
 
-                // пишем в тот же буфер — иначе каждый кадр в мусор уходит 440 КБ
-                Preview = TexData.Reuse(Preview, _read);
-                Diagnose();
-                return true;
-            }
-            catch (Exception e)
-            {
-                MelonLogger.Warning("[LPhone] видоискатель: " + e.Message);
-                return false;
-            }
-        }
-
-        /// <summary>
-        /// Разовая проверка первого кадра. Если он полностью чёрный, значит URP
-        /// не отрисовала нашу камеру — пишем это в лог, иначе «чёрный экран»
-        /// не отличить от «в кадре темно».
-        /// </summary>
-        private void Diagnose()
-        {
-            if (_diagDone || Preview == null) return;
-            _diagDone = true;
-
-            long sum = 0;
-            var px = Preview.Pixels;
-            for (int i = 0; i < px.Length; i += 97) sum += px[i].r + px[i].g + px[i].b;
-            int n = (px.Length + 96) / 97;
-            float avg = n > 0 ? sum / (float)(n * 3) : 0f;
-            MelonLogger.Msg($"[LPhone] видоискатель: средняя яркость {avg:0.0}/255");
-            if (avg <= 1.5f) MelonLogger.Warning("[LPhone] кадр пустой — URP не рисует нашу камеру");
-        }
-
-        // ─────────────── снимок ───────────────
-
-        /// <summary>
-        /// Спуск затвора. Берём последний кадр видоискателя — он не старше
-        /// одной восьмой секунды. Кодируем ТОЛЬКО в JPEG: PNG на 110 тысяч
-        /// пикселей кодируется десятки миллисекунд и давал заметный фриз.
-        /// </summary>
-        public Photo Capture()
-        {
-            if (_read == null) return null;
-            try
-            {
                 var jpg = Jpeg.EncodeJpg(_read, 88);
                 var data = TexData.FromTexture(_read);
                 if (data == null) return null;
@@ -255,7 +283,7 @@ namespace LPhone
         /// <summary>Маленький JPEG для видеозвонка.</summary>
         public byte[] VideoFrame(float hz = 4f)
         {
-            if (_cam == null || !_on || _read == null) return null;
+            if (_cam == null || !_on || _rt == null) return null;
             if (Time.unscaledTime < _nextVideo) return null;
             _nextVideo = Time.unscaledTime + 1f / Mathf.Max(1f, hz);
 

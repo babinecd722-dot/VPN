@@ -4,7 +4,7 @@ using BoneLib.BoneMenu;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.5.0", "BE PRIME")]
+[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.5.1", "BE PRIME")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 [assembly: MelonOptionalDependencies("LabFusion")]
 
@@ -19,7 +19,7 @@ namespace LPhone
         {
             BuildMenu();
             PalletBinder.Install(HarmonyInstance);
-            MelonLogger.Msg("[LPhone] загружен v0.5.0");
+            MelonLogger.Msg("[LPhone] загружен v0.5.1");
             MelonLogger.Msg("[LPhone] Telegram: @be_primex");
         }
 

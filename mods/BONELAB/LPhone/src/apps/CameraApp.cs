@@ -30,8 +30,10 @@ namespace LPhone
 
         public override void Tick()
         {
-            // новый кадр видоискателя — только тогда и перерисовываем экран
-            if (OS.Cam != null && OS.Cam.UpdatePreview(8f)) OS.Invalidate();
+            // Камере даём импульс, экран НЕ трогаем: картинку показывает квад,
+            // а вокруг него интерфейс статичен. Раньше каждый новый кадр
+            // видоискателя тянул за собой полную перерисовку экрана.
+            OS.Cam?.Pulse(8f);
             if (_flash > 0f) { _flash -= Time.deltaTime * 3.5f; OS.Invalidate(); }
             if (_toastUntil > 0f && Time.unscaledTime > _toastUntil) { _toastUntil = 0f; OS.Invalidate(); }
         }
@@ -48,19 +50,12 @@ namespace LPhone
             G.Clear(new Color32(6, 6, 8, 255));
             OS.DrawStatusBar();
 
-            // кадр видоискателя
+            // Под областью видоискателя — просто чёрный фон: поверх неё стоит
+            // квад с текстурой камеры, рисовать сюда пиксели не нужно.
             int vy = P(CameraRig.VfTop), vh = P(CameraRig.VfH);
-            var frame = OS.Cam != null ? OS.Cam.Preview : null;
-            if (frame != null)
-            {
-                G.BlitOpaque(frame, 0, vy, W, vh);
-            }
-            else
-            {
-                G.Rect(0, vy, W, vh, new Color32(0, 0, 0, 255));
-                G.Text(OS.Cam != null && OS.Cam.Ready ? "Наводим…" : "Камера недоступна",
-                       W / 2, vy + vh / 2, 0.42f * K, UI.Dim, Gfx.Align.Center);
-            }
+            G.Rect(0, vy, W, vh, new Color32(0, 0, 0, 255));
+            if (OS.Cam == null || !OS.Cam.Ready)
+                G.Text("Камера недоступна", W / 2, vy + vh / 2, 0.42f * K, UI.Dim, Gfx.Align.Center);
 
             var corner = new Color32(255, 255, 255, 120);
             int cl = P(36), th = Mathf.Max(2, P(5));

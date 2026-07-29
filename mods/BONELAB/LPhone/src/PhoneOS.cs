@@ -164,7 +164,7 @@ namespace LPhone
 
                 if (_need && Time.unscaledTime >= _nextPaint)
                 {
-                    _nextPaint = Time.unscaledTime + 1f / 24f;
+                    _nextPaint = Time.unscaledTime + (_dragging ? 1f / 10f : 1f / 15f);
                     _need = false;
                     Paint();
                 }
@@ -263,8 +263,8 @@ namespace LPhone
 
             if (LNet.State == CallState.Active && LNet.CamOn && Cam != null)
             {
-                Cam.Enable();
-                Cam.UpdatePreview(4f);          // камера живёт по одному кадру
+                Cam.Enable(false);              // без видоискателя: идёт звонок
+                Cam.Pulse(4f);                  // камера живёт по одному кадру
                 var jpg = Cam.VideoFrame(4f);
                 if (jpg != null) LNet.SendVideoFrame(jpg);
             }
