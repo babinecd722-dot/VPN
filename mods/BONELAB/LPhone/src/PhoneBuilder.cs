@@ -140,6 +140,58 @@ namespace LPhone
             return m;
         }
 
+        private static bool _layersLogged;
+
+        /// <summary>
+        /// Ставим телефону тот же слой физики, что у настоящих пропов игры.
+        /// Слой берём у любого InteractableHost в сцене — это ровно тот слой,
+        /// на котором лежат хватаемые предметы (гадать по именам не нужно).
+        /// Компонент только ИЩЕМ, не добавляем — добавление роняет игру.
+        /// </summary>
+        private static void ApplyPropLayer(GameObject root)
+        {
+            try
+            {
+                if (!_layersLogged)
+                {
+                    _layersLogged = true;
+                    var sb = new System.Text.StringBuilder();
+                    for (int i = 0; i < 32; i++)
+                    {
+                        string n = LayerMask.LayerToName(i);
+                        if (!string.IsNullOrEmpty(n)) sb.Append(i).Append('=').Append(n).Append("  ");
+                    }
+                    MelonLogger.Msg("[LPhone] слои: " + sb);
+                }
+
+                int layer = -1;
+                var host = UnityEngine.Object.FindObjectOfType<InteractableHost>();
+                if (host != null)
+                {
+                    layer = host.gameObject.layer;
+                    Step($"слой пропа взят у InteractableHost: {layer} ({LayerMask.LayerToName(layer)})");
+                }
+                else
+                {
+                    foreach (var n in new[] { "Dynamic", "Prop", "Interactable", "Default" })
+                    {
+                        int l = LayerMask.NameToLayer(n);
+                        if (l >= 0) { layer = l; Step($"слой по имени: {n} ({l})"); break; }
+                    }
+                }
+
+                if (layer >= 0) SetLayerRecursive(root.transform, layer);
+                else Step("слой не определён — остаётся Default");
+            }
+            catch (Exception e) { MelonLogger.Warning("[LPhone] слой: " + e.Message); }
+        }
+
+        private static void SetLayerRecursive(Transform t, int layer)
+        {
+            t.gameObject.layer = layer;
+            for (int i = 0; i < t.childCount; i++) SetLayerRecursive(t.GetChild(i), layer);
+        }
+
         public static PhoneInstance Build(Vector3 position, Quaternion rotation)
         {
             Step("старт сборки");
@@ -210,6 +262,8 @@ namespace LPhone
                 rb.angularDrag = 0.35f;
                 rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
                 rb.interpolation = RigidbodyInterpolation.Interpolate;
+
+                ApplyPropLayer(root);
 
                 Step("физика ок, хват — свой (PhoneGrab)");
             }

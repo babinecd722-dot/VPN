@@ -4,7 +4,7 @@ using BoneLib.BoneMenu;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.2.0", "BE PRIME")]
+[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.2.1", "BE PRIME")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace LPhone
@@ -73,6 +73,9 @@ namespace LPhone
                         PhoneGrab.Enabled = v;
                         MelonLogger.Msg("[LPhone] хват: " + (v ? "ВКЛ" : "выкл"));
                     }));
+
+                root.CreateBool("Притягивание", new Color(0.5f, 0.8f, 1f), PhoneGrab.PullEnabled,
+                    (Action<bool>)((v) => PhoneGrab.PullEnabled = v));
 
                 // Позу удержания можно довести прямо на устройстве.
                 var hold = root.CreatePage("Поза в руке", new Color(0.6f, 0.75f, 1f), 0, true);

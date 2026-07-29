@@ -28,7 +28,12 @@ namespace LPhone
         public static float HoldForward = 0.020f;   // вынос вперёд от кулака
         public static float HoldTilt    = 12f;      // наклон верха от себя, градусы
 
-        private const float GrabRange  = 0.20f;
+        private const float GrabRange  = 0.13f;     // от ПОВЕРХНОСТИ корпуса, а не от центра
+        // Притягивание: наводишь раскрытой рукой и сжимаешь кулак
+        public static bool  PullEnabled = true;
+        private const float PullRange   = 6f;
+        private const float PullAngle   = 30f;      // конус наведения, градусы
+        private const float PullSpeed   = 7f;
         private const float GripOn     = 0.55f;     // порог сжатия
         private const float GripOff    = 0.35f;     // гистерезис отпускания
         private const float BlendTime  = 0.12f;     // плавная доводка в позу
@@ -56,8 +61,20 @@ namespace LPhone
         {
             if (!Enabled || phone == null || !phone.Alive) return;
             int id = phone.Root.GetInstanceID();
-            if (_held.TryGetValue(id, out var h)) HoldTick(phone, h, id);
-            else TryGrab(phone, id);
+            if (_held.TryGetValue(id, out var h)) { HoldTick(phone, h, id); return; }
+
+            TryGrab(phone, id);
+
+            // притягивание закончилось — возвращаем гравитацию
+            if (Time.time > _pullingUntil)
+            {
+                try
+                {
+                    var rb = phone.Root.GetComponent<Rigidbody>();
+                    if (rb != null && !rb.isKinematic && !rb.useGravity) rb.useGravity = true;
+                }
+                catch { }
+            }
         }
 
         /// <summary>Сила сжатия кулака 0..1.</summary>
@@ -105,17 +122,29 @@ namespace LPhone
             try
             {
                 var root = phone.Root.transform;
+                var col = phone.Root.GetComponent<Collider>();
                 foreach (var hand in new[] { BoneLib.Player.RightHand, BoneLib.Player.LeftHand })
                 {
                     if (hand == null) continue;
                     try { if (BoneLib.Player.GetObjectInHand(hand) != null) continue; } catch { }
 
                     var ht = hand.transform;
-                    if (Vector3.Distance(ht.position, root.position) > GrabRange) continue;
-                    if (GripAmount(hand) < GripOn) continue;
+                    float grip = GripAmount(hand);
+
+                    // расстояние до ПОВЕРХНОСТИ телефона — брать можно за любой край
+                    float dist;
+                    try { dist = Vector3.Distance(ht.position, col != null ? col.ClosestPoint(ht.position) : root.position); }
+                    catch { dist = Vector3.Distance(ht.position, root.position); }
+
+                    if (dist > GrabRange)
+                    {
+                        if (grip >= GripOn) TryPull(phone, hand, dist);
+                        continue;
+                    }
+                    if (grip < GripOn) continue;
 
                     var rb = phone.Root.GetComponent<Rigidbody>();
-                    if (rb != null) { rb.isKinematic = true; rb.detectCollisions = false; }
+                    if (rb != null) { rb.useGravity = true; rb.isKinematic = true; rb.detectCollisions = false; }
 
                     // целевая поза
                     Vector3 lp; Quaternion lr;
@@ -146,6 +175,39 @@ namespace LPhone
             }
             catch (Exception e) { MelonLogger.Warning("[LPhone] захват: " + e.Message); }
         }
+
+        /// <summary>
+        /// Притягивание: раскрытой рукой наводишься на телефон и сжимаешь кулак —
+        /// он летит в ладонь. Это наш аналог force pull (штатный ForcePullGrip от SLZ
+        /// нам недоступен: его компонент нельзя добавить в рантайме).
+        /// </summary>
+        private static void TryPull(PhoneInstance phone, Hand hand, float dist)
+        {
+            if (!PullEnabled || dist > PullRange) return;
+            try
+            {
+                var ht = hand.transform;
+                var root = phone.Root.transform;
+                Vector3 to = root.position - ht.position;
+                if (to.sqrMagnitude < 1e-6f) return;
+
+                // наводимся ладонью: телефон должен быть в конусе перед рукой
+                if (Vector3.Angle(ht.forward, to.normalized) > PullAngle) return;
+
+                var rb = phone.Root.GetComponent<Rigidbody>();
+                if (rb == null || rb.isKinematic) return;
+
+                rb.useGravity = false;
+                Vector3 target = ht.position + ht.forward * 0.05f;
+                Vector3 dir = (target - root.position);
+                rb.velocity = dir.normalized * Mathf.Min(PullSpeed, dir.magnitude * 6f + 1f);
+                rb.angularVelocity *= 0.85f;
+                _pullingUntil = Time.time + 0.15f;
+            }
+            catch { }
+        }
+
+        private static float _pullingUntil;
 
         private static void HoldTick(PhoneInstance phone, Held h, int id)
         {
