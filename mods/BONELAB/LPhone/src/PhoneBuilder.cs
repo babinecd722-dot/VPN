@@ -164,20 +164,13 @@ namespace LPhone
                     MelonLogger.Msg("[LPhone] слои: " + sb);
                 }
 
+                // Физические пропы BONELAB живут на слое Dynamic. Эвристика «взять слой
+                // у первого InteractableHost» дала Default — она ненадёжна, берём по имени.
                 int layer = -1;
-                var host = UnityEngine.Object.FindObjectOfType<InteractableHost>();
-                if (host != null)
+                foreach (var n in new[] { "Dynamic", "Interactable" })
                 {
-                    layer = host.gameObject.layer;
-                    Step($"слой пропа взят у InteractableHost: {layer} ({LayerMask.LayerToName(layer)})");
-                }
-                else
-                {
-                    foreach (var n in new[] { "Dynamic", "Prop", "Interactable", "Default" })
-                    {
-                        int l = LayerMask.NameToLayer(n);
-                        if (l >= 0) { layer = l; Step($"слой по имени: {n} ({l})"); break; }
-                    }
+                    int l = LayerMask.NameToLayer(n);
+                    if (l >= 0) { layer = l; Step($"слой: {n} ({l})"); break; }
                 }
 
                 if (layer >= 0) SetLayerRecursive(root.transform, layer);

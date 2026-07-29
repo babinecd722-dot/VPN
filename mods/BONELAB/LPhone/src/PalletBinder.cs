@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using HarmonyLib;
+using Il2CppSLZ.Marrow.Interaction;
 using MelonLoader;
 using UnityEngine;
 
@@ -19,8 +21,9 @@ namespace LPhone
     {
         public const string ScreenName = "Screen_UI_Anchor";
 
-        private const float ScanInterval = 0.5f;
-        private static float _nextScan;
+        // Очередь сущностей, пришедших из хука MarrowEntity.Awake.
+        private static readonly Queue<GameObject> _pending = new Queue<GameObject>();
+        private static bool _hooked;
 
         private static readonly Dictionary<int, PhoneInstance> _bound =
             new Dictionary<int, PhoneInstance>();
@@ -39,12 +42,40 @@ namespace LPhone
             if (phone?.Root != null) _bound.Remove(phone.Root.GetInstanceID());
         }
 
-        /// <summary>Периодически ищем новые телефоны из паллета и оживляем их экран.</summary>
+        /// <summary>
+        /// Ставим хук на появление сущностей Marrow. Раньше здесь был периодический
+        /// FindObjectsOfType&lt;MeshFilter&gt;() — в сцене BONELAB их тысячи, и это
+        /// давало просадку каждые полсекунды. Теперь стоимость нулевая: реагируем
+        /// только на реальный спавн.
+        /// </summary>
+        public static void Install(HarmonyLib.Harmony harmony)
+        {
+            if (_hooked || harmony == null) return;
+            try
+            {
+                var m = AccessTools.Method(typeof(MarrowEntity), "Awake");
+                if (m == null) { MelonLogger.Warning("[LPhone] MarrowEntity.Awake не найден"); return; }
+                harmony.Patch(m, postfix: new HarmonyMethod(typeof(PalletBinder), nameof(OnEntityAwake)));
+                _hooked = true;
+                MelonLogger.Msg("[LPhone] хук спавна паллета установлен");
+            }
+            catch (Exception e) { MelonLogger.Warning("[LPhone] хук спавна: " + e.Message); }
+        }
+
+        private static void OnEntityAwake(MarrowEntity __instance)
+        {
+            try
+            {
+                if (__instance == null) return;
+                var go = __instance.gameObject;
+                if (go != null) _pending.Enqueue(go);      // связываем в следующем кадре
+            }
+            catch { }
+        }
+
+        /// <summary>Разбираем очередь спавнов и подчищаем уничтоженные телефоны.</summary>
         public static void Scan()
         {
-            if (Time.unscaledTime < _nextScan) return;
-            _nextScan = Time.unscaledTime + ScanInterval;
-
             // подчищаем уничтоженные
             List<int> dead = null;
             foreach (var kv in _bound)
@@ -52,35 +83,34 @@ namespace LPhone
             if (dead != null)
                 foreach (var k in dead) _bound.Remove(k);
 
-            try
+            while (_pending.Count > 0)
             {
-                var filters = UnityEngine.Object.FindObjectsOfType<MeshFilter>();
-                if (filters == null) return;
-
-                for (int i = 0; i < filters.Length; i++)
+                var go = _pending.Dequeue();
+                try
                 {
-                    var mf = filters[i];
-                    if (mf == null || mf.gameObject == null) continue;
-                    if (!string.Equals(mf.gameObject.name, ScreenName, StringComparison.Ordinal)) continue;
+                    if (go == null) continue;
 
-                    // корень телефона = объект с Rigidbody выше по иерархии
-                    Transform root = mf.transform;
-                    var rb = mf.GetComponentInParent<Rigidbody>();
+                    // ищем экран ТОЛЬКО внутри заспавненной сущности — это дёшево
+                    Transform screen = null;
+                    foreach (var t in go.GetComponentsInChildren<Transform>(true))
+                    {
+                        if (t != null && string.Equals(t.name, ScreenName, StringComparison.Ordinal))
+                        { screen = t; break; }
+                    }
+                    if (screen == null) continue;
+
+                    Transform root = go.transform;
+                    var rb = go.GetComponentInParent<Rigidbody>();
                     if (rb != null) root = rb.transform;
-                    else if (root.parent != null) root = root.parent;
 
                     int id = root.gameObject.GetInstanceID();
                     if (_bound.ContainsKey(id)) continue;
 
-                    var rend = mf.GetComponent<Renderer>();
-                    var phone = new PhoneInstance(root.gameObject, rend, mf.transform);
+                    var phone = new PhoneInstance(root.gameObject, screen.GetComponent<Renderer>(), screen);
                     _bound[id] = phone;
                     MelonLogger.Msg($"[LPhone] подхвачен телефон из паллета: {root.name}");
                 }
-            }
-            catch (Exception e)
-            {
-                MelonLogger.Warning("[LPhone] скан паллета: " + e.Message);
+                catch (Exception e) { MelonLogger.Warning("[LPhone] привязка: " + e.Message); }
             }
         }
     }

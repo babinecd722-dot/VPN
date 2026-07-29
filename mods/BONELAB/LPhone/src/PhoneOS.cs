@@ -26,6 +26,7 @@ namespace LPhone
         private bool _dragging;
         private Vector2 _dragStart, _dragNow;
         private float _unlockProgress;
+        private float _nextDragPaint;
 
         public readonly List<AppEntry> Installed = new List<AppEntry>();
 
@@ -119,7 +120,12 @@ namespace LPhone
             {
                 float dy = _dragStart.y - p.y;                 // вверх = положительно
                 _unlockProgress = Mathf.Clamp01(dy / P(420));
-                Repaint();
+                // перерисовка экрана дорогая — во время свайпа ограничиваем частоту
+                if (Time.unscaledTime >= _nextDragPaint)
+                {
+                    _nextDragPaint = Time.unscaledTime + 0.033f;
+                    Repaint();
+                }
             }
         }
 

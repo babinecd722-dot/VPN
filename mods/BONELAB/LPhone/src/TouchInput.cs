@@ -11,15 +11,16 @@ namespace LPhone
     /// </summary>
     internal static class TouchInput
     {
-        private const float TouchDepth  = 0.006f;   // насколько глубоко палец «продавил» экран
-        private const float HoverDepth  = 0.030f;   // на каком расстоянии уже следим
+        private const float TouchDepth  = 0.008f;   // насколько глубоко палец «продавил» экран
+        private const float HoverDepth  = 0.045f;   // на каком расстоянии уже следим
+        private const float FingerTipExt = 0.022f;  // от кости index3 до подушечки
         private static bool _down;
 
         public static void Tick(PhoneInstance phone)
         {
             if (phone == null || !phone.Alive || phone.ScreenTransform == null) return;
 
-            if (!TryFingerTip(out Vector3 tip))
+            if (!TryFingerTip(phone, out Vector3 tip))
             {
                 if (_down) { _down = false; }
                 return;
@@ -61,29 +62,55 @@ namespace LPhone
             return new Vector2(u * Phone.ScreenPxW, (1f - v) * Phone.ScreenPxH);
         }
 
-        /// <summary>Кончик указательного пальца ближайшей руки.</summary>
-        private static bool TryFingerTip(out Vector3 tip)
+        /// <summary>
+        /// Кончик указательного пальца руки, которая БЛИЖЕ К ЭКРАНУ.
+        /// Берём настоящие кости (index2 -> index3) и продлеваем на подушечку —
+        /// это точнее, чем прикидывать смещение от ладони, и не зависит от того,
+        /// как ориентированы оси кисти.
+        /// </summary>
+        private static bool TryFingerTip(PhoneInstance phone, out Vector3 tip)
         {
             tip = Vector3.zero;
             try
             {
-                var rig = BoneLib.Player.RigManager;
-                if (rig == null) return false;
+                Vector3 screenPos = phone.ScreenTransform.position;
+                float best = float.MaxValue;
+                bool found = false;
 
-                Hand best = null;
-                float bestD = float.MaxValue;
                 foreach (var h in new[] { BoneLib.Player.LeftHand, BoneLib.Player.RightHand })
                 {
                     if (h == null) continue;
-                    float d = h.transform.position.sqrMagnitude;
-                    if (d < bestD) { bestD = d; best = h; }
+                    if (!TipOf(h, out Vector3 t)) continue;
+                    float d = (t - screenPos).sqrMagnitude;
+                    if (d < best) { best = d; tip = t; found = true; }
                 }
-                if (best == null) return false;
+                return found;
+            }
+            catch { return false; }
+        }
 
-                // указательный: смещение вперёд от ладони
-                tip = best.transform.position
-                    + best.transform.forward * 0.075f
-                    + best.transform.up * 0.005f;
+        private static bool TipOf(Hand hand, out Vector3 tip)
+        {
+            tip = Vector3.zero;
+            try
+            {
+                var anim = hand.Animator;
+                if (anim != null)
+                {
+                    var i3 = anim.index3;
+                    var i2 = anim.index2;
+                    if (i3 != null)
+                    {
+                        Vector3 dir = (i2 != null)
+                            ? (i3.position - i2.position)
+                            : hand.transform.forward;
+                        if (dir.sqrMagnitude < 1e-8f) dir = hand.transform.forward;
+                        tip = i3.position + dir.normalized * FingerTipExt;
+                        return true;
+                    }
+                }
+                // запас, если анимации пальцев нет
+                tip = hand.transform.position + hand.transform.forward * 0.075f;
                 return true;
             }
             catch { return false; }
