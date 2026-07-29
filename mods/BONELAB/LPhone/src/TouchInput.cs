@@ -15,9 +15,10 @@ namespace LPhone
     /// </summary>
     internal static class TouchInput
     {
-        private const float TouchDepth = 0.010f;   // палец продавил стекло
-        private const float HoverDepth = 0.055f;   // ближе этого уже следим
-        private const float ThroughDepth = -0.040f; // пролетел насквозь — не касание
+        // Всё считается от плоскости стекла (см. PhoneInstance.ScreenCenter).
+        private const float TouchDepth = 0.006f;    // палец коснулся стекла
+        private const float HoverDepth = 0.045f;    // ближе этого уже следим
+        private const float ThroughDepth = -0.030f; // пролетел насквозь — не касание
         private const float TipExt = 0.014f;       // от последней фаланги до подушечки
         private const float EdgePad = 0.004f;      // допуск за краем экрана
 
@@ -55,7 +56,10 @@ namespace LPhone
                 int cnt = FillTips(hand);
                 for (int k = 0; k < cnt; k++)
                 {
-                    Vector3 lp = phone.ScreenTransform.InverseTransformPoint(_tips[k]);
+                    // Вершины экрана запечены со смещением, поэтому и границы,
+                    // и глубину считаем от фактического центра плоскости.
+                    Vector3 lp = phone.ScreenTransform.InverseTransformPoint(_tips[k])
+                                 - phone.ScreenCenter;
                     if (Mathf.Abs(lp.x) > Phone.ScreenW * 0.5f + EdgePad) continue;
                     if (Mathf.Abs(lp.y) > Phone.ScreenH * 0.5f + EdgePad) continue;
                     if (lp.z > HoverDepth || lp.z < ThroughDepth) continue;

@@ -228,20 +228,21 @@ namespace LPhone
         }
 
         /// <summary>
-        /// Разворот UV экрана на 180 градусов.
+        /// Приведение UV экрана к нашему буферу.
         ///
-        /// Экранная панель лежит на +Z, а её UV запечены как u=(x+w/2)/w,
-        /// v=(y+h/2)/h. Но игрок смотрит на экран СО СТОРОНЫ +Z, и в этом
-        /// положении ось +X меша идёт для него ВЛЕВО, а SetPixels32 кладёт
-        /// нулевую строку нашего буфера (визуальный верх) в НИЗ текстуры.
-        /// В сумме картинка выходила зеркальной по обеим осям — то самое
-        /// «фулл перевёрнутое» управление. Инвертируем обе координаты.
+        /// Игрок смотрит на панель СО СТОРОНЫ +Z, и в этом положении ось +X
+        /// меша идёт для него влево — по горизонтали запечённые UV этому уже
+        /// соответствуют (в phone.bin u=1 при x=-w/2). А вот по вертикали
+        /// расхождение: SetPixels32 кладёт нулевую строку буфера (визуальный
+        /// верх) в НИЗ текстуры, поэтому картинка выходила перевёрнутой.
+        /// Инвертируем ТОЛЬКО v: если тронуть ещё и u, горизонталь уедет
+        /// зеркально в другую сторону.
         /// </summary>
         private static Vector2[] ScreenUV(Vector2[] src)
         {
             var r = new Vector2[src.Length];
             for (int i = 0; i < src.Length; i++)
-                r[i] = new Vector2(1f - src[i].x, 1f - src[i].y);
+                r[i] = new Vector2(src[i].x, 1f - src[i].y);
             return r;
         }
 
@@ -352,6 +353,14 @@ namespace LPhone
         public readonly Transform ScreenTransform;
         public readonly Gfx Screen;
         public readonly PhoneOS OS;
+
+        /// <summary>
+        /// Где на самом деле лежит плоскость стекла в локальных координатах
+        /// экранного меша. Вершины запечены со смещением (z = +0.0045), а не
+        /// вокруг нуля, поэтому «глубину» касания надо мерить от этой плоскости.
+        /// Иначе палец нажимал бы, не долетев до стекла нескольких миллиметров.
+        /// </summary>
+        public readonly Vector3 ScreenCenter;
         /// <summary>true — собран модом; false — пришёл из паллета (хват/физика от SLZ).</summary>
         public bool RuntimeBuilt;
 
@@ -360,6 +369,15 @@ namespace LPhone
             Root = root;
             ScreenRenderer = screen;
             ScreenTransform = screenTf;
+
+            try
+            {
+                var mf = screenTf != null ? screenTf.GetComponent<MeshFilter>() : null;
+                if (mf != null && mf.sharedMesh != null) ScreenCenter = mf.sharedMesh.bounds.center;
+            }
+            catch { }
+            MelonLogger.Msg($"[LPhone] ... плоскость экрана: {ScreenCenter.x:0.0000} " +
+                            $"{ScreenCenter.y:0.0000} {ScreenCenter.z:0.0000}");
 
             Screen = new Gfx(Phone.ScreenPxW, Phone.ScreenPxH);
             if (ScreenRenderer != null)

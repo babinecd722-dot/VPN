@@ -136,6 +136,9 @@ namespace LPhone
         private int W => _g.W;
         private int H => _g.H;
 
+        /// <summary>Насколько нужно провести вверх, чтобы разблокировать (≈2.4 см).</summary>
+        private int UnlockDist => P(240);
+
         public void Invalidate() => _need = true;
 
         // ─────────────────────── жизненный цикл ───────────────────────
@@ -292,8 +295,10 @@ namespace LPhone
 
             if (Locked)
             {
+                // Прогресс считаем по тому же порогу, что и срабатывание, иначе
+                // индикатор доходил только до 57% в момент разблокировки.
                 float dy = _dragStart.y - p.y;
-                float nu = Mathf.Clamp01(dy / P(420));
+                float nu = Mathf.Clamp01(dy / UnlockDist);
                 if (Mathf.Abs(nu - _unlock) > 0.02f) { _unlock = nu; Invalidate(); }
                 return;
             }
@@ -319,7 +324,9 @@ namespace LPhone
             // ── экран блокировки
             if (Locked)
             {
-                if (_dragStart.y > H * 0.5f && -d.y > P(240))
+                // Начать свайп можно с любой точки ниже верхней трети — жёсткая
+                // «нижняя половина» отсекала привычный свайп от середины экрана.
+                if (_dragStart.y > H * 0.34f && -d.y > UnlockDist)
                 {
                     Locked = false;
                     Audio?.Click();
