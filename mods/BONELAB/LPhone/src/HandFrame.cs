@@ -58,12 +58,15 @@ namespace LPhone
                 along.Normalize();
                 across.Normalize();
 
-                // Проверка знака (правая рука, ладонь к лицу, пальцы вверх):
-                // along = +Y, across (указательный->мизинец) = +X,
-                // Cross(+Y, +X) = -Z, а ладонь смотрит в +Z. Значит для правой
-                // руки нормаль ладони = -Cross(along, across), для левой = +Cross.
+                // Знак нормали. Большой палец всегда снаружи от тела: у правой
+                // руки он со стороны, противоположной мизинцу справа, у левой —
+                // слева. Значит across (указательный->мизинец) у правой руки
+                // смотрит в -X, у левой в +X, если держать ладонь от себя
+                // пальцами вверх. Отсюда: правая = +Cross(along, across),
+                // левая = -Cross. В прошлой версии знак был перевёрнут, и
+                // телефон ложился экраном ВНУТРЬ ладони — пальцы закрывали экран.
                 Vector3 normal = Vector3.Cross(along, across).normalized;
-                if (IsRight(hand)) normal = -normal;
+                if (!IsRight(hand)) normal = -normal;
 
                 // ортогонализация, чтобы базис был чистым
                 across = Vector3.Cross(normal, along).normalized;
@@ -100,7 +103,7 @@ namespace LPhone
             f.Palm = ht.position;
             f.Along = ht.forward;
             f.Across = ht.right;
-            f.Normal = IsRight(hand) ? -ht.up : ht.up;
+            f.Normal = IsRight(hand) ? ht.up : -ht.up;
             return f;
         }
     }

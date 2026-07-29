@@ -247,14 +247,24 @@ namespace LPhone
             }
         }
 
+        private float _nextCallPaint;
+
         private void TickCall()
         {
             if (LNet.State == CallState.None) return;
-            Invalidate();      // таймер и анимация звонка
+
+            // Таймер меняется раз в секунду, анимация вызова — плавная, но
+            // перерисовывать весь экран каждый кадр ради них незачем.
+            if (Time.unscaledTime >= _nextCallPaint)
+            {
+                _nextCallPaint = Time.unscaledTime + 1f / 6f;
+                Invalidate();
+            }
 
             if (LNet.State == CallState.Active && LNet.CamOn && Cam != null)
             {
                 Cam.Enable();
+                Cam.UpdatePreview(4f);          // камера живёт по одному кадру
                 var jpg = Cam.VideoFrame(4f);
                 if (jpg != null) LNet.SendVideoFrame(jpg);
             }

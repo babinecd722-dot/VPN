@@ -4,7 +4,7 @@ using BoneLib.BoneMenu;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.4.3", "BE PRIME")]
+[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.5.0", "BE PRIME")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 [assembly: MelonOptionalDependencies("LabFusion")]
 
@@ -19,7 +19,7 @@ namespace LPhone
         {
             BuildMenu();
             PalletBinder.Install(HarmonyInstance);
-            MelonLogger.Msg("[LPhone] загружен v0.4.3");
+            MelonLogger.Msg("[LPhone] загружен v0.5.0");
             MelonLogger.Msg("[LPhone] Telegram: @be_primex");
         }
 
@@ -35,6 +35,7 @@ namespace LPhone
         public override void OnUpdate()
         {
             PalletBinder.Scan();
+            PhoneGrab.PollInput();      // штатный хват опрашиваем один раз за кадр
 
             foreach (var p in PalletBinder.Bound)
             {
@@ -70,6 +71,8 @@ namespace LPhone
                 // и телефон прилетал в руку сам собой.
                 root.CreateBool("Pull to hand", new Color(0.5f, 0.8f, 1f), PhoneGrab.PullEnabled,
                     (Action<bool>)((v) => PhoneGrab.PullEnabled = v));
+                root.CreateBool("Grip + trigger", new Color(0.8f, 0.7f, 1f), PhoneGrab.RequireTrigger,
+                    (Action<bool>)((v) => { PhoneGrab.RequireTrigger = v; MelonLogger.Msg("[LPhone] trigger: " + v); }));
 
                 // позу удержания удобно доводить прямо на устройстве
                 var hold = root.CreatePage("Hold pose", new Color(0.6f, 0.75f, 1f), 0, true);

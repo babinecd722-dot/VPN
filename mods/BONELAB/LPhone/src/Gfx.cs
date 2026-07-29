@@ -200,12 +200,32 @@ namespace LPhone
         {
             int x1 = Mathf.Max(0, x), y1 = Mathf.Max(0, y);
             int x2 = Mathf.Min(W, x + w), y2 = Mathf.Min(H, y + h);
-            for (int yy = y1; yy < y2; yy++)
-                for (int xx = x1; xx < x2; xx++)
+            if (x2 <= x1 || y2 <= y1) return;
+
+            // Множитель альфы в цикле не меняется — считаем его один раз,
+            // а полностью непрозрачную заливку пишем без смешения вообще.
+            float a = alpha * (c.a / 255f);
+            if (a <= 0f) return;
+            if (a >= 1f)
+            {
+                for (int yy = y1; yy < y2; yy++)
                 {
-                    int i = yy * W + xx;
-                    _buf[i] = Blend(_buf[i], c, alpha * (c.a / 255f));
+                    int row = yy * W;
+                    for (int xx = x1; xx < x2; xx++) _buf[row + xx] = c;
                 }
+            }
+            else
+            {
+                for (int yy = y1; yy < y2; yy++)
+                {
+                    int row = yy * W;
+                    for (int xx = x1; xx < x2; xx++)
+                    {
+                        int i = row + xx;
+                        _buf[i] = Blend(_buf[i], c, a);
+                    }
+                }
+            }
             MarkRows(y1, y2);
         }
 
@@ -213,29 +233,54 @@ namespace LPhone
         public void RoundRect(int x, int y, int w, int h, int r, Color32 c, float alpha = 1f)
         {
             r = Mathf.Clamp(r, 0, Mathf.Min(w, h) / 2);
+            if (r <= 0) { Rect(x, y, w, h, c, alpha); return; }
+
             int x1 = Mathf.Max(0, x), y1 = Mathf.Max(0, y);
             int x2 = Mathf.Min(W, x + w), y2 = Mathf.Min(H, y + h);
+            if (x2 <= x1 || y2 <= y1) return;
+
+            float baseA = alpha * (c.a / 255f);
+            if (baseA <= 0f) return;
+            bool opaque = baseA >= 1f;
+
+            // Скругление живёт только в четырёх углах. Раньше корень и две
+            // проверки считались для КАЖДОГО пикселя прямоугольника — на доке
+            // и карточках это сотни тысяч лишних вычислений на кадр.
+            int innerX0 = x + r, innerX1 = x + w - r;      // [innerX0, innerX1) — без скругления по X
+            int innerY0 = y + r, innerY1 = y + h - r;
+
             for (int yy = y1; yy < y2; yy++)
             {
+                int row = yy * W;
+                bool midRow = yy >= innerY0 && yy < innerY1;
+
+                if (midRow)
+                {
+                    if (opaque) { for (int xx = x1; xx < x2; xx++) _buf[row + xx] = c; }
+                    else
+                    {
+                        for (int xx = x1; xx < x2; xx++)
+                        { int i = row + xx; _buf[i] = Blend(_buf[i], c, baseA); }
+                    }
+                    continue;
+                }
+
+                float dy = yy < innerY0 ? innerY0 - yy - 0.5f : yy - (innerY1 - 1) + 0.5f;
+                float dy2 = dy * dy;
+
                 for (int xx = x1; xx < x2; xx++)
                 {
-                    float a = 1f;
-                    if (r > 0)
+                    float a = baseA;
+                    if (xx < innerX0 || xx >= innerX1)
                     {
-                        float dx = 0f, dy = 0f;
-                        if (xx < x + r) dx = (x + r) - xx - 0.5f;
-                        else if (xx > x + w - r - 1) dx = xx - (x + w - r - 1) + 0.5f;
-                        if (yy < y + r) dy = (y + r) - yy - 0.5f;
-                        else if (yy > y + h - r - 1) dy = yy - (y + h - r - 1) + 0.5f;
-                        if (dx > 0f && dy > 0f)
-                        {
-                            float d = Mathf.Sqrt(dx * dx + dy * dy);
-                            a = Mathf.Clamp01(r - d + 0.5f);
-                            if (a <= 0f) continue;
-                        }
+                        float dx = xx < innerX0 ? innerX0 - xx - 0.5f : xx - (innerX1 - 1) + 0.5f;
+                        float d = Mathf.Sqrt(dx * dx + dy2);
+                        float cov = Mathf.Clamp01(r - d + 0.5f);
+                        if (cov <= 0f) continue;
+                        a = cov * baseA;
                     }
-                    int i = yy * W + xx;
-                    _buf[i] = Blend(_buf[i], c, a * alpha * (c.a / 255f));
+                    int i = row + xx;
+                    _buf[i] = a >= 1f ? c : Blend(_buf[i], c, a);
                 }
             }
             MarkRows(y1, y2);
@@ -285,7 +330,8 @@ namespace LPhone
                     var c = img.Pixels[sy * img.W + sx];
                     if (c.a == 0) continue;
                     int i = yy * W + xx;
-                    _buf[i] = Blend(_buf[i], c, alpha * (c.a / 255f));
+                    if (c.a == 255 && alpha >= 1f) _buf[i] = c;
+                    else _buf[i] = Blend(_buf[i], c, alpha * (c.a / 255f));
                 }
             }
             MarkRows(y1, y2);
@@ -429,6 +475,21 @@ namespace LPhone
     {
         public int W, H;
         public Color32[] Pixels;
+
+        /// <summary>
+        /// Перелить пиксели в уже существующий буфер. Видоискатель обновляется
+        /// восемь раз в секунду, и каждый новый TexData — это 440 КБ в мусор.
+        /// </summary>
+        public static TexData Reuse(TexData dst, Texture2D t)
+        {
+            if (t == null) return dst;
+            if (dst == null || dst.W != t.width || dst.H != t.height) return FromTexture(t);
+            var raw = t.GetPixels32();
+            var src = raw.AsSpan();
+            for (int y = 0; y < dst.H; y++)
+                src.Slice((dst.H - 1 - y) * dst.W, dst.W).CopyTo(dst.Pixels.AsSpan(y * dst.W, dst.W));
+            return dst;
+        }
 
         public static TexData FromTexture(Texture2D t)
         {

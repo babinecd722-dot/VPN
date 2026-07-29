@@ -7,20 +7,27 @@ using UnityEngine;
 namespace LPhone
 {
     /// <summary>
-    /// Хват телефона. Ключевое отличие от прошлой версии: поза строится по
-    /// СИСТЕМЕ КООРДИНАТ ЛАДОНИ (HandFrame), а не от hand.transform.position.
+    /// Хват телефона.
     ///
-    /// Раньше телефон ставился от начала трансформа кисти — а это запястье,
-    /// поэтому корпус длиной 16 см наполовину уходил внутрь руки.
-    /// Теперь: корпус лежит НА ладони (сдвиг по нормали наружу), а ладонь
-    /// держит нижнюю треть — ровно как держат телефон в жизни.
+    /// Вход берём ШТАТНЫЙ — Controller.isGrabInputPressedFinal, тот же сигнал,
+    /// которым игра берёт любой предмет. Самодельный порог по силе сжатия
+    /// срабатывал от чего угодно, вплоть до нажатия стика, и телефон летел
+    /// в руку сам собой.
+    ///
+    /// Взять можно только с касания (5.5 см от корпуса) — как обычный предмет.
+    /// Притягивание отдельным жестом: навести ладонью и НАЖАТЬ хват; конус
+    /// узкий, импульс один на нажатие, а не постоянная тяга.
+    ///
+    /// Поза строится по системе координат ЛАДОНИ (HandFrame), а не от
+    /// hand.transform.position: там начало трансформа — запястье, и корпус
+    /// длиной 16 см наполовину уходил внутрь кисти.
     /// </summary>
     internal static class PhoneGrab
     {
         public static bool Enabled = true;
-        // Притягивание выключено по умолчанию: оно ловило любое сжатие кулака
-        // в радиусе шести метров, и телефон прилетал в руку сам собой.
-        public static bool PullEnabled = false;
+        public static bool PullEnabled = true;
+        /// <summary>Требовать вдобавок нажатый триггер (как просят «две кнопки»).</summary>
+        public static bool RequireTrigger = false;
 
         // Подгонка позы ползунками в меню.
         public static float HoldOut  = 0.012f;   // от ладони наружу (полтолщины + зазор)
@@ -30,14 +37,15 @@ namespace LPhone
         /// <summary>Аварийный переворот стороны ладони, если знак всё же не тот.</summary>
         public static bool FlipPalm = false;
 
-        private const float GrabRange = 0.20f;   // от поверхности корпуса
-        private const float GripOn    = 0.32f;   // берём легко, с первого раза
-        private const float GripOff   = 0.18f;
-        private const float BlendTime = 0.10f;
+        // Берём с касания, как любой предмет игры: двадцать сантиметров — это
+        // не «взял», это «телефон прыгнул в руку сам».
+        private const float GrabRange = 0.055f;
+        private const float BlendTime = 0.08f;
 
-        private const float PullRange = 6f;
-        private const float PullAngle = 35f;
-        private const float PullSpeed = 7f;
+        // Притягивание — по НАЖАТИЮ хвата с наведения, а не пока сжат кулак.
+        private const float PullRange = 4f;
+        private const float PullAngle = 14f;
+        private const float PullSpeed = 9f;
 
         private const float ThrowScale = 1.15f;
         private const float MaxThrow   = 9f;
@@ -56,7 +64,51 @@ namespace LPhone
 
         private static readonly Dictionary<int, Held> _held = new Dictionary<int, Held>();
         private static float _pullingUntil;
-        private static float _nextGripLog;
+
+        // Фронт нажатия хвата, по одному разу за кадр на каждую руку.
+        private static bool _grabR, _grabL, _prevR, _prevL;
+        private static int _inputFrame = -1;
+
+        /// <summary>
+        /// Опрос хвата один раз за кадр. Берём ШТАТНЫЙ сигнал SLZ
+        /// (isGrabInputPressedFinal) — тот же, которым игра берёт все предметы,
+        /// а не самодельный порог по силе сжатия: он срабатывал от чего угодно,
+        /// вплоть до нажатия стика.
+        /// </summary>
+        public static void PollInput()
+        {
+            if (_inputFrame == Time.frameCount) return;
+            _inputFrame = Time.frameCount;
+            _prevR = _grabR; _prevL = _grabL;
+            _grabR = Pressed(BoneLib.Player.RightHand);
+            _grabL = Pressed(BoneLib.Player.LeftHand);
+        }
+
+        private static bool Pressed(Hand hand)
+        {
+            if (hand == null) return false;
+            try
+            {
+                var c = hand.Controller;
+                if (c == null) return false;
+                bool grab = c.isGrabInputPressedFinal;
+                if (RequireTrigger) grab = grab && c._primaryInteractionButton;
+                return grab;
+            }
+            catch { return false; }
+        }
+
+        private static bool IsRightHand(Hand h)
+        {
+            try { return h == BoneLib.Player.RightHand; } catch { return true; }
+        }
+
+        /// <summary>Хват зажат сейчас.</summary>
+        private static bool GrabHeld(Hand h) => IsRightHand(h) ? _grabR : _grabL;
+
+        /// <summary>Хват нажали именно в этом кадре.</summary>
+        private static bool GrabDown(Hand h) =>
+            IsRightHand(h) ? (_grabR && !_prevR) : (_grabL && !_prevL);
 
         public static bool IsHeld(PhoneInstance p) =>
             p?.Root != null && _held.ContainsKey(p.Root.GetInstanceID());
@@ -87,19 +139,6 @@ namespace LPhone
                 }
                 catch { }
             }
-        }
-
-        /// <summary>Сила сжатия кулака 0..1.</summary>
-        private static float GripAmount(Hand hand)
-        {
-            try
-            {
-                var c = hand.Controller;
-                if (c == null) return 0f;
-                float g = Mathf.Max(c._gripForce, c._solvedGrip);
-                return Mathf.Clamp01(g);
-            }
-            catch { return 0f; }
         }
 
         /// <summary>Целевая поза телефона в ладони, в мировых координатах.</summary>
@@ -136,7 +175,6 @@ namespace LPhone
 
                     var f = HandFrame.Of(hand);
                     Vector3 handPos = f.Valid ? f.Palm : hand.transform.position;
-                    float grip = GripAmount(hand);
 
                     float dist;
                     try { dist = Vector3.Distance(handPos, col != null ? col.ClosestPoint(handPos) : root.position); }
@@ -144,19 +182,11 @@ namespace LPhone
 
                     if (dist > GrabRange)
                     {
-                        if (grip >= GripOn) TryPull(phone, hand, dist);
+                        // издалека — только по свежему нажатию и точному наведению
+                        if (GrabDown(hand)) TryPull(phone, hand, dist);
                         continue;
                     }
-                    if (grip < GripOn)
-                    {
-                        // рука рядом, а взять не выходит — покажем в логе реальную силу хвата
-                        if (Time.time > _nextGripLog)
-                        {
-                            _nextGripLog = Time.time + 2f;
-                            MelonLogger.Msg($"[LPhone] рядом (d={dist:0.000}) grip={grip:0.00} < {GripOn:0.00}");
-                        }
-                        continue;
-                    }
+                    if (!GrabHeld(hand)) continue;
 
                     // рука занята штатным предметом — не перехватываем
                     try { if (BoneLib.Player.GetObjectInHand(hand) != null) continue; } catch { }
@@ -199,7 +229,11 @@ namespace LPhone
             catch (Exception e) { MelonLogger.Warning("[LPhone] захват: " + e.Message); }
         }
 
-        /// <summary>Притягивание: наводишь ладонью с расстояния и сжимаешь кулак.</summary>
+        /// <summary>
+        /// Притягивание в духе штатного: навести ладонью и НАЖАТЬ хват.
+        /// Конус узкий (14 градусов) и импульс даётся один раз на нажатие —
+        /// иначе телефон летел в руку от любого сжатия кулака в комнате.
+        /// </summary>
         private static void TryPull(PhoneInstance phone, Hand hand, float dist)
         {
             if (!PullEnabled || dist > PullRange) return;
@@ -207,7 +241,8 @@ namespace LPhone
             {
                 var f = HandFrame.Of(hand);
                 Vector3 from = f.Valid ? f.Palm : hand.transform.position;
-                Vector3 aim  = f.Valid ? f.Along : hand.transform.forward;
+                // целимся ладонью: предмет должен быть перед раскрытой ладонью
+                Vector3 aim  = f.Valid ? f.Normal : hand.transform.forward;
 
                 var root = phone.Root.transform;
                 Vector3 to = root.position - from;
@@ -250,7 +285,7 @@ namespace LPhone
                 root.position = target;
                 root.rotation = ht.rotation * lr;
 
-                if (GripAmount(h.Hand) < GripOff) Release(phone, h, id);
+                if (!GrabHeld(h.Hand)) Release(phone, h, id);
             }
             catch (Exception e)
             {
