@@ -164,10 +164,10 @@ namespace LPhone
                     _need = false;
                     Paint();
                 }
+
+                _g.Present();
             }
             catch (Exception e) { MelonLoader.MelonLogger.Warning("[LPhone] OS: " + e.Message); }
-
-            _g.Present();
         }
 
         public void GoHome()

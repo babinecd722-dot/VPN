@@ -82,9 +82,22 @@ namespace LPhone
                 MelonLoader.MelonLogger.Msg($"[LPhone] ... первый Present {W}x{H}");
             }
             if (_gpu == null || _gpu.Length != _buf.Length)
-                _gpu = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Color32>(_buf.Length);
-            _buf.AsSpan().CopyTo(_gpu.AsSpan());
+            {
+                // ВНИМАНИЕ. Здесь нельзя писать new Il2CppStructArray<Color32>(_buf.Length):
+                // в C# 11 преобразование int -> nint считается лучше, чем int -> long,
+                // и вызов уходит в конструктор Il2CppStructArray(IntPtr pointer) —
+                // длина буфера уезжает туда как нативный указатель и игра падает
+                // на первом же SetPixels32. Конструктор от managed-массива
+                // однозначен, поэтому создаём массив им — один раз за всё время.
+                _gpu = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Color32>(_buf);
+                MelonLoader.MelonLogger.Msg($"[LPhone] ... буфер заливки {_gpu.Length}");
+            }
+            else
+            {
+                _buf.AsSpan().CopyTo(_gpu.AsSpan());
+            }
             _tex.SetPixels32(_gpu);
+            if (!_firstApplyLogged) MelonLoader.MelonLogger.Msg("[LPhone] ... SetPixels32 ок");
             _tex.Apply(false);
             if (!_firstApplyLogged)
             {
