@@ -36,6 +36,10 @@ namespace LPhone
             public TexData Icon;
         }
 
+        /// <summary>Вёрстка задумана под ширину 742 — масштабируем под фактическую.</summary>
+        private float K => _g.W / 742f;
+        private int P(float v) => Mathf.RoundToInt(v * K);
+
         public PhoneOS(PhoneInstance phone)
         {
             _phone = phone;
@@ -114,7 +118,7 @@ namespace LPhone
             if (Locked)
             {
                 float dy = _dragStart.y - p.y;                 // вверх = положительно
-                _unlockProgress = Mathf.Clamp01(dy / 420f);
+                _unlockProgress = Mathf.Clamp01(dy / P(420));
                 Repaint();
             }
         }
@@ -127,7 +131,7 @@ namespace LPhone
 
             if (Locked)
             {
-                if (_dragStart.y > Phone.ScreenPxH * 0.55f && -d.y > 260f)
+                if (_dragStart.y > _g.H * 0.55f && -d.y > P(260))
                 {
                     Locked = false;
                     Current = ScreenId.Home;
@@ -138,8 +142,8 @@ namespace LPhone
             }
 
             // короткое касание = тап
-            if (d.magnitude < 40f) Tap(p);
-            else if (d.y > 320f && _dragStart.y < 260f) Lock();   // свайп вниз сверху = блокировка
+            if (d.magnitude < P(40)) Tap(p);
+            else if (d.y > P(320) && _dragStart.y < P(260)) Lock();   // свайп вниз сверху = блокировка
         }
 
         private void Tap(Vector2 p)
@@ -156,7 +160,7 @@ namespace LPhone
             else if (Current != ScreenId.Lock)
             {
                 // «домой» — нижняя полоска
-                if (p.y > Phone.ScreenPxH - 90) Open(ScreenId.Home);
+                if (p.y > _g.H - P(90)) Open(ScreenId.Home);
             }
         }
 
@@ -182,15 +186,16 @@ namespace LPhone
         private void DrawStatusBar()
         {
             var white = new Color32(255, 255, 255, 255);
-            _g.Text(DateTime.Now.ToString("HH:mm"), 92, 58, 0.44f, white);
+            _g.Text(DateTime.Now.ToString("HH:mm"), P(92), P(58), 0.44f * K, white);
             // батарея
-            int bx = _g.W - 128, by = 62;
-            _g.RoundRect(bx, by, 56, 26, 8, new Color32(255, 255, 255, 90));
-            _g.RoundRect(bx + 3, by + 3, 44, 20, 5, white);
-            _g.RoundRect(bx + 60, by + 9, 5, 10, 2, new Color32(255, 255, 255, 90));
+            int bx = _g.W - P(128), by = P(62);
+            _g.RoundRect(bx, by, P(56), P(26), P(8), new Color32(255, 255, 255, 90));
+            _g.RoundRect(bx + P(3), by + P(3), P(44), P(20), P(5), white);
+            _g.RoundRect(bx + P(60), by + P(9), P(5), P(10), P(2), new Color32(255, 255, 255, 90));
             // сеть
             for (int i = 0; i < 4; i++)
-                _g.RoundRect(_g.W - 232 + i * 15, by + 22 - (i + 1) * 5, 10, (i + 1) * 5, 3, white);
+                _g.RoundRect(_g.W - P(232) + P(i * 15), by + P(22) - P((i + 1) * 5),
+                             P(10), P((i + 1) * 5), P(3), white);
         }
 
         private void DrawLock()
@@ -200,21 +205,21 @@ namespace LPhone
 
             var white = new Color32(255, 255, 255, 255);
             int cx = _g.W / 2;
-            int shift = Mathf.RoundToInt(_unlockProgress * -90f);
+            int shift = P(_unlockProgress * -90f);
 
             var now = DateTime.Now;
-            _g.Text(now.ToString("dddd, d MMMM"), cx, 300 + shift, 0.52f,
+            _g.Text(now.ToString("dddd, d MMMM"), cx, P(300) + shift, 0.52f * K,
                     new Color32(235, 235, 245, 255), Gfx.Align.Center);
-            _g.Text(now.ToString("HH:mm"), cx, 350 + shift, 2.55f, white, Gfx.Align.Center);
+            _g.Text(now.ToString("HH:mm"), cx, P(350) + shift, 2.55f * K, white, Gfx.Align.Center);
 
             // подсказка разблокировки
             float pulse = 0.55f + 0.45f * Mathf.Sin(Time.unscaledTime * 2.2f);
-            _g.Text("Свайп вверх для разблокировки", cx, _g.H - 200, 0.40f,
+            _g.Text("Свайп вверх для разблокировки", cx, _g.H - P(200), 0.40f * K,
                     new Color32(240, 240, 250, 255), Gfx.Align.Center, 0.55f + 0.35f * pulse);
-            _g.RoundRect(cx - 90, _g.H - 60, 180, 9, 5, white, 0.9f);
+            _g.RoundRect(cx - P(90), _g.H - P(60), P(180), P(9), P(5), white, 0.9f);
         }
 
-        private const int DockH = 210;
+        private int DockH => P(210);
 
         private void DrawHome()
         {
@@ -222,29 +227,29 @@ namespace LPhone
             DrawStatusBar();
 
             // док
-            int dockY = _g.H - DockH - 60;
-            _g.RoundRect(28, dockY, _g.W - 56, DockH, 56, new Color32(255, 255, 255, 46));
+            int dockY = _g.H - DockH - P(60);
+            _g.RoundRect(P(28), dockY, _g.W - P(56), DockH, P(56), new Color32(255, 255, 255, 46));
 
             for (int i = 0; i < Installed.Count && i < 4; i++)
             {
                 var r = IconRect(i);
                 _g.BlitRounded(Installed[i].Icon, r.x, r.y, r.width, r.height,
                                Mathf.RoundToInt(r.width * 0.235f));
-                _g.Text(Installed[i].Title, r.x + r.width / 2, r.y + r.height + 12, 0.32f,
+                _g.Text(Installed[i].Title, r.x + r.width / 2, r.y + r.height + P(12), 0.32f * K,
                         new Color32(255, 255, 255, 255), Gfx.Align.Center);
             }
 
-            _g.RoundRect(_g.W / 2 - 90, _g.H - 46, 180, 9, 5,
+            _g.RoundRect(_g.W / 2 - P(90), _g.H - P(46), P(180), P(9), P(5),
                          new Color32(255, 255, 255, 255), 0.85f);
         }
 
         private RectInt IconRect(int i)
         {
             int n = Mathf.Max(1, Mathf.Min(Installed.Count, 4));
-            int size = 132;
-            int gap = (_g.W - 80 - n * size) / Mathf.Max(1, n + 1);
-            int x = 40 + gap + i * (size + gap);
-            int y = _g.H - DockH - 60 + 30;
+            int size = P(132);
+            int gap = (_g.W - P(80) - n * size) / Mathf.Max(1, n + 1);
+            int x = P(40) + gap + i * (size + gap);
+            int y = _g.H - DockH - P(60) + P(30);
             return new RectInt(x, y, size, size);
         }
 
@@ -253,8 +258,8 @@ namespace LPhone
             for (int i = 0; i < Installed.Count && i < 4; i++)
             {
                 var r = IconRect(i);
-                if (p.x >= r.x - 14 && p.x <= r.x + r.width + 14 &&
-                    p.y >= r.y - 14 && p.y <= r.y + r.height + 26)
+                if (p.x >= r.x - P(14) && p.x <= r.x + r.width + P(14) &&
+                    p.y >= r.y - P(14) && p.y <= r.y + r.height + P(26))
                     return i;
             }
             return -1;
@@ -264,11 +269,11 @@ namespace LPhone
         {
             _g.Clear(new Color32(16, 17, 22, 255));
             DrawStatusBar();
-            _g.Text(Current.ToString(), _g.W / 2, 420, 1.05f,
+            _g.Text(Current.ToString(), _g.W / 2, P(420), 1.05f * K,
                     new Color32(255, 255, 255, 255), Gfx.Align.Center);
-            _g.Text("в разработке", _g.W / 2, 520, 0.42f,
+            _g.Text("в разработке", _g.W / 2, P(520), 0.42f * K,
                     new Color32(150, 155, 170, 255), Gfx.Align.Center);
-            _g.RoundRect(_g.W / 2 - 90, _g.H - 46, 180, 9, 5,
+            _g.RoundRect(_g.W / 2 - P(90), _g.H - P(46), P(180), P(9), P(5),
                          new Color32(255, 255, 255, 255), 0.85f);
         }
     }

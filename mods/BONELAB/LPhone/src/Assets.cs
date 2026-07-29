@@ -100,10 +100,7 @@ namespace LPhone
             try
             {
                 var tex = new Texture2D(2, 2, TextureFormat.RGBA32, false);
-                var bytes = Res(file);
-                var arr = new Il2CppStructArray<byte>(bytes.Length);
-                for (int i = 0; i < bytes.Length; i++) arr[i] = bytes[i];
-                ImageConversion.LoadImage(tex, arr);
+                ImageConversion.LoadImage(tex, new Il2CppStructArray<byte>(Res(file)));
                 tex.wrapMode = TextureWrapMode.Clamp;
                 tex.filterMode = FilterMode.Bilinear;
                 tex.hideFlags = HideFlags.HideAndDontSave;

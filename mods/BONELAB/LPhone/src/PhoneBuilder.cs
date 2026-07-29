@@ -8,154 +8,207 @@ namespace LPhone
 {
     /// <summary>
     /// Собирает телефон в рантайме: меш из запечённых данных, материалы,
-    /// физика и хват. Паллет Marrow SDK не нужен — всё в моде.
+    /// физика и (опционально) хват. Паллет Marrow SDK не нужен.
+    ///
+    /// ВАЖНО про шейдеры: в собранном билде Shader.Find обычно возвращает null
+    /// для URP-шейдеров (их нет в "always included"), а new Material(null)
+    /// роняет Il2Cpp НАСМЕРТЬ — managed try/catch это не ловит.
+    /// Поэтому шейдер берём у любого живого рендерера сцены.
     /// </summary>
     internal static class PhoneBuilder
     {
-        private static Shader _lit, _unlit;
+        /// <summary>Ставить ли SLZ-хват. Компоненты SLZ в рантайме — частая причина
+        /// нативных крашей, поэтому по умолчанию выключено (телефон = физ-предмет).</summary>
+        public static bool EnableGrip = false;
 
-        private static Shader Lit
+        private static Shader _shader;
+        private static bool _shaderSearched;
+
+        private static void Step(string s) => MelonLogger.Msg("[LPhone] ... " + s);
+
+        /// <summary>Гарантированно живой шейдер: сначала по имени, потом «занимаем» у сцены.</summary>
+        private static Shader GetShader()
         {
-            get
+            if (_shaderSearched) return _shader;
+            _shaderSearched = true;
+
+            foreach (var n in new[]
             {
-                if (_lit != null) return _lit;
-                foreach (var n in new[]
+                "Universal Render Pipeline/Lit",
+                "Universal Render Pipeline/Simple Lit",
+                "Universal Render Pipeline/Unlit",
+                "Standard",
+            })
+            {
+                try
                 {
-                    "Universal Render Pipeline/Lit",
-                    "Universal Render Pipeline/Simple Lit",
-                    "Standard",
-                })
-                {
-                    _lit = Shader.Find(n);
-                    if (_lit != null) { MelonLogger.Msg("[LPhone] шейдер: " + n); return _lit; }
+                    var s = Shader.Find(n);
+                    if (s != null)
+                    {
+                        _shader = s;
+                        MelonLogger.Msg("[LPhone] шейдер найден по имени: " + n);
+                        return _shader;
+                    }
                 }
-                return Unlit;
+                catch { }
             }
+
+            // Shader.Find пуст — берём шейдер у произвольного рендерера сцены.
+            try
+            {
+                var rends = UnityEngine.Object.FindObjectsOfType<MeshRenderer>();
+                if (rends != null)
+                {
+                    for (int i = 0; i < rends.Length; i++)
+                    {
+                        var m = rends[i] != null ? rends[i].sharedMaterial : null;
+                        if (m != null && m.shader != null)
+                        {
+                            _shader = m.shader;
+                            MelonLogger.Msg("[LPhone] шейдер взят из сцены: " + _shader.name);
+                            return _shader;
+                        }
+                    }
+                }
+            }
+            catch (Exception e) { MelonLogger.Warning("[LPhone] поиск шейдера: " + e.Message); }
+
+            MelonLogger.Error("[LPhone] шейдер не найден — телефон будет без материалов");
+            return null;
         }
 
-        private static Shader Unlit
+        private static Material MakeMat(int id, Shader sh)
         {
-            get
-            {
-                if (_unlit != null) return _unlit;
-                foreach (var n in new[]
-                {
-                    "Universal Render Pipeline/Unlit",
-                    "Unlit/Texture",
-                    "Sprites/Default",
-                })
-                {
-                    _unlit = Shader.Find(n);
-                    if (_unlit != null) return _unlit;
-                }
-                return null;
-            }
-        }
+            if (sh == null) return null;                 // критично: new Material(null) = краш
 
-        private static Material MakeMat(int id)
-        {
-            // Цвета в ЛИНЕЙНОМ пространстве — как в glTF.
-            Color c;
-            float metal, rough;
+            Color c; float metal, rough;
             switch (id)
             {
                 case 1: c = new Color(0.660f, 0.135f, 0.030f); metal = 0.85f; rough = 0.34f; break;
-                case 2: c = Color.white;                        metal = 0.00f; rough = 0.06f; break;
-                case 3: c = new Color(0.015f, 0.025f, 0.055f);  metal = 0.35f; rough = 0.05f; break;
-                case 4: c = new Color(0.780f, 0.780f, 0.800f);  metal = 1.00f; rough = 0.22f; break;
-                case 5: c = new Color(0.030f, 0.030f, 0.030f);  metal = 0.00f; rough = 0.35f; break;
-                case 6: c = new Color(0.008f, 0.008f, 0.010f);  metal = 0.00f; rough = 0.10f; break;
-                case 7: c = new Color(0.855f, 0.215f, 0.055f);  metal = 0.30f; rough = 0.28f; break;
+                case 2: c = Color.white;                       metal = 0.00f; rough = 0.06f; break;
+                case 3: c = new Color(0.015f, 0.025f, 0.055f); metal = 0.35f; rough = 0.05f; break;
+                case 4: c = new Color(0.780f, 0.780f, 0.800f); metal = 1.00f; rough = 0.22f; break;
+                case 5: c = new Color(0.030f, 0.030f, 0.030f); metal = 0.00f; rough = 0.35f; break;
+                case 6: c = new Color(0.008f, 0.008f, 0.010f); metal = 0.00f; rough = 0.10f; break;
+                case 7: c = new Color(0.855f, 0.215f, 0.055f); metal = 0.30f; rough = 0.28f; break;
                 default: c = new Color(0.807f, 0.181f, 0.042f); metal = 0.85f; rough = 0.40f; break;
             }
 
-            // Экран рисуем без освещения — он «светится» сам.
-            var sh = id == 2 ? (Unlit ?? Lit) : Lit;
-            var m = new Material(sh) { hideFlags = HideFlags.HideAndDontSave };
+            Material m;
+            try { m = new Material(sh) { hideFlags = HideFlags.HideAndDontSave }; }
+            catch (Exception e) { MelonLogger.Warning("[LPhone] материал: " + e.Message); return null; }
+
             try { m.color = c; } catch { }
             try { m.SetColor("_BaseColor", c); } catch { }
             try { m.SetFloat("_Metallic", metal); } catch { }
             try { m.SetFloat("_Smoothness", 1f - rough); } catch { }
             try { m.SetFloat("_Glossiness", 1f - rough); } catch { }
+            // экран должен светиться, а не зависеть от освещения сцены
+            if (id == 2)
+            {
+                try { m.EnableKeyword("_EMISSION"); } catch { }
+                try { m.SetColor("_EmissionColor", Color.white); } catch { }
+            }
             return m;
         }
 
-        /// <summary>Строит объект телефона. Возвращает корень; экран доступен через PhoneInstance.</summary>
         public static PhoneInstance Build(Vector3 position, Quaternion rotation)
         {
+            Step("старт сборки");
+            var sh = GetShader();
+
             var root = new GameObject("LPhone_17_Pro_Max");
             root.transform.position = position;
             root.transform.rotation = rotation;
 
             Renderer screenRenderer = null;
             Transform screenTf = null;
+            int built = 0;
 
-            foreach (var part in Assets.PhoneParts)
+            var parts = Assets.PhoneParts;
+            Step($"деталей к сборке: {parts.Count}");
+
+            foreach (var part in parts)
             {
-                var go = new GameObject(part.Name);
-                go.transform.SetParent(root.transform, false);
-
-                var mesh = new Mesh { hideFlags = HideFlags.HideAndDontSave };
-                var verts = new Il2CppStructArray<Vector3>(part.Vertices.Length);
-                for (int i = 0; i < part.Vertices.Length; i++) verts[i] = part.Vertices[i];
-                mesh.vertices = verts;
-
-                if (part.UV != null)
+                try
                 {
-                    var uvs = new Il2CppStructArray<Vector2>(part.UV.Length);
-                    for (int i = 0; i < part.UV.Length; i++) uvs[i] = part.UV[i];
-                    mesh.uv = uvs;
+                    var go = new GameObject(part.Name);
+                    go.transform.SetParent(root.transform, false);
+
+                    var mesh = new Mesh { hideFlags = HideFlags.HideAndDontSave };
+                    // массовые конструкторы — без поэлементного interop
+                    mesh.vertices = new Il2CppStructArray<Vector3>(part.Vertices);
+                    if (part.UV != null) mesh.uv = new Il2CppStructArray<Vector2>(part.UV);
+                    mesh.triangles = new Il2CppStructArray<int>(part.Triangles);
+                    mesh.RecalculateNormals();
+                    mesh.RecalculateBounds();
+
+                    var mf = go.AddComponent<MeshFilter>();
+                    mf.sharedMesh = mesh;                       // не .mesh — тот делает копию
+
+                    var mat = MakeMat(part.MaterialId, sh);
+                    if (mat != null)
+                    {
+                        var mr = go.AddComponent<MeshRenderer>();
+                        mr.sharedMaterial = mat;
+                        if (part.Name == "Screen_UI_Anchor")
+                        {
+                            screenRenderer = mr;
+                            screenTf = go.transform;
+                        }
+                    }
+                    else if (part.Name == "Screen_UI_Anchor")
+                    {
+                        screenTf = go.transform;
+                    }
+                    built++;
                 }
-
-                var tris = new Il2CppStructArray<int>(part.Triangles.Length);
-                for (int i = 0; i < part.Triangles.Length; i++) tris[i] = part.Triangles[i];
-                mesh.triangles = tris;
-
-                mesh.RecalculateNormals();
-                mesh.RecalculateBounds();
-
-                var mf = go.AddComponent<MeshFilter>();
-                mf.mesh = mesh;
-                var mr = go.AddComponent<MeshRenderer>();
-                mr.material = MakeMat(part.MaterialId);
-
-                if (part.Name == "Screen_UI_Anchor")
+                catch (Exception e)
                 {
-                    screenRenderer = mr;
-                    screenTf = go.transform;
+                    MelonLogger.Warning($"[LPhone] деталь {part.Name}: {e.Message}");
                 }
             }
+            Step($"меши собраны: {built}");
 
-            // Физика: один коллайдер по габаритам корпуса.
-            var bc = root.AddComponent<BoxCollider>();
-            bc.size = new Vector3(Phone.BodyW, Phone.BodyH, Phone.BodyT);
-            bc.center = Vector3.zero;
+            try
+            {
+                var bc = root.AddComponent<BoxCollider>();
+                bc.size = new Vector3(Phone.BodyW, Phone.BodyH, Phone.BodyT);
+                bc.center = Vector3.zero;
 
-            var rb = root.AddComponent<Rigidbody>();
-            rb.mass = 0.22f;                    // ~как настоящий телефон
-            rb.drag = 0.05f;
-            rb.angularDrag = 0.35f;
-            rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
-            rb.interpolation = RigidbodyInterpolation.Interpolate;
+                var rb = root.AddComponent<Rigidbody>();
+                rb.mass = 0.22f;
+                rb.drag = 0.05f;
+                rb.angularDrag = 0.35f;
+                rb.collisionDetectionMode = CollisionDetectionMode.ContinuousDynamic;
+                rb.interpolation = RigidbodyInterpolation.Interpolate;
+                Step("физика ок");
 
-            TryAddGrip(root, bc);
+                if (EnableGrip) TryAddGrip(root, bc);
+                else Step("хват выключен (EnableGrip=false)");
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("[LPhone] физика: " + e.Message);
+            }
 
+            Step("экран/ОС");
             var inst = new PhoneInstance(root, screenRenderer, screenTf);
             MelonLogger.Msg("[LPhone] телефон создан");
             return inst;
         }
 
         /// <summary>
-        /// Хват: InteractableHost + BoxGrip, чтобы телефон брался рукой как обычный предмет
-        /// (и корректно ронялся при отпускании — это штатная физика Marrow).
+        /// SLZ-хват. Внимание: InteractableHost.Awake() рассчитывает на настройку из SDK
+        /// и в рантайме может уронить игру НАТИВНО (managed try/catch не спасёт).
+        /// Поэтому включается вручную тумблером в меню.
         /// </summary>
         private static void TryAddGrip(GameObject root, BoxCollider bc)
         {
             try
             {
-                var host = root.AddComponent<InteractableHost>();
+                Step("ставлю BoxGrip");
                 var grip = root.AddComponent<BoxGrip>();
-
                 try { grip.isThrowable = true; } catch { }
                 try
                 {
@@ -164,18 +217,19 @@ namespace LPhone
                     grip.gripColliders = cols;
                 } catch { }
 
+                Step("ставлю InteractableHost");
+                var host = root.AddComponent<InteractableHost>();
                 try { host.DecorateHostOnChildGrips(root.transform); } catch { }
-                MelonLogger.Msg("[LPhone] хват установлен (InteractableHost + BoxGrip)");
+
+                MelonLogger.Msg("[LPhone] хват установлен");
             }
             catch (Exception e)
             {
-                MelonLogger.Warning("[LPhone] хват не установлен: " + e.Message +
-                                    " — телефон останется физическим предметом");
+                MelonLogger.Warning("[LPhone] хват не установлен: " + e.Message);
             }
         }
     }
 
-    /// <summary>Живой экземпляр телефона в мире.</summary>
     internal sealed class PhoneInstance
     {
         public readonly GameObject Root;
@@ -191,39 +245,39 @@ namespace LPhone
             ScreenTransform = screenTf;
 
             Screen = new Gfx(Phone.ScreenPxW, Phone.ScreenPxH);
-            if (ScreenRenderer != null && ScreenRenderer.material != null)
+            if (ScreenRenderer != null)
             {
-                try { ScreenRenderer.material.mainTexture = Screen.Texture; } catch { }
-                try { ScreenRenderer.material.SetTexture("_BaseMap", Screen.Texture); } catch { }
+                var m = ScreenRenderer.sharedMaterial;
+                if (m != null)
+                {
+                    try { m.mainTexture = Screen.Texture; } catch { }
+                    try { m.SetTexture("_BaseMap", Screen.Texture); } catch { }
+                    try { m.SetTexture("_EmissionMap", Screen.Texture); } catch { }
+                }
             }
 
             OS = new PhoneOS(this);
         }
 
         public bool Alive => Root != null;
-
-        public void Destroy()
-        {
-            if (Root != null) UnityEngine.Object.Destroy(Root);
-        }
+        public void Destroy() { if (Root != null) UnityEngine.Object.Destroy(Root); }
     }
 
-    /// <summary>Константы телефона (метры / пиксели экрана).</summary>
     internal static class Phone
     {
         public const float BodyW = 0.0776f;
         public const float BodyH = 0.1634f;
         public const float BodyT = 0.00875f;
 
-        public const float ScreenW = 0.0742f;      // ширина экранного меша
+        public const float ScreenW = 0.0742f;
         public const float ScreenH = 0.1600f;
-        public const float ScreenZ = 0.00449f;     // BodyT/2 + вынос
 
-        public const int ScreenPxW = 742;          // 1 px = 0.1 мм
-        public const int ScreenPxH = 1600;
+        // 371x800: на расстоянии вытянутой руки в VR этого с запасом хватает,
+        // а работы вчетверо меньше, чем при 742x1600.
+        public const int ScreenPxW = 371;
+        public const int ScreenPxH = 800;
 
-        /// <summary>Верхняя зона под Dynamic Island — туда UI не лезет.</summary>
-        public const int SafeTop = 150;
-        public const int SafeBottom = 40;
+        public const int SafeTop = 75;
+        public const int SafeBottom = 20;
     }
 }

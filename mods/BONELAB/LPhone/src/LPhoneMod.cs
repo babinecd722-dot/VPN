@@ -4,7 +4,7 @@ using BoneLib.BoneMenu;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.1.0", "BE PRIME")]
+[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.1.1", "BE PRIME")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace LPhone
@@ -47,6 +47,15 @@ namespace LPhone
                     (Action)SpawnInFront);
                 root.CreateFunction("Despawn all", new Color(1f, 0.4f, 0.35f),
                     (Action)DespawnAll);
+                // SLZ-компоненты в рантайме — частая причина нативных крашей,
+                // поэтому хват отдельным тумблером, по умолчанию выключен.
+                root.CreateBool("Grip (экспериментально)", new Color(0.9f, 0.8f, 0.2f),
+                    PhoneBuilder.EnableGrip,
+                    (Action<bool>)((v) =>
+                    {
+                        PhoneBuilder.EnableGrip = v;
+                        MelonLogger.Msg("[LPhone] хват: " + (v ? "ВКЛ" : "выкл"));
+                    }));
             }
             catch (Exception e)
             {

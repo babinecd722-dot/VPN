@@ -16,6 +16,7 @@ namespace LPhone
         public readonly int W, H;
         private readonly Color32[] _buf;
         private readonly Texture2D _tex;
+        private Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Color32> _gpu;
         private bool _dirty = true;
 
         public Texture2D Texture => _tex;
@@ -38,9 +39,11 @@ namespace LPhone
         {
             if (!_dirty) return;
             _dirty = false;
-            var arr = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Color32>(_buf.Length);
-            for (int i = 0; i < _buf.Length; i++) arr[i] = _buf[i];
-            _tex.SetPixels32(arr);
+            // один массовый memcpy вместо миллиона interop-обращений
+            if (_gpu == null)
+                _gpu = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Color32>(_buf.Length);
+            _buf.AsSpan().CopyTo(_gpu.AsSpan());
+            _tex.SetPixels32(_gpu);
             _tex.Apply(false);
         }
 
@@ -270,12 +273,11 @@ namespace LPhone
         public static TexData FromTexture(Texture2D t)
         {
             if (t == null) return null;
-            var px = t.GetPixels32();
-            var d = new TexData { W = t.width, H = t.height, Pixels = new Color32[px.Length] };
-            // Unity даёт пиксели снизу вверх — переворачиваем в экранный порядок
+            var src = t.GetPixels32().AsSpan();
+            var d = new TexData { W = t.width, H = t.height, Pixels = new Color32[src.Length] };
+            // Unity отдаёт пиксели снизу вверх — переворачиваем построчно (по строке за раз)
             for (int y = 0; y < d.H; y++)
-                for (int x = 0; x < d.W; x++)
-                    d.Pixels[y * d.W + x] = px[(d.H - 1 - y) * d.W + x];
+                src.Slice((d.H - 1 - y) * d.W, d.W).CopyTo(d.Pixels.AsSpan(y * d.W, d.W));
             return d;
         }
     }
