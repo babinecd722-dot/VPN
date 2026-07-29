@@ -152,6 +152,92 @@ namespace LPhone
             }
         }
 
+        /// <summary>Заливка треугольника построчно — основа для стрелок и логотипов.</summary>
+        public static void Tri(Gfx g, Vector2 a, Vector2 b, Vector2 c, Color32 col)
+        {
+            int y0 = Mathf.FloorToInt(Mathf.Min(a.y, Mathf.Min(b.y, c.y)));
+            int y1 = Mathf.CeilToInt(Mathf.Max(a.y, Mathf.Max(b.y, c.y)));
+            float den = (b.y - c.y) * (a.x - c.x) + (c.x - b.x) * (a.y - c.y);
+            if (Mathf.Abs(den) < 1e-5f) return;
+
+            for (int y = y0; y <= y1; y++)
+            {
+                int x0 = Mathf.FloorToInt(Mathf.Min(a.x, Mathf.Min(b.x, c.x)));
+                int x1 = Mathf.CeilToInt(Mathf.Max(a.x, Mathf.Max(b.x, c.x)));
+                int run = -1;
+                for (int x = x0; x <= x1; x++)
+                {
+                    float w0 = ((b.y - c.y) * (x - c.x) + (c.x - b.x) * (y - c.y)) / den;
+                    float w1 = ((c.y - a.y) * (x - c.x) + (a.x - c.x) * (y - c.y)) / den;
+                    float w2 = 1f - w0 - w1;
+                    bool inside = w0 >= -0.001f && w1 >= -0.001f && w2 >= -0.001f;
+                    if (inside) { if (run < 0) run = x; }
+                    else if (run >= 0) { g.Rect(run, y, x - run, 1, col); run = -1; }
+                }
+                if (run >= 0) g.Rect(run, y, x1 - run + 1, 1, col);
+            }
+        }
+
+        /// <summary>Самолётик Telegram.</summary>
+        public static void TelegramGlyph(Gfx g, int cx, int cy, int size, Color32 col)
+        {
+            float s = size * 0.5f;
+            var tip = new Vector2(cx + s, cy - s * 0.75f);        // правый верхний угол
+            var tail = new Vector2(cx - s, cy - s * 0.05f);       // левый край
+            var mid = new Vector2(cx + s * 0.05f, cy + s * 0.32f);
+            var low = new Vector2(cx + s * 0.42f, cy + s * 0.85f);
+
+            Tri(g, tip, tail, mid, col);          // верхнее крыло
+            Tri(g, tip, mid, low, col);           // нижний «хвост»
+        }
+
+        /// <summary>
+        /// Глобус — значок сайта. Кольцо получается вычитанием: внутренний круг
+        /// закрашивается цветом подложки, поэтому её и передаём (прозрачным
+        /// «вырезать» нельзя — альфа 0 просто ничего не пишет).
+        /// </summary>
+        public static void GlobeGlyph(Gfx g, int cx, int cy, int size, Color32 col, Color32 bg)
+        {
+            int r = size / 2;
+            int th = Mathf.Max(2, Mathf.RoundToInt(size * 0.09f));
+            g.Circle(cx, cy, r, col);
+            g.Circle(cx, cy, r - th, bg);
+
+            g.Rect(cx - r + th / 2, cy - th / 2, r * 2 - th, th, col);   // экватор
+            for (int i = -r + th; i <= r - th; i++)                       // меридиан
+            {
+                float k = i / (float)r;
+                int hw = Mathf.RoundToInt(r * 0.45f * Mathf.Cos(k * Mathf.PI * 0.5f));
+                if (hw <= 0) continue;
+                g.Rect(cx - hw, cy + i, Mathf.Max(1, th / 2), 1, col);
+                g.Rect(cx + hw - Mathf.Max(1, th / 2), cy + i, Mathf.Max(1, th / 2), 1, col);
+            }
+        }
+
+        /// <summary>Круговые стрелки — «сменить камеру».</summary>
+        public static void SwapGlyph(Gfx g, int cx, int cy, int size, Color32 col)
+        {
+            int r = Mathf.RoundToInt(size * 0.36f);
+            int th = Mathf.Max(2, Mathf.RoundToInt(size * 0.09f));
+            // две дуги: верхняя слева направо, нижняя справа налево
+            for (int i = 0; i <= 90; i += 2)
+            {
+                float a1 = Mathf.Deg2Rad * (20 + i * 1.6f);
+                float a2 = Mathf.Deg2Rad * (200 + i * 1.6f);
+                g.Rect(cx + Mathf.RoundToInt(Mathf.Cos(a1) * r) - th / 2,
+                       cy - Mathf.RoundToInt(Mathf.Sin(a1) * r) - th / 2, th, th, col);
+                g.Rect(cx + Mathf.RoundToInt(Mathf.Cos(a2) * r) - th / 2,
+                       cy - Mathf.RoundToInt(Mathf.Sin(a2) * r) - th / 2, th, th, col);
+            }
+            int h = Mathf.RoundToInt(size * 0.16f);
+            Tri(g, new Vector2(cx + r + h * 0.2f, cy - h),
+                   new Vector2(cx + r + h * 1.4f, cy - h * 0.1f),
+                   new Vector2(cx + r - h * 0.4f, cy - h * 0.1f), col);
+            Tri(g, new Vector2(cx - r - h * 0.2f, cy + h),
+                   new Vector2(cx - r - h * 1.4f, cy + h * 0.1f),
+                   new Vector2(cx - r + h * 0.4f, cy + h * 0.1f), col);
+        }
+
         /// <summary>Значок камеры (для кнопки видео).</summary>
         public static void CamGlyph(Gfx g, int cx, int cy, int size, Color32 col)
         {

@@ -98,13 +98,20 @@ namespace LPhone
             }
         }
 
-        /// <summary>Локальная точка меша → пиксели UI (0..W слева направо, 0..H сверху вниз).</summary>
+        /// <summary>
+        /// Локальная точка меша → пиксели UI (0..W слева направо, 0..H сверху вниз).
+        ///
+        /// Игрок смотрит на экран со стороны +Z, поэтому его «вправо» — это
+        /// УМЕНЬШЕНИЕ локального x, а «вниз» — уменьшение локального y.
+        /// Раньше x не переворачивался, и касания уезжали по горизонтали
+        /// на зеркальную сторону экрана.
+        /// </summary>
         private static Vector2 ToPixels(Vector3 local)
         {
-            float u = (local.x + Phone.ScreenW * 0.5f) / Phone.ScreenW;
-            float v = (local.y + Phone.ScreenH * 0.5f) / Phone.ScreenH;
-            return new Vector2(Mathf.Clamp01(u) * Phone.ScreenPxW,
-                               (1f - Mathf.Clamp01(v)) * Phone.ScreenPxH);
+            float rx = (Phone.ScreenW * 0.5f - local.x) / Phone.ScreenW;
+            float dy = (Phone.ScreenH * 0.5f - local.y) / Phone.ScreenH;
+            return new Vector2(Mathf.Clamp01(rx) * Phone.ScreenPxW,
+                               Mathf.Clamp01(dy) * Phone.ScreenPxH);
         }
 
         // Переиспользуемый буфер: не мусорим массивом на каждый кадр.

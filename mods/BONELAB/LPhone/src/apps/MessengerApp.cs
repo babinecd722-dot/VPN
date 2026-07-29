@@ -24,6 +24,9 @@ namespace LPhone
         /// <summary>Фото, которое пользователь отправил из галереи.</summary>
         public Photo PendingPhoto;
 
+        private string _toast;
+        private float _toastUntil;
+
         public bool IsChatWith(byte sid) => _mode == Mode.Chat && _peer == sid;
 
         public override void Open()
@@ -36,6 +39,18 @@ namespace LPhone
         }
 
         public override void Close() { _scroll = 0; }
+
+        public override void Tick()
+        {
+            if (_toastUntil > 0f && Time.unscaledTime > _toastUntil) { _toastUntil = 0f; OS.Invalidate(); }
+        }
+
+        private void Toast(string s)
+        {
+            _toast = s;
+            _toastUntil = Time.unscaledTime + 4f;
+            OS.Invalidate();
+        }
 
         public override bool Back()
         {
@@ -255,53 +270,92 @@ namespace LPhone
             return res;
         }
 
-        // ─────────────── канал автора ───────────────
+        // ─────────────── карточка автора ───────────────
+
+        public const string Tg = "@be_primex";
+        public const string Site = "bonelab.fun";
 
         private static readonly string[][] Posts =
         {
             new[] { "LPhone 17 PRO MAX", "Телефон целиком внутри BONELAB: камера, галерея, магазин и мессенджер." },
-            new[] { "MONSTER Panel", "Панель, которую знают во всех лобби. Обновления выходят первыми здесь." },
-            new[] { "Подписывайся", "Новые моды, ранние сборки и разборы механик — в канале @be_primex." },
+            new[] { "MONSTER Panel", "Панель, которую знают во всех лобби. Обновления выходят первыми в канале." },
         };
+
+        private RectInt LinkTg() => R(30f, 660f, 742f - 60f, 150f);
+        private RectInt LinkSite() => R(30f, 828f, 742f - 60f, 150f);
 
         private void DrawChannel()
         {
-            G.Clear(new Color32(14, 16, 20, 255));
+            G.Clear(new Color32(13, 15, 19, 255));
+
+            // шапка с градиентом под цвет молнии
+            G.VGradient(0, 0, W, P(560), new Color32(14, 58, 128, 255), new Color32(13, 15, 19, 255));
             OS.DrawStatusBar();
 
             var b = BtnBack();
-            UI.BackArrow(G, b.x + P(28), b.y + P(22), P(34), UI.Blue);
+            UI.BackArrow(G, b.x + P(28), b.y + P(22), P(34), UI.White);
 
-            // шапка канала
-            G.VGradient(0, P(230), W, P(300), new Color32(0, 92, 200, 255), new Color32(14, 16, 20, 255));
-            UI.Avatar(G, W / 2, P(330), P(90), Contacts.Author, K);
-            G.Text("BE PRIME", W / 2, P(440), 0.64f * K, UI.White, Gfx.Align.Center);
+            // аватар с мягким ореолом
+            int acx = W / 2, acy = P(320);
+            G.Circle(acx, acy, P(112), new Color32(120, 175, 255, 60));
+            G.Circle(acx, acy, P(96), new Color32(0, 122, 255, 255));
+            G.Circle(acx, acy - P(30), P(70), new Color32(255, 255, 255, 40));
+            UI.Bolt(G, acx, acy, P(110), UI.White);
 
-            int bw = P(150);
-            G.RoundRect(W / 2 - bw / 2, P(510), bw, P(46), P(16), UI.Blue);
-            G.Text("AUTHOR", W / 2, P(518), 0.26f * K, UI.White, Gfx.Align.Center);
+            G.Text("BE PRIME", acx, P(438), 0.70f * K, UI.White, Gfx.Align.Center);
 
-            G.Text("@be_primex", W / 2, P(576), 0.38f * K, new Color32(120, 170, 255, 255), Gfx.Align.Center);
-            G.Text("Telegram-канал · моды для BONELAB", W / 2, P(628), 0.30f * K, UI.Dim, Gfx.Align.Center);
+            int bw = P(168), bh = P(50);
+            G.RoundRect(acx - bw / 2, P(516), bw, bh, P(18), new Color32(0, 122, 255, 255));
+            G.Text("AUTHOR", acx, P(526), 0.28f * K, UI.White, Gfx.Align.Center);
 
-            int y = P(710);
+            G.Text("Автор мода · моды для BONELAB", acx, P(590), 0.30f * K,
+                   new Color32(160, 168, 186, 255), Gfx.Align.Center);
+
+            // ── соцсети
+            var tg = LinkTg();
+            G.RoundRect(tg.x, tg.y, tg.width, tg.height, P(36), new Color32(23, 27, 36, 255));
+            int tcx = tg.x + P(84), tcy = tg.y + tg.height / 2;
+            G.Circle(tcx, tcy, P(48), new Color32(41, 161, 226, 255));
+            UI.TelegramGlyph(G, tcx, tcy, P(52), UI.White);
+            G.Text("Telegram", tg.x + P(160), tg.y + P(34), 0.40f * K, UI.White);
+            G.Text(Tg, tg.x + P(160), tg.y + P(88), 0.36f * K, new Color32(105, 185, 255, 255));
+            UI.Chevron(G, tg.x + tg.width - P(70), tcy - P(20), P(34), new Color32(110, 114, 128, 255));
+
+            var st = LinkSite();
+            var card = new Color32(23, 27, 36, 255);
+            G.RoundRect(st.x, st.y, st.width, st.height, P(36), card);
+            int scx = st.x + P(84), scy = st.y + st.height / 2;
+            G.Circle(scx, scy, P(48), new Color32(255, 138, 42, 255));
+            UI.GlobeGlyph(G, scx, scy, P(56), UI.White, new Color32(255, 138, 42, 255));
+            G.Text("Сайт", st.x + P(160), st.y + P(34), 0.40f * K, UI.White);
+            G.Text(Site, st.x + P(160), st.y + P(88), 0.36f * K, new Color32(255, 176, 106, 255));
+            UI.Chevron(G, st.x + st.width - P(70), scy - P(20), P(34), new Color32(110, 114, 128, 255));
+
+            // ── о чём канал
+            int y = P(1012);
+            G.Text("В КАНАЛЕ", P(44), y, 0.28f * K, new Color32(120, 126, 142, 255));
+            y += P(50);
             for (int i = 0; i < Posts.Length; i++)
             {
-                int h = P(210);
-                G.RoundRect(P(30), y, W - P(60), h, P(30), new Color32(24, 26, 32, 255));
-                UI.Bolt(G, P(86), y + P(70), P(54), new Color32(90, 160, 255, 255));
-                G.Text(Posts[i][0], P(130), y + P(38), 0.40f * K, UI.White);
-                int ty = y + P(96);
+                int h = P(196);
+                G.RoundRect(P(30), y, W - P(60), h, P(32), card);
+                UI.Bolt(G, P(92), y + P(66), P(52), new Color32(96, 166, 255, 255));
+                G.Text(Posts[i][0], P(140), y + P(36), 0.38f * K, UI.White);
+                int ty = y + P(92);
                 foreach (var line in Wrap(Posts[i][1], W - P(180)))
                 {
-                    G.Text(line, P(60), ty, 0.30f * K, new Color32(180, 184, 196, 255));
-                    ty += G.LineHeight(0.30f * K);
+                    G.Text(line, P(60), ty, 0.29f * K, new Color32(168, 174, 190, 255));
+                    ty += G.LineHeight(0.29f * K);
                 }
                 y += h + P(18);
             }
 
-            G.Text("Открой Telegram и найди @be_primex", W / 2, H - P(140), 0.30f * K,
-                   new Color32(120, 122, 134, 255), Gfx.Align.Center);
+            if (_toastUntil > 0f)
+            {
+                G.RoundRect(P(40), H - P(230), W - P(80), P(120), P(38), new Color32(0, 0, 0, 225));
+                G.Text(_toast, W / 2, H - P(190), 0.42f * K, UI.White, Gfx.Align.Center);
+            }
+
             OS.DrawHomeBar();
         }
 
@@ -346,7 +400,12 @@ namespace LPhone
 
             if (_mode == Mode.Channel)
             {
-                if (In(p, BtnBack()) || d.x > P(200)) { _mode = Mode.Contacts; OS.Invalidate(); }
+                if (In(p, BtnBack()) || d.x > P(200)) { _mode = Mode.Contacts; OS.Invalidate(); return; }
+                if (d.magnitude > P(50)) return;
+                // Открыть ссылку из VR нельзя, поэтому показываем адрес крупно,
+                // чтобы его можно было спокойно прочитать и набрать на телефоне.
+                if (In(p, LinkTg())) { OS.Audio?.Click(); Toast("Telegram: " + Tg); return; }
+                if (In(p, LinkSite())) { OS.Audio?.Click(); Toast("Сайт: " + Site); return; }
                 return;
             }
 

@@ -19,6 +19,15 @@ namespace LPhone
         private bool _firstPresentLogged, _firstApplyLogged;
         private bool _dirty = true;
 
+        // Экран поделён на горизонтальные полосы. Заливаем в текстуру только
+        // те, что реально менялись: перерисовка одной кнопки не должна стоить
+        // копирования всех 4.7 МБ кадра.
+        private const int Bands = 10;
+        private readonly bool[] _bandDirty = new bool[Bands];
+        private readonly int _bandH;
+        private Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Color32> _band;
+        private Color32[] _bandBuf;
+
         // Один раз выделенный Il2Cpp-массив под заливку. Раньше он создавался
         // на КАЖДЫЙ Present — это 1.2 МБ мусора 30 раз в секунду при свайпе,
         // отсюда и были фризы. Теперь копируем в него спаном.
@@ -28,11 +37,24 @@ namespace LPhone
         private readonly Dictionary<int, Color32[]> _layers = new Dictionary<int, Color32[]>();
 
         public Texture2D Texture => _tex;
-        public void MarkDirty() => _dirty = true;
+        public void MarkDirty() => MarkRows(0, H);
+
+        /// <summary>Пометить строки [y0, y1) как изменившиеся.</summary>
+        private void MarkRows(int y0, int y1)
+        {
+            _dirty = true;
+            if (y0 < 0) y0 = 0;
+            if (y1 > H) y1 = H;
+            if (y1 <= y0) return;
+            int b0 = y0 / _bandH, b1 = (y1 - 1) / _bandH;
+            if (b1 >= Bands) b1 = Bands - 1;
+            for (int b = b0; b <= b1; b++) _bandDirty[b] = true;
+        }
 
         public Gfx(int w, int h)
         {
             W = w; H = h;
+            _bandH = (h + Bands - 1) / Bands;
             _buf = new Color32[w * h];
             _tex = new Texture2D(w, h, TextureFormat.RGBA32, false)
             {
@@ -50,8 +72,8 @@ namespace LPhone
         /// <summary>Запомнить текущий буфер как фоновый слой.</summary>
         public void StoreLayer(int key)
         {
-            // каждый слой — это 1.2 МБ, поэтому больше трёх не держим
-            if (_layers.Count >= 3 && !_layers.ContainsKey(key)) _layers.Clear();
+            // при 742x1600 слой весит 4.7 МБ, поэтому держим только два
+            if (_layers.Count >= 2 && !_layers.ContainsKey(key)) _layers.Clear();
             if (!_layers.TryGetValue(key, out var l) || l.Length != _buf.Length)
             {
                 l = new Color32[_buf.Length];
@@ -65,22 +87,43 @@ namespace LPhone
         {
             if (!_layers.TryGetValue(key, out var l) || l.Length != _buf.Length) return false;
             Array.Copy(l, _buf, _buf.Length);
-            _dirty = true;
+            MarkRows(0, H);
             return true;
         }
 
         public void DropLayers() => _layers.Clear();
 
-        /// <summary>Заливаем накопленный кадр в текстуру (только если что-то менялось).</summary>
+        /// <summary>Заливаем изменившиеся полосы кадра в текстуру.</summary>
         public void Present()
         {
             if (!_dirty) return;
             _dirty = false;
+
             if (!_firstPresentLogged)
             {
                 _firstPresentLogged = true;
-                MelonLoader.MelonLogger.Msg($"[LPhone] ... первый Present {W}x{H}");
+                MelonLoader.MelonLogger.Msg($"[LPhone] ... первый Present {W}x{H}, полоса {_bandH}");
             }
+
+            int dirty = 0;
+            for (int b = 0; b < Bands; b++) if (_bandDirty[b]) dirty++;
+            if (dirty == 0) return;
+
+            if (dirty >= Bands - 1) PresentFull();
+            else PresentBands();
+
+            for (int b = 0; b < Bands; b++) _bandDirty[b] = false;
+
+            _tex.Apply(false);
+            if (!_firstApplyLogged)
+            {
+                _firstApplyLogged = true;
+                MelonLoader.MelonLogger.Msg("[LPhone] ... первый Apply ок");
+            }
+        }
+
+        private void PresentFull()
+        {
             if (_gpu == null || _gpu.Length != _buf.Length)
             {
                 // ВНИМАНИЕ. Здесь нельзя писать new Il2CppStructArray<Color32>(_buf.Length):
@@ -98,11 +141,31 @@ namespace LPhone
             }
             _tex.SetPixels32(_gpu);
             if (!_firstApplyLogged) MelonLoader.MelonLogger.Msg("[LPhone] ... SetPixels32 ок");
-            _tex.Apply(false);
-            if (!_firstApplyLogged)
+        }
+
+        /// <summary>
+        /// Заливка только изменившихся полос. Строки нашего буфера ложатся в
+        /// текстуру подряд и без переворота, поэтому полоса — это непрерывный
+        /// кусок _buf, который копируется одним спаном.
+        /// </summary>
+        private void PresentBands()
+        {
+            int len = W * _bandH;
+            if (_bandBuf == null || _bandBuf.Length != len)
             {
-                _firstApplyLogged = true;
-                MelonLoader.MelonLogger.Msg("[LPhone] ... первый Apply ок");
+                _bandBuf = new Color32[len];
+                _band = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Color32>(_bandBuf);
+            }
+
+            for (int b = 0; b < Bands; b++)
+            {
+                if (!_bandDirty[b]) continue;
+                int y0 = b * _bandH;
+                int h = Mathf.Min(_bandH, H - y0);
+                if (h <= 0) continue;
+
+                _buf.AsSpan(y0 * W, h * W).CopyTo(_band.AsSpan());
+                _tex.SetPixels32(0, y0, W, h, _band);
             }
         }
 
@@ -110,8 +173,8 @@ namespace LPhone
 
         public void Clear(Color32 c)
         {
-            for (int i = 0; i < _buf.Length; i++) _buf[i] = c;
-            _dirty = true;
+            Array.Fill(_buf, c);      // заметно быстрее ручного цикла на 1.2 млн пикселей
+            MarkRows(0, H);
         }
 
         private static Color32 Blend(Color32 dst, Color32 src, float a)
@@ -130,6 +193,7 @@ namespace LPhone
             if (x < 0 || y < 0 || x >= W || y >= H) return;
             int i = y * W + x;
             _buf[i] = Blend(_buf[i], c, a * (c.a / 255f));
+            MarkRows(y, y + 1);
         }
 
         public void Rect(int x, int y, int w, int h, Color32 c, float alpha = 1f)
@@ -142,7 +206,7 @@ namespace LPhone
                     int i = yy * W + xx;
                     _buf[i] = Blend(_buf[i], c, alpha * (c.a / 255f));
                 }
-            _dirty = true;
+            MarkRows(y1, y2);
         }
 
         /// <summary>Скруглённый прямоугольник со сглаженным краем.</summary>
@@ -174,7 +238,7 @@ namespace LPhone
                     _buf[i] = Blend(_buf[i], c, a * alpha * (c.a / 255f));
                 }
             }
-            _dirty = true;
+            MarkRows(y1, y2);
         }
 
         public void Circle(int cx, int cy, int r, Color32 c, float alpha = 1f)
@@ -199,7 +263,7 @@ namespace LPhone
                     _buf[i] = Blend(_buf[i], c, c.a / 255f);
                 }
             }
-            _dirty = true;
+            MarkRows(y1, y2);
         }
 
         // ─────────────────── картинки ───────────────────
@@ -224,7 +288,41 @@ namespace LPhone
                     _buf[i] = Blend(_buf[i], c, alpha * (c.a / 255f));
                 }
             }
-            _dirty = true;
+            MarkRows(y1, y2);
+        }
+
+        // таблица исходных столбцов для быстрого блита — чтобы не делить на пиксель
+        private int[] _sxTab;
+
+        /// <summary>
+        /// Непрозрачный блит с масштабированием. Кадр видоискателя занимает
+        /// две трети экрана, и гонять его через общий Blit с альфа-смешением
+        /// и делением на каждый пиксель — чистая трата: здесь только выборка
+        /// и присваивание.
+        /// </summary>
+        public void BlitOpaque(TexData img, int x, int y, int w, int h)
+        {
+            if (img == null || w <= 0 || h <= 0) return;
+            int x1 = Mathf.Max(0, x), y1 = Mathf.Max(0, y);
+            int x2 = Mathf.Min(W, x + w), y2 = Mathf.Min(H, y + h);
+            if (x2 <= x1 || y2 <= y1) return;
+
+            if (_sxTab == null || _sxTab.Length < W) _sxTab = new int[W];
+            for (int xx = x1; xx < x2; xx++)
+            {
+                int sx = (int)((long)(xx - x) * img.W / w);
+                _sxTab[xx] = sx < 0 ? 0 : (sx >= img.W ? img.W - 1 : sx);
+            }
+
+            var src = img.Pixels;
+            for (int yy = y1; yy < y2; yy++)
+            {
+                int sy = (int)((long)(yy - y) * img.H / h);
+                if (sy < 0) sy = 0; else if (sy >= img.H) sy = img.H - 1;
+                int srow = sy * img.W, drow = yy * W;
+                for (int xx = x1; xx < x2; xx++) _buf[drow + xx] = src[srow + _sxTab[xx]];
+            }
+            MarkRows(y1, y2);
         }
 
         /// <summary>Картинка, обрезанная по скруглённому прямоугольнику (для иконок/аватарок).</summary>
@@ -260,7 +358,7 @@ namespace LPhone
                     _buf[i] = Blend(_buf[i], c, m * alpha * (c.a / 255f));
                 }
             }
-            _dirty = true;
+            MarkRows(y1, y2);
         }
 
         // ─────────────────── текст ───────────────────
@@ -289,6 +387,7 @@ namespace LPhone
             float pen = x;
             int baseline = Mathf.RoundToInt(Font.Baseline * scale);
             var atlas = Font.Atlas;
+            int tMin = int.MaxValue, tMax = int.MinValue;
 
             foreach (char ch in s)
             {
@@ -314,12 +413,14 @@ namespace LPhone
                             if (a == 0) continue;
                             int i = py * W + px;
                             _buf[i] = Blend(_buf[i], col, (a / 255f) * alpha);
+                            if (py < tMin) tMin = py;
+                            if (py > tMax) tMax = py;
                         }
                     }
                 }
                 pen += g.Advance * scale;
             }
-            _dirty = true;
+            if (tMax >= tMin) MarkRows(tMin, tMax + 1);
         }
     }
 

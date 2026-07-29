@@ -18,13 +18,17 @@ namespace LPhone
     internal static class PhoneGrab
     {
         public static bool Enabled = true;
-        public static bool PullEnabled = true;
+        // Притягивание выключено по умолчанию: оно ловило любое сжатие кулака
+        // в радиусе шести метров, и телефон прилетал в руку сам собой.
+        public static bool PullEnabled = false;
 
         // Подгонка позы ползунками в меню.
         public static float HoldOut  = 0.012f;   // от ладони наружу (полтолщины + зазор)
         public static float HoldUp   = 0.045f;   // вдоль пальцев: ладонь держит нижнюю треть
         public static float HoldSide = 0.0f;     // поперёк ладони
         public static float HoldTilt = 0f;       // доворот вокруг оси пальцев
+        /// <summary>Аварийный переворот стороны ладони, если знак всё же не тот.</summary>
+        public static bool FlipPalm = false;
 
         private const float GrabRange = 0.20f;   // от поверхности корпуса
         private const float GripOn    = 0.32f;   // берём легко, с первого раза
@@ -107,12 +111,13 @@ namespace LPhone
 
             // +Z телефона (экран) — по нормали ладони наружу
             // +Y телефона (верх)  — вдоль пальцев
-            rot = Quaternion.LookRotation(f.Normal, f.Along);
+            Vector3 nrm = FlipPalm ? -f.Normal : f.Normal;
+            rot = Quaternion.LookRotation(nrm, f.Along);
             if (Mathf.Abs(HoldTilt) > 0.01f)
                 rot = Quaternion.AngleAxis(HoldTilt, f.Along) * rot;
 
             pos = f.Palm
-                + f.Normal * HoldOut     // лежит НА ладони, не внутри неё
+                + nrm * HoldOut          // лежит НА ладони, не внутри неё
                 + f.Along  * HoldUp      // ладонь держит нижнюю треть
                 + f.Across * HoldSide;
             return true;

@@ -9,7 +9,8 @@ namespace LPhone
     /// приложения, режим редактирования иконок, звонки поверх всего.
     ///
     /// Перерисовка ленивая: экраны сами зовут Invalidate(), а кадр собирается
-    /// не чаще 30 раз в секунду. Обои лежат в кэше слоёв Gfx, поэтому фон
+    /// не чаще 24 раз в секунду, и в текстуру уходят только изменившиеся полосы.
+    /// Обои лежат в кэше слоёв Gfx, поэтому фон
     /// восстанавливается memcpy, а не попиксельным блитом.
     /// </summary>
     internal sealed class PhoneOS
@@ -160,7 +161,7 @@ namespace LPhone
 
                 if (_need && Time.unscaledTime >= _nextPaint)
                 {
-                    _nextPaint = Time.unscaledTime + 1f / 30f;
+                    _nextPaint = Time.unscaledTime + 1f / 24f;
                     _need = false;
                     Paint();
                 }
@@ -250,7 +251,7 @@ namespace LPhone
 
             if (LNet.State == CallState.Active && LNet.CamOn && Cam != null)
             {
-                Cam.Enable(false);
+                Cam.Enable();
                 var jpg = Cam.VideoFrame(4f);
                 if (jpg != null) LNet.SendVideoFrame(jpg);
             }

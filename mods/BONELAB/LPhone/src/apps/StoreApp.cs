@@ -18,6 +18,7 @@ namespace LPhone
 
         private PhoneApp _downloading;
         private float _startedAt;
+        private float _nextTick;
         private int _scroll;
 
         public override void Open() { _scroll = 0; OS.Invalidate(); }
@@ -25,7 +26,14 @@ namespace LPhone
         public override void Tick()
         {
             if (_downloading == null) return;
-            OS.Invalidate();
+            // Кольцо прогресса дискретное, обновлять его 30 раз в секунду
+            // незачем: полная перерисовка экрана на каждый кадр и давала
+            // просадку во время «загрузки».
+            if (Time.unscaledTime >= _nextTick)
+            {
+                _nextTick = Time.unscaledTime + 1f / 8f;
+                OS.Invalidate();
+            }
             if (Time.unscaledTime - _startedAt >= DownloadTime)
             {
                 OS.Install(_downloading);

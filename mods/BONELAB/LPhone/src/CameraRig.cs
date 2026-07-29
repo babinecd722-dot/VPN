@@ -1,18 +1,19 @@
 using System;
-using Il2CppInterop.Runtime.InteropTypes.Arrays;
 using MelonLoader;
 using UnityEngine;
 
 namespace LPhone
 {
     /// <summary>
-    /// Настоящая камера телефона: Unity-камера на корпусе, картинка в RenderTexture,
-    /// видоискатель — отдельный квад ровно поверх нужного куска экрана.
+    /// Камера телефона: Unity-камера на корпусе рисует в RenderTexture,
+    /// а кадр видоискателя читается в наш программный буфер и блитится в UI.
     ///
-    /// Почему квад, а не рисование кадра в наш софтовый буфер: чтение
-    /// RenderTexture каждый кадр — это стоп GPU, на Quest так делать нельзя.
-    /// Квад показывает текстуру напрямую, а вокруг него UI рисует наш Gfx.
-    /// Пиксели читаем ровно один раз — в момент спуска затвора.
+    /// Первая версия показывала RenderTexture отдельным квадом поверх экрана —
+    /// и видоискатель оставался чёрным. Квад зависит и от свойств шейдера,
+    /// который мы занимаем у сцены (SLZ/LitMAS), и от того, рисует ли URP
+    /// нашу камеру. Чтение пикселей от этого не зависит вообще, поэтому
+    /// картинка есть всегда. Цена сдержана: читаем уменьшенный кадр 288x384
+    /// и не чаще 8 раз в секунду, полный размер — только в момент снимка.
     /// </summary>
     internal sealed class CameraRig
     {
@@ -20,15 +21,20 @@ namespace LPhone
         public const float VfTop = 200f;
         public const float VfH = 989f;
 
-        private const int RtW = 384, RtH = 512;
-        private const int VideoW = 96, VideoH = 128;
+        private const int RtW = 384, RtH = 512;      // снимок
+        private const int PrevW = 288, PrevH = 384;  // видоискатель
+        private const int VideoW = 96, VideoH = 128; // кадр видеозвонка
 
         private readonly PhoneInstance _phone;
-        private GameObject _camGo, _quad;
+        private GameObject _camGo;
         private Camera _cam;
-        private RenderTexture _rt;
-        private Texture2D _read;
-        private Material _quadMat;
+        private RenderTexture _rt, _prevRt, _smallRt;
+        private Texture2D _read, _prevTex, _small;
+        private float _nextPreview, _nextVideo;
+        private bool _on, _diagDone;
+
+        /// <summary>Последний кадр видоискателя, готовый к отрисовке.</summary>
+        public TexData Preview;
 
         public bool Front;                 // селфи-камера
         public int Lens = 1;               // 0 = 0.5x, 1 = 1x, 2 = 3x
@@ -41,49 +47,57 @@ namespace LPhone
 
         // ─────────────── жизненный цикл ───────────────
 
-        private bool _on;
-
-        public void Enable(bool showViewfinder)
+        public void Enable()
         {
             try
             {
                 if (_cam == null) Create();
-                if (_cam == null) return;
-                if (_on && _quad != null && _quad.activeSelf == showViewfinder) return;
+                if (_cam == null || _on) return;
                 _on = true;
                 Place();
                 _cam.enabled = true;
-                if (_quad != null) _quad.SetActive(showViewfinder);
+                _nextPreview = 0f;
             }
             catch (Exception e) { MelonLogger.Warning("[LPhone] камера вкл: " + e.Message); }
         }
 
         public void Disable()
         {
+            if (!_on) return;
             _on = false;
             try { if (_cam != null) _cam.enabled = false; } catch { }
-            try { if (_quad != null) _quad.SetActive(false); } catch { }
         }
 
         public void Destroy()
         {
             try { if (_camGo != null) UnityEngine.Object.Destroy(_camGo); } catch { }
-            try { if (_quad != null) UnityEngine.Object.Destroy(_quad); } catch { }
-            try { if (_rt != null) { _rt.Release(); UnityEngine.Object.Destroy(_rt); } } catch { }
-            _camGo = null; _quad = null; _rt = null; _cam = null;
+            Release(ref _rt); Release(ref _prevRt); Release(ref _smallRt);
+            _camGo = null; _cam = null;
         }
 
-        private void Create()
+        private static void Release(ref RenderTexture rt)
         {
-            _rt = new RenderTexture(RtW, RtH, 16, RenderTextureFormat.ARGB32)
+            try { if (rt != null) { rt.Release(); UnityEngine.Object.Destroy(rt); } } catch { }
+            rt = null;
+        }
+
+        private static RenderTexture NewRT(int w, int h, string name)
+        {
+            var rt = new RenderTexture(w, h, 16, RenderTextureFormat.ARGB32)
             {
-                name = "LPhone_RT",
+                name = name,
                 antiAliasing = 1,
                 useMipMap = false,
                 autoGenerateMips = false,
                 hideFlags = HideFlags.HideAndDontSave,
             };
-            _rt.Create();
+            rt.Create();
+            return rt;
+        }
+
+        private void Create()
+        {
+            _rt = NewRT(RtW, RtH, "LPhone_RT");
 
             _camGo = new GameObject("LPhone_Cam");
             _camGo.transform.SetParent(_phone.Root.transform, false);
@@ -96,8 +110,6 @@ namespace LPhone
             _cam.allowHDR = false;
             _cam.allowMSAA = false;
             _cam.depth = -20f;               // не мешаем основной камере
-            // В URP ручной Camera.Render() не поддерживается, поэтому камеру
-            // просто включаем на время работы приложения и гасим сразу после.
             _cam.enabled = false;
             // NameToLayer вернёт -1, если слоя нет, а 1 << -1 в C# — это бит 31,
             // и мы бы случайно выключили фон. Поэтому только при валидном слое.
@@ -108,58 +120,7 @@ namespace LPhone
             }
             catch { }
 
-            BuildQuad();
             MelonLogger.Msg("[LPhone] камера создана");
-        }
-
-        /// <summary>Квад видоискателя ровно поверх области предпросмотра.</summary>
-        private void BuildQuad()
-        {
-            var parent = _phone.ScreenTransform != null ? _phone.ScreenTransform : _phone.Root.transform;
-
-            float top = Phone.ScreenH * (0.5f - VfTop / 1600f);
-            float bottom = Phone.ScreenH * (0.5f - (VfTop + VfH) / 1600f);
-            float hw = Phone.ScreenW * 0.5f;
-
-            var mesh = new Mesh { hideFlags = HideFlags.HideAndDontSave };
-            mesh.vertices = new Il2CppStructArray<Vector3>(new[]
-            {
-                new Vector3(-hw, bottom, 0f),
-                new Vector3( hw, bottom, 0f),
-                new Vector3( hw, top,    0f),
-                new Vector3(-hw, top,    0f),
-            });
-            mesh.uv = new Il2CppStructArray<Vector2>(new[]
-            {
-                new Vector2(0f, 0f), new Vector2(1f, 0f),
-                new Vector2(1f, 1f), new Vector2(0f, 1f),
-            });
-            mesh.triangles = new Il2CppStructArray<int>(new[] { 0, 2, 1, 0, 3, 2 });
-            mesh.RecalculateNormals();
-            mesh.RecalculateBounds();
-
-            _quad = new GameObject("LPhone_Viewfinder");
-            _quad.transform.SetParent(parent, false);
-            _quad.transform.localPosition = new Vector3(0f, 0f, 0.0006f);
-            _quad.transform.localRotation = Quaternion.identity;
-            _quad.layer = parent.gameObject.layer;
-
-            _quad.AddComponent<MeshFilter>().sharedMesh = mesh;
-
-            var sh = PhoneBuilder.GetShader();
-            if (sh != null)
-            {
-                _quadMat = new Material(sh) { hideFlags = HideFlags.HideAndDontSave };
-                try { _quadMat.mainTexture = _rt; } catch { }
-                try { _quadMat.SetTexture("_BaseMap", _rt); } catch { }
-                try { _quadMat.EnableKeyword("_EMISSION"); } catch { }
-                try { _quadMat.SetTexture("_EmissionMap", _rt); } catch { }
-                try { _quadMat.SetColor("_EmissionColor", Color.white); } catch { }
-                try { _quadMat.SetFloat("_Metallic", 0f); } catch { }
-                try { _quadMat.SetFloat("_Smoothness", 0f); } catch { }
-                _quad.AddComponent<MeshRenderer>().sharedMaterial = _quadMat;
-            }
-            _quad.SetActive(false);
         }
 
         private void Place()
@@ -177,51 +138,108 @@ namespace LPhone
             _cam.fieldOfView = Fov[Mathf.Clamp(Lens, 0, Fov.Length - 1)];
         }
 
-        /// <summary>Оставлено для совместимости: в URP кадр рисует сама включённая камера.</summary>
-        public void Render(float hz = 15f) { }
-
         public void SetLens(int lens)
         {
             Lens = Mathf.Clamp(lens, 0, Fov.Length - 1);
             if (_cam != null) _cam.fieldOfView = Fov[Lens];
+            _nextPreview = 0f;
         }
 
         public void Flip()
         {
             Front = !Front;
             Place();
+            _nextPreview = 0f;
+        }
+
+        // ─────────────── видоискатель ───────────────
+
+        /// <summary>Обновляет Preview. true — кадр сменился, экран надо перерисовать.</summary>
+        public bool UpdatePreview(float hz = 8f)
+        {
+            if (_cam == null || !_on) return false;
+            if (Time.unscaledTime < _nextPreview) return false;
+            _nextPreview = Time.unscaledTime + 1f / Mathf.Max(1f, hz);
+
+            try
+            {
+                if (_prevRt == null) _prevRt = NewRT(PrevW, PrevH, "LPhone_PrevRT");
+                if (_prevTex == null)
+                    _prevTex = new Texture2D(PrevW, PrevH, TextureFormat.RGBA32, false)
+                    { hideFlags = HideFlags.HideAndDontSave };
+
+                Graphics.Blit(_rt, _prevRt);          // уменьшаем на GPU
+
+                var prev = RenderTexture.active;
+                RenderTexture.active = _prevRt;
+                _prevTex.ReadPixels(new Rect(0, 0, PrevW, PrevH), 0, 0, false);
+                _prevTex.Apply(false);
+                RenderTexture.active = prev;
+
+                Preview = TexData.FromTexture(_prevTex);
+                Diagnose();
+                return true;
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("[LPhone] видоискатель: " + e.Message);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Разовая проверка первого кадра. Если он полностью чёрный, значит URP
+        /// не отрисовала нашу камеру — пробуем дёрнуть её вручную и пишем в лог,
+        /// что именно помогло. Без этого «чёрный видоискатель» не отличить от
+        /// «в кадре действительно темно».
+        /// </summary>
+        private void Diagnose()
+        {
+            if (_diagDone || Preview == null) return;
+            _diagDone = true;
+
+            long sum = 0;
+            var px = Preview.Pixels;
+            for (int i = 0; i < px.Length; i += 97) sum += px[i].r + px[i].g + px[i].b;
+            int n = (px.Length + 96) / 97;
+            float avg = n > 0 ? sum / (float)(n * 3) : 0f;
+            MelonLogger.Msg($"[LPhone] видоискатель: средняя яркость {avg:0.0}/255");
+
+            if (avg > 1.5f) return;
+
+            MelonLogger.Warning("[LPhone] кадр пустой — пробуем ручной Render()");
+            try
+            {
+                _cam.Render();
+                MelonLogger.Msg("[LPhone] ручной Render() прошёл");
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("[LPhone] ручной Render() не поддерживается: " + e.Message);
+            }
         }
 
         // ─────────────── снимок ───────────────
 
-        private Texture2D ReadBack()
-        {
-            if (_rt == null || _cam == null) return null;
-
-            if (_read == null || _read.width != RtW || _read.height != RtH)
-            {
-                _read = new Texture2D(RtW, RtH, TextureFormat.RGBA32, false)
-                { hideFlags = HideFlags.HideAndDontSave };
-            }
-
-            var prev = RenderTexture.active;
-            RenderTexture.active = _rt;
-            _read.ReadPixels(new Rect(0, 0, RtW, RtH), 0, 0, false);
-            _read.Apply(false);
-            RenderTexture.active = prev;
-            return _read;
-        }
-
         /// <summary>Спуск затвора: снимок уходит в галерею.</summary>
         public Photo Capture()
         {
+            if (_rt == null || _cam == null) return null;
             try
             {
-                var t = ReadBack();
-                if (t == null) return null;
-                var png = Jpeg.EncodePng(t);
-                var jpg = Jpeg.EncodeJpg(t, 78);      // по сети гоним лёгкую копию
-                var data = TexData.FromTexture(t);
+                if (_read == null)
+                    _read = new Texture2D(RtW, RtH, TextureFormat.RGBA32, false)
+                    { hideFlags = HideFlags.HideAndDontSave };
+
+                var prev = RenderTexture.active;
+                RenderTexture.active = _rt;
+                _read.ReadPixels(new Rect(0, 0, RtW, RtH), 0, 0, false);
+                _read.Apply(false);
+                RenderTexture.active = prev;
+
+                var png = Jpeg.EncodePng(_read);
+                var jpg = Jpeg.EncodeJpg(_read, 78);      // по сети гоним лёгкую копию
+                var data = TexData.FromTexture(_read);
                 if (data == null) return null;
                 return PhotoStore.Add(data, png, jpg);
             }
@@ -234,33 +252,21 @@ namespace LPhone
 
         // ─────────────── кадр для видеозвонка ───────────────
 
-        private Texture2D _small;
-        private RenderTexture _smallRt;
-        private float _nextVideo;
-
         /// <summary>Маленький JPEG для видеозвонка. Сжатие и частоту держим низкими,
         /// иначе канал Fusion захлебнётся, а Quest просядет по FPS.</summary>
         public byte[] VideoFrame(float hz = 4f)
         {
-            if (_cam == null) return null;
+            if (_cam == null || !_on) return null;
             if (Time.unscaledTime < _nextVideo) return null;
             _nextVideo = Time.unscaledTime + 1f / Mathf.Max(1f, hz);
 
             try
             {
-                if (_smallRt == null)
-                {
-                    _smallRt = new RenderTexture(VideoW, VideoH, 16, RenderTextureFormat.ARGB32)
-                    { hideFlags = HideFlags.HideAndDontSave };
-                    _smallRt.Create();
-                }
+                if (_smallRt == null) _smallRt = NewRT(VideoW, VideoH, "LPhone_VidRT");
                 if (_small == null)
-                {
                     _small = new Texture2D(VideoW, VideoH, TextureFormat.RGB24, false)
                     { hideFlags = HideFlags.HideAndDontSave };
-                }
 
-                // уменьшаем на GPU: читать 384x512 ради кадра видеозвонка — расточительно
                 Graphics.Blit(_rt, _smallRt);
 
                 var prev = RenderTexture.active;

@@ -5,9 +5,8 @@ namespace LPhone
 {
     /// <summary>
     /// Камера в духе iPhone: видоискатель, переключение объективов 0,5x / 1x / 3x,
-    /// фронт/тыл и спуск затвора. Кадр показывается настоящим квадом поверх
-    /// экрана (см. CameraRig), поэтому предпросмотр не стоит ни одного
-    /// прочитанного пикселя.
+    /// кнопка смены основной и фронтальной камеры, спуск затвора.
+    /// Кадр приходит из CameraRig уже готовым буфером.
     /// </summary>
     internal sealed class CameraApp : PhoneApp
     {
@@ -20,7 +19,7 @@ namespace LPhone
 
         public override void Open()
         {
-            OS.Cam?.Enable(true);
+            OS.Cam?.Enable();
             OS.Invalidate();
         }
 
@@ -31,7 +30,8 @@ namespace LPhone
 
         public override void Tick()
         {
-            OS.Cam?.Render(15f);
+            // новый кадр видоискателя — только тогда и перерисовываем экран
+            if (OS.Cam != null && OS.Cam.UpdatePreview(8f)) OS.Invalidate();
             if (_flash > 0f) { _flash -= Time.deltaTime * 3.5f; OS.Invalidate(); }
             if (_toastUntil > 0f && Time.unscaledTime > _toastUntil) { _toastUntil = 0f; OS.Invalidate(); }
         }
@@ -39,7 +39,7 @@ namespace LPhone
         // ─────────────── вёрстка ───────────────
 
         private RectInt Shutter() => R(742f / 2f - 90f, 1330f, 180f, 180f);
-        private RectInt Flip() => R(742f - 190f, 1370f, 110f, 110f);
+        private RectInt Flip() => R(742f - 210f, 1348f, 148f, 148f);
         private RectInt Thumb() => R(66f, 1370f, 110f, 110f);
         private RectInt LensChip(int i) => R(742f / 2f - 165f + i * 115f, 1210f, 100f, 76f);
 
@@ -48,14 +48,20 @@ namespace LPhone
             G.Clear(new Color32(6, 6, 8, 255));
             OS.DrawStatusBar();
 
-            // область видоискателя — за ней настоящий квад, поэтому под ним чёрный фон
+            // кадр видоискателя
             int vy = P(CameraRig.VfTop), vh = P(CameraRig.VfH);
-            G.Rect(0, vy, W, vh, new Color32(0, 0, 0, 255));
+            var frame = OS.Cam != null ? OS.Cam.Preview : null;
+            if (frame != null)
+            {
+                G.BlitOpaque(frame, 0, vy, W, vh);
+            }
+            else
+            {
+                G.Rect(0, vy, W, vh, new Color32(0, 0, 0, 255));
+                G.Text(OS.Cam != null && OS.Cam.Ready ? "Наводим…" : "Камера недоступна",
+                       W / 2, vy + vh / 2, 0.42f * K, UI.Dim, Gfx.Align.Center);
+            }
 
-            if (OS.Cam == null || !OS.Cam.Ready)
-                G.Text("Камера недоступна", W / 2, vy + vh / 2, 0.42f * K, UI.Dim, Gfx.Align.Center);
-
-            // рамка/сетка кадра поверх квада не нарисуется — вместо неё углы вокруг
             var corner = new Color32(255, 255, 255, 120);
             int cl = P(36), th = Mathf.Max(2, P(5));
             G.Rect(0, vy - th, cl, th, corner); G.Rect(W - cl, vy - th, cl, th, corner);
@@ -72,8 +78,9 @@ namespace LPhone
                        on ? new Color32(20, 20, 24, 255) : UI.White, Gfx.Align.Center);
             }
 
-            G.Text(OS.Cam != null && OS.Cam.Front ? "Фронтальная" : "Основная",
-                   W / 2, P(1160), 0.32f * K, UI.Dim, Gfx.Align.Center);
+            bool front = OS.Cam != null && OS.Cam.Front;
+            G.Text(front ? "ФРОНТАЛЬНАЯ" : "ОСНОВНАЯ",
+                   W / 2, P(1156), 0.30f * K, new Color32(255, 214, 10, 235), Gfx.Align.Center);
 
             // затвор
             var s = Shutter();
@@ -89,10 +96,16 @@ namespace LPhone
             else
                 G.RoundRect(t.x, t.y, t.width, t.height, P(20), new Color32(40, 40, 46, 255));
 
-            // переворот камеры
+            // смена камеры: основная <-> фронтальная
             var f = Flip();
-            G.Circle(f.x + f.width / 2, f.y + f.height / 2, f.width / 2, new Color32(60, 60, 68, 255));
-            UI.CamGlyph(G, f.x + f.width / 2, f.y + f.height / 2, P(60), UI.White);
+            int fcx = f.x + f.width / 2, fcy = f.y + f.height / 2;
+            G.Circle(fcx, fcy, f.width / 2, front ? new Color32(255, 214, 10, 235)
+                                                  : new Color32(62, 62, 70, 255));
+            var fg = front ? new Color32(20, 20, 24, 255) : UI.White;
+            UI.CamGlyph(G, fcx, fcy - P(6), P(52), fg);
+            UI.SwapGlyph(G, fcx, fcy, P(120), fg);
+            G.Text(front ? "фронт" : "тыл", fcx, f.y + f.height + P(8), 0.28f * K,
+                   UI.White, Gfx.Align.Center);
 
             if (_flash > 0f) G.Rect(0, 0, W, H, UI.White, Mathf.Clamp01(_flash));
 

@@ -20,6 +20,48 @@ namespace LPhone
         private static Shader _shader;
         private static bool _shaderSearched;
 
+        /// <summary>Расцветка корпуса. Три цвета — ровно те, в которых выпускается
+        /// iPhone 17 Pro Max: Cosmic Orange, Deep Blue и Silver.</summary>
+        internal struct BodyStyle
+        {
+            public string Name;
+            public Color32 Frame;   // рама по периметру
+            public Color32 Dark;    // тёмная рама, плато камер, кнопки
+            public Color32 Back;    // задняя стеклянная панель
+        }
+
+        internal static readonly BodyStyle[] Styles =
+        {
+            new BodyStyle { Name = "Cosmic Orange",
+                            Frame = new Color32(0xE8, 0x76, 0x3A, 255),
+                            Dark  = new Color32(0xD4, 0x66, 0x2D, 255),
+                            Back  = new Color32(0xEE, 0x7C, 0x42, 255) },
+            new BodyStyle { Name = "Deep Blue",
+                            Frame = new Color32(0x2E, 0x4E, 0x7E, 255),
+                            Dark  = new Color32(0x24, 0x40, 0x6A, 255),
+                            Back  = new Color32(0x35, 0x57, 0x8A, 255) },
+            new BodyStyle { Name = "Silver",
+                            Frame = new Color32(0xD8, 0xD9, 0xDC, 255),
+                            Dark  = new Color32(0xC4, 0xC6, 0xCA, 255),
+                            Back  = new Color32(0xE6, 0xE7, 0xEA, 255) },
+        };
+
+        private static BodyStyle _style = Styles[0];
+        private static readonly System.Random _rnd = new System.Random();
+        private static int _lastStyle = -1;
+
+        /// <summary>
+        /// sRGB в линейное. Шейдеру цвет уходит как есть, а проект в линейном
+        /// пространстве — если подать байты напрямую, оранжевый выйдет бурым.
+        /// </summary>
+        private static Color Lin(Color32 c) => new Color(Ch(c.r), Ch(c.g), Ch(c.b));
+
+        private static float Ch(byte b)
+        {
+            float v = b / 255f;
+            return v <= 0.04045f ? v / 12.92f : Mathf.Pow((v + 0.055f) / 1.055f, 2.4f);
+        }
+
         private static void Step(string s) => MelonLogger.Msg("[LPhone] ... " + s);
 
         /// <summary>Гарантированно живой шейдер: сначала по имени, потом «занимаем» у сцены.</summary>
@@ -112,14 +154,14 @@ namespace LPhone
             Color c; float metal, rough;
             switch (id)
             {
-                case 1: c = new Color(0.660f, 0.135f, 0.030f); metal = 0.85f; rough = 0.34f; break;
+                case 1: c = Lin(_style.Dark);                  metal = 0.85f; rough = 0.34f; break;
                 case 2: c = Color.white;                       metal = 0.00f; rough = 0.06f; break;
                 case 3: c = new Color(0.015f, 0.025f, 0.055f); metal = 0.35f; rough = 0.05f; break;
                 case 4: c = new Color(0.780f, 0.780f, 0.800f); metal = 1.00f; rough = 0.22f; break;
                 case 5: c = new Color(0.030f, 0.030f, 0.030f); metal = 0.00f; rough = 0.35f; break;
                 case 6: c = new Color(0.008f, 0.008f, 0.010f); metal = 0.00f; rough = 0.10f; break;
-                case 7: c = new Color(0.855f, 0.215f, 0.055f); metal = 0.30f; rough = 0.28f; break;
-                default: c = new Color(0.807f, 0.181f, 0.042f); metal = 0.85f; rough = 0.40f; break;
+                case 7: c = Lin(_style.Back);                  metal = 0.30f; rough = 0.28f; break;
+                default: c = Lin(_style.Frame);                metal = 0.85f; rough = 0.40f; break;
             }
 
             Material m;
@@ -185,9 +227,37 @@ namespace LPhone
             for (int i = 0; i < t.childCount; i++) SetLayerRecursive(t.GetChild(i), layer);
         }
 
+        /// <summary>
+        /// Разворот UV экрана на 180 градусов.
+        ///
+        /// Экранная панель лежит на +Z, а её UV запечены как u=(x+w/2)/w,
+        /// v=(y+h/2)/h. Но игрок смотрит на экран СО СТОРОНЫ +Z, и в этом
+        /// положении ось +X меша идёт для него ВЛЕВО, а SetPixels32 кладёт
+        /// нулевую строку нашего буфера (визуальный верх) в НИЗ текстуры.
+        /// В сумме картинка выходила зеркальной по обеим осям — то самое
+        /// «фулл перевёрнутое» управление. Инвертируем обе координаты.
+        /// </summary>
+        private static Vector2[] ScreenUV(Vector2[] src)
+        {
+            var r = new Vector2[src.Length];
+            for (int i = 0; i < src.Length; i++)
+                r[i] = new Vector2(1f - src[i].x, 1f - src[i].y);
+            return r;
+        }
+
         public static PhoneInstance Build(Vector3 position, Quaternion rotation)
         {
             Step("старт сборки");
+
+            // Цвет каждый раз случайный, но не тот же, что в прошлый спавн —
+            // иначе из трёх вариантов два подряд совпадения выглядят как баг.
+            int si = _rnd.Next(Styles.Length);
+            if (si == _lastStyle && Styles.Length > 1)
+                si = (si + 1 + _rnd.Next(Styles.Length - 1)) % Styles.Length;
+            _lastStyle = si;
+            _style = Styles[si];
+            Step("цвет корпуса: " + _style.Name);
+
             var sh = GetShader();
 
             var root = new GameObject("LPhone_17_Pro_Max");
@@ -211,7 +281,9 @@ namespace LPhone
                     var mesh = new Mesh { hideFlags = HideFlags.HideAndDontSave };
                     // массовые конструкторы — без поэлементного interop
                     mesh.vertices = new Il2CppStructArray<Vector3>(part.Vertices);
-                    if (part.UV != null) mesh.uv = new Il2CppStructArray<Vector2>(part.UV);
+                    var uv = part.UV;
+                    if (uv != null && part.Name == "Screen_UI_Anchor") uv = ScreenUV(uv);
+                    if (uv != null) mesh.uv = new Il2CppStructArray<Vector2>(uv);
                     mesh.triangles = new Il2CppStructArray<int>(part.Triangles);
                     mesh.RecalculateNormals();
                     mesh.RecalculateBounds();
@@ -322,10 +394,11 @@ namespace LPhone
         public const float ScreenW = 0.0742f;
         public const float ScreenH = 0.1600f;
 
-        // 371x800: на расстоянии вытянутой руки в VR этого с запасом хватает,
-        // а работы вчетверо меньше, чем при 742x1600.
-        public const int ScreenPxW = 371;
-        public const int ScreenPxH = 800;
+        // 742x1600 — ровно 0.1 мм на пиксель, около 254 PPI. На 371x800 текст
+        // на дистанции вытянутой руки читался плохо. Цена подъёма гасится
+        // полосной заливкой в Gfx: перерисовывается только изменившаяся часть.
+        public const int ScreenPxW = 742;
+        public const int ScreenPxH = 1600;
 
         public const int SafeTop = 75;
         public const int SafeBottom = 20;

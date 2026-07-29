@@ -4,7 +4,7 @@ using BoneLib.BoneMenu;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.4.1", "BE PRIME")]
+[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.4.2", "BE PRIME")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 [assembly: MelonOptionalDependencies("LabFusion")]
 
@@ -19,7 +19,7 @@ namespace LPhone
         {
             BuildMenu();
             PalletBinder.Install(HarmonyInstance);
-            MelonLogger.Msg("[LPhone] загружен v0.4.1");
+            MelonLogger.Msg("[LPhone] загружен v0.4.2");
             MelonLogger.Msg("[LPhone] Telegram: @be_primex");
         }
 
@@ -66,6 +66,8 @@ namespace LPhone
                     (Action<bool>)((v) => { EnableTouch = v; MelonLogger.Msg("[LPhone] touch: " + v); }));
                 root.CreateBool("Hand grab", new Color(0.9f, 0.8f, 0.2f), PhoneGrab.Enabled,
                     (Action<bool>)((v) => { PhoneGrab.Enabled = v; MelonLogger.Msg("[LPhone] grab: " + v); }));
+                // По умолчанию выключено: притягивание ловило любое сжатие кулака
+                // и телефон прилетал в руку сам собой.
                 root.CreateBool("Pull to hand", new Color(0.5f, 0.8f, 1f), PhoneGrab.PullEnabled,
                     (Action<bool>)((v) => PhoneGrab.PullEnabled = v));
 
@@ -83,6 +85,9 @@ namespace LPhone
                 hold.CreateFloat("Tilt, deg", new Color(0.8f, 0.85f, 1f),
                     PhoneGrab.HoldTilt, 2f, -40f, 40f,
                     (Action<float>)((v) => PhoneGrab.HoldTilt = v));
+                // страховка: если телефон всё же лёг на тыльную сторону кисти
+                hold.CreateBool("Flip palm side", new Color(1f, 0.7f, 0.5f), PhoneGrab.FlipPalm,
+                    (Action<bool>)((v) => { PhoneGrab.FlipPalm = v; MelonLogger.Msg("[LPhone] flip palm: " + v); }));
             }
             catch (Exception e) { MelonLogger.Error("[LPhone] menu: " + e); }
         }
