@@ -16,7 +16,7 @@ namespace LPhone
         public readonly int W, H;
         private readonly Color32[] _buf;
         private readonly Texture2D _tex;
-        private Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Color32> _gpu;
+        private bool _firstPresentLogged, _firstApplyLogged;
         private bool _dirty = true;
 
         public Texture2D Texture => _tex;
@@ -39,12 +39,21 @@ namespace LPhone
         {
             if (!_dirty) return;
             _dirty = false;
-            // один массовый memcpy вместо миллиона interop-обращений
-            if (_gpu == null)
-                _gpu = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Color32>(_buf.Length);
-            _buf.AsSpan().CopyTo(_gpu.AsSpan());
-            _tex.SetPixels32(_gpu);
+            // Массовый конструктор из managed-массива — самый безопасный путь в Il2Cpp
+            // (span поверх временного Il2Cpp-массива рискует «уехать» из-под GC).
+            if (!_firstPresentLogged)
+            {
+                _firstPresentLogged = true;
+                MelonLoader.MelonLogger.Msg($"[LPhone] ... первый Present {W}x{H}");
+            }
+            var gpu = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Color32>(_buf);
+            _tex.SetPixels32(gpu);
             _tex.Apply(false);
+            if (!_firstApplyLogged)
+            {
+                _firstApplyLogged = true;
+                MelonLoader.MelonLogger.Msg("[LPhone] ... первый Apply ок");
+            }
         }
 
         // ─────────────────── примитивы ───────────────────
@@ -273,7 +282,8 @@ namespace LPhone
         public static TexData FromTexture(Texture2D t)
         {
             if (t == null) return null;
-            var src = t.GetPixels32().AsSpan();
+            var raw = t.GetPixels32();          // держим ссылку живой, пока работаем со span
+            var src = raw.AsSpan();
             var d = new TexData { W = t.width, H = t.height, Pixels = new Color32[src.Length] };
             // Unity отдаёт пиксели снизу вверх — переворачиваем построчно (по строке за раз)
             for (int y = 0; y < d.H; y++)

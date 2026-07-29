@@ -37,7 +37,6 @@ namespace LPhone
                 "Universal Render Pipeline/Lit",
                 "Universal Render Pipeline/Simple Lit",
                 "Universal Render Pipeline/Unlit",
-                "Standard",
             })
             {
                 try
@@ -53,7 +52,8 @@ namespace LPhone
                 catch { }
             }
 
-            // Shader.Find пуст — берём шейдер у произвольного рендерера сцены.
+            // Игра на URP, а Shader.Find("Standard") дал бы шейдер старого пайплайна —
+            // он в URP не рисуется. Поэтому берём шейдер у живого рендерера сцены.
             try
             {
                 var rends = UnityEngine.Object.FindObjectsOfType<MeshRenderer>();
@@ -72,6 +72,18 @@ namespace LPhone
                 }
             }
             catch (Exception e) { MelonLogger.Warning("[LPhone] поиск шейдера: " + e.Message); }
+
+            try
+            {
+                var last = Shader.Find("Standard");     // крайний случай: хоть что-то
+                if (last != null)
+                {
+                    _shader = last;
+                    MelonLogger.Warning("[LPhone] запасной шейдер Standard (в URP может не рисоваться)");
+                    return _shader;
+                }
+            }
+            catch { }
 
             MelonLogger.Error("[LPhone] шейдер не найден — телефон будет без материалов");
             return null;

@@ -19,6 +19,8 @@
     <EmbeddedResource Include="res/icon_gallery.png" LogicalName="LPhone.icon_gallery.png" />
     <EmbeddedResource Include="res/icon_store.png" LogicalName="LPhone.icon_store.png" />
     <EmbeddedResource Include="res/icon_messenger.png" LogicalName="LPhone.icon_messenger.png" />
+    <EmbeddedResource Include="res/font.png" LogicalName="LPhone.font.png" />
+    <EmbeddedResource Include="res/font.bin" LogicalName="LPhone.font.bin" />
   </ItemGroup>
 
   <ItemGroup>

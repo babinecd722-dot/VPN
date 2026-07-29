@@ -4,7 +4,7 @@ using BoneLib.BoneMenu;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.1.1", "BE PRIME")]
+[assembly: MelonInfo(typeof(LPhone.LPhoneMod), "LPhone", "0.1.2", "BE PRIME")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace LPhone
@@ -12,6 +12,9 @@ namespace LPhone
     public class LPhoneMod : MelonMod
     {
         private static readonly List<PhoneInstance> _phones = new List<PhoneInstance>();
+        /// <summary>Тач можно отключить — полезно, чтобы локализовать краш.</summary>
+        public static bool EnableTouch = true;
+        private static int _ticks;
 
         public override void OnInitializeMelon()
         {
@@ -28,8 +31,16 @@ namespace LPhone
                 if (!p.Alive) { _phones.RemoveAt(i); continue; }
                 try
                 {
-                    TouchInput.Tick(p);
+                    if (_ticks < 3)
+                    {
+                        _ticks++;
+                        MelonLogger.Msg($"[LPhone] ... кадр {_ticks}: тач");
+                    }
+                    if (EnableTouch) TouchInput.Tick(p);
+
+                    if (_ticks <= 3) MelonLogger.Msg($"[LPhone] ... кадр {_ticks}: отрисовка");
                     p.OS.Tick();
+                    if (_ticks <= 3) MelonLogger.Msg($"[LPhone] ... кадр {_ticks}: ок");
                 }
                 catch (Exception e)
                 {
@@ -49,6 +60,12 @@ namespace LPhone
                     (Action)DespawnAll);
                 // SLZ-компоненты в рантайме — частая причина нативных крашей,
                 // поэтому хват отдельным тумблером, по умолчанию выключен.
+                root.CreateBool("Touch input", new Color(0.4f, 0.9f, 0.6f), EnableTouch,
+                    (Action<bool>)((v) =>
+                    {
+                        EnableTouch = v;
+                        MelonLogger.Msg("[LPhone] тач: " + (v ? "ВКЛ" : "выкл"));
+                    }));
                 root.CreateBool("Grip (экспериментально)", new Color(0.9f, 0.8f, 0.2f),
                     PhoneBuilder.EnableGrip,
                     (Action<bool>)((v) =>
