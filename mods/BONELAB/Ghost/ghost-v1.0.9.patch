@@ -1,0 +1,343 @@
+diff --git a/sources/BuildInfo.cs b/sources/BuildInfo.cs
+index f3d7450..d3624e2 100644
+--- a/sources/BuildInfo.cs
++++ b/sources/BuildInfo.cs
+@@ -4,6 +4,6 @@ public static class BuildInfo
+ {
+     public const string Name = "Ghost";
+     public const string Author = "BE PRIME";
+-    public const string Version = "1.0.8";
++    public const string Version = "1.0.9";
+     public const string DownloadLink = "https://t.me/be_primex";
+ }
+diff --git a/sources/Ghost.csproj b/sources/Ghost.csproj
+index 6cfd1b1..3eaaca8 100644
+--- a/sources/Ghost.csproj
++++ b/sources/Ghost.csproj
+@@ -1,7 +1,7 @@
+ <Project Sdk="Microsoft.NET.Sdk">
+ 
+   <PropertyGroup>
+-    <TargetFramework>net6.0</TargetFramework>
++    <TargetFramework>net8.0</TargetFramework>
+     <LangVersion>latest</LangVersion>
+     <Nullable>disable</Nullable>
+     <AssemblyName>Ghost</AssemblyName>
+@@ -28,10 +28,8 @@
+     <Reference Include="UnityEngine.PhysicsModule"><HintPath>$(RefsRoot)/UnityEngine.PhysicsModule.dll</HintPath><Private>false</Private></Reference>
+     <Reference Include="UnityEngine.UI"><HintPath>$(RefsRoot)/UnityEngine.UI.dll</HintPath><Private>false</Private></Reference>
+     <Reference Include="UnityEngine.UIModule"><HintPath>$(RefsRoot)/UnityEngine.UIModule.dll</HintPath><Private>false</Private></Reference>
+-    <Reference Include="UnityEngine.IMGUIModule"><HintPath>$(RefsRoot)/UnityEngine.IMGUIModule.dll</HintPath><Private>false</Private></Reference>
+     <Reference Include="UnityEngine.TextRenderingModule"><HintPath>$(RefsRoot)/UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
+     <Reference Include="Il2CppSLZ.Marrow"><HintPath>$(RefsRoot)/Il2CppSLZ.Marrow.dll</HintPath><Private>false</Private></Reference>
+-    <Reference Include="Assembly-CSharp"><HintPath>$(RefsRoot)/Assembly-CSharp.dll</HintPath><Private>false</Private></Reference>
+     <Reference Include="LabFusion"><HintPath>$(RefsRoot)/LabFusion.dll</HintPath><Private>false</Private></Reference>
+   </ItemGroup>
+ 
+diff --git a/sources/GhostHolo.cs b/sources/GhostHolo.cs
+index 6fa5867..9bc6f7e 100644
+--- a/sources/GhostHolo.cs
++++ b/sources/GhostHolo.cs
+@@ -45,10 +45,11 @@ public static class GhostHolo
+     private static int _hoverIndex = -1;
+     private static int _insideIndex = -1;
+     private static float _clickLockUntil;
+-    private static float _prevBestPlane = 99f;
+-    private const float ClickCooldown = 0.42f;
+-    private const float PlaneMax = 0.028f;
+-    private const float PlaneEnter = 0.018f;
++    private static bool _touchDown;
++    private const float ClickCooldown = 0.28f;
++    private const float PlaneMax = 0.055f;    // дальше этого палец панель не видит
++    private const float PlaneEnter = 0.022f;  // ближе этого — нажатие
++    private const float PlaneExit = 0.038f;   // дальше этого — отпустил
+     private const float EdgePad = 0.12f;
+ 
+     private static float _toastT = 1f;
+@@ -138,6 +139,10 @@ public static class GhostHolo
+         _buttons.Clear();
+         _hoverIndex = -1;
+         _insideIndex = -1;
++        // без сброса плата при повторном показе стартовала со старым
++        // направлением и первые кадры «доезжала» на место
++        _touchDown = false;
++        _outInit = false;
+         if (_root != null)
+         {
+             Object.Destroy(_root);
+@@ -353,9 +358,30 @@ public static class GhostHolo
+         ApplyToastVisual();
+     }
+ 
++    // Сглаженное направление «наружу из предплечья». Хранится между кадрами,
++    // иначе плата дёргается при каждом движении головы.
++    private static Vector3 _outSmooth;
++    private static bool _outInit;
++
++    private const float LiftOffArm = 0.075f;   // на сколько поднять над рукой
++    private const float AlongArm = 0.45f;      // где вдоль предплечья (0 локоть, 1 кисть)
++
+     /// <summary>
+-    /// Locked to forearm bones only — no palm.up, no head tracking (those made it roll away).
+-    /// Plate flat on inner forearm, face toward the player.
++    /// Плата лежит на предплечье, ЛИЦОМ К ИГРОКУ и ГОРИЗОНТАЛЬНО (длинная
++    /// сторона вдоль предплечья).
++    ///
++    /// Что было не так. Направление «наружу» выбиралось как самая большая из
++    /// проекций трёх осей кости — это лотерея: при смене позы руки побеждала
++    /// другая ось, и плата прыгала на другую сторону. Плюс лицо Canvas
++    /// направлялось ВНУТРЬ руки: у мирового Canvas лицевая сторона — это +forward,
++    /// а не -forward, поэтому панель была видна с обратной стороны.
++    ///
++    /// Теперь базис детерминированный:
++    ///   forward (лицо)  = от предплечья К ГОЛОВЕ, спроецировано на плоскость
++    ///                     перпендикулярно оси руки — то есть всегда на игрока;
++    ///   right           = вдоль предплечья, поэтому плата лежит горизонтально;
++    ///   up              = выбирается так, чтобы смотреть В МИРОВОЙ ВЕРХ —
++    ///                     панель физически не может оказаться перевёрнутой.
+     /// </summary>
+     private static void AttachToLeftForearm()
+     {
+@@ -369,52 +395,75 @@ public static class GhostHolo
+             Transform wrist = art?.artWristLf;
+             Hand hand = Player.LeftHand;
+ 
+-            if (lower == null || wrist == null)
++            Vector3 elbowPos, wristPos;
++
++            if (lower != null && wrist != null)
++            {
++                elbowPos = lower.position;
++                wristPos = wrist.position;
++            }
++            else
+             {
++                // ART-рига нет — строим отрезок предплечья от кисти назад
+                 if (hand == null) return;
+                 Transform palm = hand.palmPositionTransform != null ? hand.palmPositionTransform : hand.transform;
+-                Vector3 fallPos = palm.TransformPoint(new Vector3(0f, 0.05f, -0.12f));
+-                // Face player: UI front is -forward → point forward into the palm
+-                Quaternion fallRot = Quaternion.LookRotation(-palm.up, -palm.forward);
+-                fallRot *= Quaternion.Euler(0f, 0f, -90f);
+-                _root.transform.SetPositionAndRotation(fallPos, fallRot);
+-                return;
++                wristPos = palm.position;
++                elbowPos = palm.position - palm.forward * 0.26f;
+             }
+ 
+-            Vector3 along = wrist.position - lower.position;
++            Vector3 along = wristPos - elbowPos;
+             if (along.sqrMagnitude < 1e-8f) return;
+             along.Normalize();
+ 
+-            // Stable "out of inner forearm" from the BONE axes (follows arm, not fingers).
+-            Vector3 a = Vector3.ProjectOnPlane(lower.up, along);
+-            Vector3 b = Vector3.ProjectOnPlane(lower.right, along);
+-            Vector3 c = Vector3.ProjectOnPlane(lower.forward, along);
+-            Vector3 outward = a;
+-            if (b.sqrMagnitude > outward.sqrMagnitude) outward = b;
+-            if (c.sqrMagnitude > outward.sqrMagnitude) outward = c;
+-            if (outward.sqrMagnitude < 1e-8f) return;
++            Vector3 basePos = Vector3.Lerp(elbowPos, wristPos, AlongArm);
++
++            // Лицо панели — на игрока. Берём направление к голове и убираем
++            // составляющую вдоль руки, чтобы панель осталась «лежащей» на ней.
++            Vector3 outward = Vector3.zero;
++            Transform head = Player.Head;
++            if (head != null)
++                outward = Vector3.ProjectOnPlane(head.position - basePos, along);
++
++            if (outward.sqrMagnitude < 1e-6f)
++            {
++                // рука смотрит точно в лицо — берём любую перпендикулярную ось
++                outward = Vector3.ProjectOnPlane(Vector3.up, along);
++                if (outward.sqrMagnitude < 1e-6f) outward = Vector3.ProjectOnPlane(Vector3.forward, along);
++                if (outward.sqrMagnitude < 1e-6f) return;
++            }
+             outward.Normalize();
+ 
+-            // Flip once toward the palm side (sign only — does not track finger curl)
+-            if (hand?.palmPositionTransform != null)
++            if (!_outInit) { _outSmooth = outward; _outInit = true; }
++            else
+             {
+-                Vector3 toPalm = hand.palmPositionTransform.position - lower.position;
+-                if (Vector3.Dot(outward, toPalm) < 0f)
+-                    outward = -outward;
++                float k = 1f - Mathf.Exp(-12f * Mathf.Max(1e-4f, Time.unscaledDeltaTime));
++                _outSmooth = Vector3.Slerp(_outSmooth, outward, k);
++                if (_outSmooth.sqrMagnitude < 1e-6f) _outSmooth = outward;
++                _outSmooth.Normalize();
+             }
+ 
+-            // Mid-forearm, lifted off the skin toward the player
+-            Vector3 posMid = Vector3.Lerp(lower.position, wrist.position, 0.40f);
+-            posMid += outward * 0.07f;
++            // right панели = вдоль предплечья, поэтому она лежит горизонтально.
++            // Знак выбираем так, чтобы панель не оказалась перевёрнутой.
++            Vector3 up = Vector3.Cross(_outSmooth, along);
++            if (up.sqrMagnitude < 1e-8f) return;
++            up.Normalize();
+ 
+-            // Unity world canvas is readable from the -forward side.
+-            // Point forward INTO the arm so the FACE looks at the player.
+-            // up = toward elbow → long side of the plate runs across the arm (horizontal).
+-            Quaternion rot = Quaternion.LookRotation(-outward, -along);
+-            // 90° clockwise (вправо), as requested from the start
+-            rot *= Quaternion.Euler(0f, 0f, -90f);
++            float upness = Vector3.Dot(up, Vector3.up);
++            if (Mathf.Abs(upness) > 0.15f)
++            {
++                // обычная поза: верх панели — в мировой верх
++                if (upness < 0f) up = -up;
++            }
++            else
++            {
++                // Рука почти вертикальна: «верх по миру» тут вырождается в ноль
++                // и знак становился случайным — панель могла встать вверх ногами.
++                // Тогда ориентир другой: длинная сторона смотрит К КИСТИ.
++                if (Vector3.Dot(Vector3.Cross(up, _outSmooth), along) < 0f) up = -up;
++            }
+ 
+-            _root.transform.SetPositionAndRotation(posMid, rot);
++            Vector3 pos = basePos + _outSmooth * LiftOffArm;
++            _root.transform.SetPositionAndRotation(pos, Quaternion.LookRotation(_outSmooth, up));
+         }
+         catch { /* rig missing */ }
+     }
+@@ -514,47 +563,68 @@ public static class GhostHolo
+         }
+     }
+ 
++    /// <summary>
++    /// Нажатие пальцем.
++    ///
++    /// Что было не так. Срабатывание требовало, чтобы на ПРОШЛОМ кадре палец был
++    /// дальше 1.8 см, а на текущем — ближе: то есть нужно было попасть в зону
++    /// толщиной 1.8 см ровно между двумя кадрами. При 72 кадрах в секунду палец
++    /// эту зону перескакивает, а если он уже держится рядом с панелью, условие
++    /// не выполнится вообще никогда. Отсюда «тапы не работают».
++    ///
++    /// Теперь состояние с гистерезисом: касание засчитывается по ВХОДУ в зону
++    /// контакта и сбрасывается только когда палец вышел за зону отпускания.
++    /// Ловить конкретный кадр больше не нужно.
++    ///
++    /// Опрашиваются кончики обеих рук: тыкать можно любой.
++    /// </summary>
+     private static void HandleTouch()
+     {
+-        if (!TryGetRightIndexTip(out Vector3 tip))
++        if (_buttons.Count == 0)
+         {
+-            _prevBestPlane = 99f;
++            _touchDown = false;
++            _hoverIndex = -1;
++            _insideIndex = -1;
+             return;
+         }
+ 
+-        if (_buttons.Count == 0) return;
+-
+         int best = -1;
+         float bestAbs = float.MaxValue;
+-        for (int i = 0; i < _buttons.Count; i++)
++
++        for (int h = 0; h < 2; h++)
+         {
+-            HoloBtn b = _buttons[i];
+-            if (b?.Rt == null) continue;
+-            if (!TryHitRect(tip, b.Rt, EdgePad, out float plane, out bool inside))
+-                continue;
+-            if (!inside) continue;
+-            float a = Mathf.Abs(plane);
+-            if (a > PlaneMax) continue;
+-            if (a < bestAbs)
++            if (!TryGetFingerTip(h == 0, out Vector3 tip)) continue;
++
++            for (int i = 0; i < _buttons.Count; i++)
+             {
+-                bestAbs = a;
+-                best = i;
++                HoloBtn b = _buttons[i];
++                if (b?.Rt == null) continue;
++                if (!TryHitRect(tip, b.Rt, EdgePad, out float plane, out bool inside)) continue;
++                if (!inside) continue;
++                float a = Mathf.Abs(plane);
++                if (a > PlaneMax) continue;
++                if (a < bestAbs) { bestAbs = a; best = i; }
+             }
+         }
+ 
+         _hoverIndex = best;
+ 
+-        // Poke = tip crosses into contact depth while still over the button
+-        bool poke = best >= 0 && bestAbs <= PlaneEnter && _prevBestPlane > PlaneEnter;
+-        _prevBestPlane = best >= 0 ? bestAbs : 99f;
++        if (best < 0)
++        {
++            _touchDown = false;
++            _insideIndex = -1;
++            return;
++        }
+ 
+-        if (poke && Time.unscaledTime >= _clickLockUntil)
++        if (!_touchDown && bestAbs <= PlaneEnter)
+         {
++            _touchDown = true;
+             _insideIndex = best;
+-            FireButton(best);
++            if (Time.unscaledTime >= _clickLockUntil) FireButton(best);
+         }
+-        else if (best < 0)
++        else if (_touchDown && bestAbs > PlaneExit)
+         {
++            _touchDown = false;
+             _insideIndex = -1;
+         }
+     }
+@@ -605,23 +675,38 @@ public static class GhostHolo
+         catch (Exception ex) { MelonLogger.Warning($"Ghost btn: {ex.Message}"); }
+     }
+ 
+-    private static bool TryGetRightIndexTip(out Vector3 tip)
++    /// <summary>
++    /// Кончик указательного пальца. Раньше опрашивалась только правая рука —
++    /// а плата висит на левом предплечье, и тыкать в неё правой удобно не всегда.
++    /// Кость берём из ART-рига, а если его нет — считаем от ладони.
++    /// </summary>
++    private static bool TryGetFingerTip(bool right, out Vector3 tip)
+     {
+         tip = default;
+         try
+         {
+-            RigManager rm = Player.RigManager;
+-            if (rm?.physicsRig?.artOutput?.artFingerRt13 != null)
++            ArtRig art = Player.RigManager?.physicsRig?.artOutput;
++            if (art != null)
+             {
+-                tip = rm.physicsRig.artOutput.artFingerRt13.position;
+-                return true;
++                Transform bone = right ? art.artFingerRt13 : art.artFingerLf13;
++                if (bone != null)
++                {
++                    // от последней фаланги до подушечки — около 1.2 см
++                    Transform mid = right ? art.artFingerRt12 : art.artFingerLf12;
++                    Vector3 dir = mid != null ? (bone.position - mid.position) : bone.forward;
++                    if (dir.sqrMagnitude < 1e-8f) dir = bone.forward;
++                    tip = bone.position + dir.normalized * 0.012f;
++                    return true;
++                }
+             }
+-            Hand hand = Player.RightHand;
++
++            Hand hand = right ? Player.RightHand : Player.LeftHand;
+             if (hand != null)
+             {
+                 if (hand.palmPositionTransform != null)
+                 {
+-                    tip = hand.palmPositionTransform.TransformPoint(new Vector3(0.01f, 0.02f, 0.06f));
++                    float sx = right ? 0.01f : -0.01f;
++                    tip = hand.palmPositionTransform.TransformPoint(new Vector3(sx, 0.02f, 0.06f));
+                     return true;
+                 }
+                 tip = hand.transform.TransformPoint(new Vector3(0f, 0.02f, 0.05f));
