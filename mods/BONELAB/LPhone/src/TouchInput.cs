@@ -1,55 +1,99 @@
 using System;
+using System.Collections.Generic;
 using Il2CppSLZ.Marrow;
 using UnityEngine;
 
 namespace LPhone
 {
     /// <summary>
-    /// Тач по экрану кончиком указательного пальца.
-    /// Позиция пальца переводится в локальные координаты экранного меша,
-    /// затем в пиксели UI. Касание считается по «проколу» плоскости экрана.
+    /// Тач по экрану. Работает ЛЮБЫМ пальцем обеих рук — как на настоящем
+    /// телефоне: касание регистрирует тот палец, который реально продавил
+    /// стекло глубже всех и попал в границы экрана.
+    ///
+    /// Рука, которая держит телефон, из опроса исключается, иначе собственные
+    /// пальцы хвата постоянно «нажимали» бы на экран.
     /// </summary>
     internal static class TouchInput
     {
-        private const float TouchDepth  = 0.008f;   // насколько глубоко палец «продавил» экран
-        private const float HoverDepth  = 0.045f;   // на каком расстоянии уже следим
-        private const float FingerTipExt = 0.022f;  // от кости index3 до подушечки
-        private static bool _down;
+        private const float TouchDepth = 0.010f;   // палец продавил стекло
+        private const float HoverDepth = 0.055f;   // ближе этого уже следим
+        private const float ThroughDepth = -0.040f; // пролетел насквозь — не касание
+        private const float TipExt = 0.014f;       // от последней фаланги до подушечки
+        private const float EdgePad = 0.004f;      // допуск за краем экрана
+
+        private sealed class State
+        {
+            public bool Down;
+            public Vector2 Last;
+            public float DownTime;
+            public bool LongFired;
+        }
+
+        private static readonly Dictionary<int, State> _st = new Dictionary<int, State>();
+
+        public static void Forget(PhoneInstance p)
+        {
+            if (p?.Root != null) _st.Remove(p.Root.GetInstanceID());
+        }
 
         public static void Tick(PhoneInstance phone)
         {
             if (phone == null || !phone.Alive || phone.ScreenTransform == null) return;
+            int id = phone.Root.GetInstanceID();
+            if (!_st.TryGetValue(id, out var s)) { s = new State(); _st[id] = s; }
 
-            if (!TryFingerTip(phone, out Vector3 tip))
+            var holder = PhoneGrab.HandOf(phone);
+
+            // Ищем палец, который ближе всех к плоскости экрана и попадает в его габарит.
+            bool found = false;
+            Vector3 bestLocal = Vector3.zero;
+            float bestDepth = float.MaxValue;
+
+            foreach (var hand in new[] { BoneLib.Player.LeftHand, BoneLib.Player.RightHand })
             {
-                if (_down) { _down = false; }
+                if (hand == null || hand == holder) continue;
+                int cnt = FillTips(hand);
+                for (int k = 0; k < cnt; k++)
+                {
+                    Vector3 lp = phone.ScreenTransform.InverseTransformPoint(_tips[k]);
+                    if (Mathf.Abs(lp.x) > Phone.ScreenW * 0.5f + EdgePad) continue;
+                    if (Mathf.Abs(lp.y) > Phone.ScreenH * 0.5f + EdgePad) continue;
+                    if (lp.z > HoverDepth || lp.z < ThroughDepth) continue;
+                    if (lp.z < bestDepth) { bestDepth = lp.z; bestLocal = lp; found = true; }
+                }
+            }
+
+            if (!found)
+            {
+                if (s.Down) { s.Down = false; phone.OS.TouchUp(s.Last); }
                 return;
             }
 
-            // локальные координаты относительно экранного меша
-            Vector3 lp = phone.ScreenTransform.InverseTransformPoint(tip);
+            Vector2 px = ToPixels(bestLocal);
+            s.Last = px;
 
-            // за плоскостью экрана? (Z вперёд)
-            float depth = lp.z;
-            bool inside = Mathf.Abs(lp.x) <= Phone.ScreenW * 0.5f &&
-                          Mathf.Abs(lp.y) <= Phone.ScreenH * 0.5f;
-
-            if (!inside || depth > HoverDepth)
+            if (bestDepth <= TouchDepth)
             {
-                if (_down) { phone.OS.TouchUp(ToPixels(lp)); _down = false; }
-                return;
+                if (!s.Down)
+                {
+                    s.Down = true;
+                    s.DownTime = Time.unscaledTime;
+                    s.LongFired = false;
+                    phone.OS.TouchDown(px);
+                }
+                else
+                {
+                    phone.OS.TouchMove(px);
+                    if (!s.LongFired && Time.unscaledTime - s.DownTime > 0.55f)
+                    {
+                        s.LongFired = true;
+                        phone.OS.LongPress(px);
+                    }
+                }
             }
-
-            Vector2 px = ToPixels(lp);
-
-            if (depth <= TouchDepth)
+            else if (s.Down)
             {
-                if (!_down) { _down = true; phone.OS.TouchDown(px); }
-                else phone.OS.TouchMove(px);
-            }
-            else if (_down)
-            {
-                _down = false;
+                s.Down = false;
                 phone.OS.TouchUp(px);
             }
         }
@@ -59,61 +103,47 @@ namespace LPhone
         {
             float u = (local.x + Phone.ScreenW * 0.5f) / Phone.ScreenW;
             float v = (local.y + Phone.ScreenH * 0.5f) / Phone.ScreenH;
-            return new Vector2(u * Phone.ScreenPxW, (1f - v) * Phone.ScreenPxH);
+            return new Vector2(Mathf.Clamp01(u) * Phone.ScreenPxW,
+                               (1f - Mathf.Clamp01(v)) * Phone.ScreenPxH);
         }
 
-        /// <summary>
-        /// Кончик указательного пальца руки, которая БЛИЖЕ К ЭКРАНУ.
-        /// Берём настоящие кости (index2 -> index3) и продлеваем на подушечку —
-        /// это точнее, чем прикидывать смещение от ладони, и не зависит от того,
-        /// как ориентированы оси кисти.
-        /// </summary>
-        private static bool TryFingerTip(PhoneInstance phone, out Vector3 tip)
-        {
-            tip = Vector3.zero;
-            try
-            {
-                Vector3 screenPos = phone.ScreenTransform.position;
-                float best = float.MaxValue;
-                bool found = false;
+        // Переиспользуемый буфер: не мусорим массивом на каждый кадр.
+        private static readonly Vector3[] _tips = new Vector3[5];
 
-                foreach (var h in new[] { BoneLib.Player.LeftHand, BoneLib.Player.RightHand })
-                {
-                    if (h == null) continue;
-                    if (!TipOf(h, out Vector3 t)) continue;
-                    float d = (t - screenPos).sqrMagnitude;
-                    if (d < best) { best = d; tip = t; found = true; }
-                }
-                return found;
-            }
-            catch { return false; }
-        }
-
-        private static bool TipOf(Hand hand, out Vector3 tip)
+        /// <summary>Складывает подушечки всех пяти пальцев в _tips, возвращает их число.</summary>
+        private static int FillTips(Hand hand)
         {
-            tip = Vector3.zero;
+            int n = 0;
             try
             {
                 var anim = hand.Animator;
                 if (anim != null)
                 {
-                    var i3 = anim.index3;
-                    var i2 = anim.index2;
-                    if (i3 != null)
-                    {
-                        Vector3 dir = (i2 != null)
-                            ? (i3.position - i2.position)
-                            : hand.transform.forward;
-                        if (dir.sqrMagnitude < 1e-8f) dir = hand.transform.forward;
-                        tip = i3.position + dir.normalized * FingerTipExt;
-                        return true;
-                    }
+                    if (Tip(anim.index2,  anim.index3,  hand, out _tips[n])) n++;
+                    if (Tip(anim.middle2, anim.middle3, hand, out _tips[n])) n++;
+                    if (Tip(anim.thumb2,  anim.thumb3,  hand, out _tips[n])) n++;
+                    if (Tip(anim.ring2,   anim.ring3,   hand, out _tips[n])) n++;
+                    if (Tip(anim.pinky2,  anim.pinky3,  hand, out _tips[n])) n++;
                 }
-                // запас, если анимации пальцев нет
-                tip = hand.transform.position + hand.transform.forward * 0.075f;
-                return true;
+                if (n == 0)
+                {
+                    var ht = hand.transform;
+                    _tips[0] = ht.position + ht.forward * 0.075f;
+                    n = 1;
+                }
             }
-            catch { return false; }
+            catch { return 0; }
+            return n;
+        }
+
+        private static bool Tip(Transform mid, Transform last, Hand hand, out Vector3 outTip)
+        {
+            outTip = Vector3.zero;
+            if (last == null) return false;
+            Vector3 dir = (mid != null) ? (last.position - mid.position) : hand.transform.forward;
+            if (dir.sqrMagnitude < 1e-8f) dir = hand.transform.forward;
+            outTip = last.position + dir.normalized * TipExt;
+            return true;
         }
     }
 }

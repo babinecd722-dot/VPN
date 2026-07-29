@@ -19,6 +19,14 @@ namespace LPhone
         private bool _firstPresentLogged, _firstApplyLogged;
         private bool _dirty = true;
 
+        // Один раз выделенный Il2Cpp-массив под заливку. Раньше он создавался
+        // на КАЖДЫЙ Present — это 1.2 МБ мусора 30 раз в секунду при свайпе,
+        // отсюда и были фризы. Теперь копируем в него спаном.
+        private Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Color32> _gpu;
+
+        // Кэш готовых фонов (обои + затемнение). Ключ — затемнение в сотых.
+        private readonly Dictionary<int, Color32[]> _layers = new Dictionary<int, Color32[]>();
+
         public Texture2D Texture => _tex;
         public void MarkDirty() => _dirty = true;
 
@@ -34,20 +42,49 @@ namespace LPhone
             };
         }
 
+        // ─────────────────── кэш фоновых слоёв ───────────────────
+
+        /// <summary>Есть ли готовый слой с таким ключом.</summary>
+        public bool HasLayer(int key) => _layers.ContainsKey(key);
+
+        /// <summary>Запомнить текущий буфер как фоновый слой.</summary>
+        public void StoreLayer(int key)
+        {
+            // каждый слой — это 1.2 МБ, поэтому больше трёх не держим
+            if (_layers.Count >= 3 && !_layers.ContainsKey(key)) _layers.Clear();
+            if (!_layers.TryGetValue(key, out var l) || l.Length != _buf.Length)
+            {
+                l = new Color32[_buf.Length];
+                _layers[key] = l;
+            }
+            Array.Copy(_buf, l, _buf.Length);
+        }
+
+        /// <summary>Мгновенно вернуть фоновый слой (memcpy вместо попиксельного блита).</summary>
+        public bool RestoreLayer(int key)
+        {
+            if (!_layers.TryGetValue(key, out var l) || l.Length != _buf.Length) return false;
+            Array.Copy(l, _buf, _buf.Length);
+            _dirty = true;
+            return true;
+        }
+
+        public void DropLayers() => _layers.Clear();
+
         /// <summary>Заливаем накопленный кадр в текстуру (только если что-то менялось).</summary>
         public void Present()
         {
             if (!_dirty) return;
             _dirty = false;
-            // Массовый конструктор из managed-массива — самый безопасный путь в Il2Cpp
-            // (span поверх временного Il2Cpp-массива рискует «уехать» из-под GC).
             if (!_firstPresentLogged)
             {
                 _firstPresentLogged = true;
                 MelonLoader.MelonLogger.Msg($"[LPhone] ... первый Present {W}x{H}");
             }
-            var gpu = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Color32>(_buf);
-            _tex.SetPixels32(gpu);
+            if (_gpu == null || _gpu.Length != _buf.Length)
+                _gpu = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppStructArray<Color32>(_buf.Length);
+            _buf.AsSpan().CopyTo(_gpu.AsSpan());
+            _tex.SetPixels32(_gpu);
             _tex.Apply(false);
             if (!_firstApplyLogged)
             {

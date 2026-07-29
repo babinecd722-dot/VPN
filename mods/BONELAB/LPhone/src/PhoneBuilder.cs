@@ -23,7 +23,7 @@ namespace LPhone
         private static void Step(string s) => MelonLogger.Msg("[LPhone] ... " + s);
 
         /// <summary>Гарантированно живой шейдер: сначала по имени, потом «занимаем» у сцены.</summary>
-        private static Shader GetShader()
+        internal static Shader GetShader()
         {
             if (_shaderSearched) return _shader;
             _shaderSearched = true;
@@ -305,7 +305,12 @@ namespace LPhone
         }
 
         public bool Alive => Root != null;
-        public void Destroy() { if (Root != null) UnityEngine.Object.Destroy(Root); }
+
+        public void Destroy()
+        {
+            try { OS?.Dispose(); } catch { }
+            if (Root != null) UnityEngine.Object.Destroy(Root);
+        }
     }
 
     internal static class Phone
