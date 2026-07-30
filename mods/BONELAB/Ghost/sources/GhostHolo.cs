@@ -50,9 +50,9 @@ public static class GhostHolo
 
     // Всё в мировых метрах: расстояние от кончика пальца до поверхности кнопки.
     private const float TouchThickness = 0.016f; // толщина коллайдера кнопки
-    private const float HoverDist = 0.030f;      // ближе этого — подсветка
-    private const float TouchEnter = 0.012f;     // ближе этого — нажатие
-    private const float TouchExit = 0.022f;      // дальше этого — отпустил
+    private const float HoverDist = 0.040f;      // ближе этого — подсветка
+    private const float TouchEnter = 0.018f;     // ближе этого — нажатие
+    private const float TouchExit = 0.030f;      // дальше этого — отпустил
 
     private static float _toastT = 1f;
     private static float _toastHoldUntil;
@@ -241,12 +241,7 @@ public static class GhostHolo
 
             BuildToast();
             _appearT = 0f;
-            Rebuild(_tab);
-
-            // Коллайдер всей стеклянной плиты — палец упирается в поверхность,
-            // а не проваливается сквозь голограмму. Кнопки сидят на этой же
-            // плоскости и детектятся своими коллайдерами.
-            AddTouchCollider(_panel.gameObject, _panel);
+            Rebuild(_tab);   // внутри навешиваются коллайдеры (кнопки + плита)
         }
         catch (Exception ex)
         {
@@ -610,13 +605,13 @@ public static class GhostHolo
             return;
         }
 
+        int nTips = CollectTips();
         int best = -1;
         float bestDist = float.MaxValue;
 
-        for (int h = 0; h < 2; h++)
+        for (int t = 0; t < nTips; t++)
         {
-            if (!TryGetFingerTip(h == 0, out Vector3 tip)) continue;
-
+            Vector3 tip = _tips[t];
             for (int i = 0; i < _buttons.Count; i++)
             {
                 HoloBtn b = _buttons[i];
@@ -628,6 +623,17 @@ public static class GhostHolo
         }
 
         _hoverIndex = (best >= 0 && bestDist <= HoverDist) ? best : -1;
+
+        // Диагностика раз в 2 с: если тапы молчат, лог скажет, есть ли вообще
+        // кончик пальца и как далеко он от ближайшей кнопки (в сантиметрах).
+        if (Time.unscaledTime >= _touchDbgAt)
+        {
+            _touchDbgAt = Time.unscaledTime + 2f;
+            bool tipR = TryGetFingerTip(true, out _);
+            bool tipL = TryGetFingerTip(false, out _);
+            MelonLogger.Msg($"[Ghost] touch: btns={_buttons.Count} tipR={tipR} tipL={tipL} " +
+                            $"best={best} dist={(best >= 0 ? (bestDist * 100f).ToString("0.0") + "cm" : "-")}");
+        }
 
         if (best < 0 || bestDist > TouchExit)
         {
@@ -644,6 +650,8 @@ public static class GhostHolo
         }
     }
 
+    private static float _touchDbgAt;
+
     private static void FireButton(int index)
     {
         if (index < 0 || index >= _buttons.Count) return;
@@ -655,43 +663,81 @@ public static class GhostHolo
         catch (Exception ex) { MelonLogger.Warning($"Ghost btn: {ex.Message}"); }
     }
 
+    // Буфер точек касания: до 4 кончиков × 2 руки + 2 запасных от ладони.
+    private static readonly Vector3[] _tips = new Vector3[10];
+
     /// <summary>
-    /// Кончик указательного пальца. Раньше опрашивалась только правая рука —
-    /// а плата висит на левом предплечье, и тыкать в неё правой удобно не всегда.
-    /// Кость берём из ART-рига, а если его нет — считаем от ладони.
+    /// Собирает ВСЕ доступные кончики пальцев обеих рук. Раньше брался один
+    /// указательный, и если именно его кость null или не там — тап не срабатывал.
+    /// Теперь проверяем все четыре пальца каждой руки плюс запас от ладони:
+    /// хоть одна точка да попадёт по кнопке.
     /// </summary>
+    private static int CollectTips()
+    {
+        int n = 0;
+        try
+        {
+            ArtRig art = Player.RigManager?.physicsRig?.artOutput;
+            if (art != null)
+            {
+                AddTip(ref n, art.artFingerRt13, art.artFingerRt12);
+                AddTip(ref n, art.artFingerRt23, art.artFingerRt22);
+                AddTip(ref n, art.artFingerRt33, art.artFingerRt32);
+                AddTip(ref n, art.artFingerRt43, art.artFingerRt42);
+                AddTip(ref n, art.artFingerLf13, art.artFingerLf12);
+                AddTip(ref n, art.artFingerLf23, art.artFingerLf22);
+                AddTip(ref n, art.artFingerLf33, art.artFingerLf32);
+                AddTip(ref n, art.artFingerLf43, art.artFingerLf42);
+            }
+        }
+        catch { }
+
+        if (n == 0)
+        {
+            // ART-рига нет — берём кончик от ладони каждой руки
+            AddPalmTip(ref n, Player.RightHand, 0.01f);
+            AddPalmTip(ref n, Player.LeftHand, -0.01f);
+        }
+        return n;
+    }
+
+    private static void AddTip(ref int n, Transform tip, Transform mid)
+    {
+        if (tip == null || n >= _tips.Length) return;
+        try
+        {
+            Vector3 dir = mid != null ? (tip.position - mid.position) : tip.forward;
+            if (dir.sqrMagnitude < 1e-8f) dir = tip.forward;
+            _tips[n++] = tip.position + dir.normalized * 0.012f;  // до подушечки
+        }
+        catch { }
+    }
+
+    private static void AddPalmTip(ref int n, Hand hand, float sx)
+    {
+        if (hand == null || n >= _tips.Length) return;
+        try
+        {
+            if (hand.palmPositionTransform != null)
+                _tips[n++] = hand.palmPositionTransform.TransformPoint(new Vector3(sx, 0.02f, 0.06f));
+            else
+                _tips[n++] = hand.transform.TransformPoint(new Vector3(0f, 0.02f, 0.05f));
+        }
+        catch { }
+    }
+
+    /// <summary>Для диагностики: есть ли хоть один кончик у указанной руки.</summary>
     private static bool TryGetFingerTip(bool right, out Vector3 tip)
     {
         tip = default;
         try
         {
             ArtRig art = Player.RigManager?.physicsRig?.artOutput;
-            if (art != null)
-            {
-                Transform bone = right ? art.artFingerRt13 : art.artFingerLf13;
-                if (bone != null)
-                {
-                    // от последней фаланги до подушечки — около 1.2 см
-                    Transform mid = right ? art.artFingerRt12 : art.artFingerLf12;
-                    Vector3 dir = mid != null ? (bone.position - mid.position) : bone.forward;
-                    if (dir.sqrMagnitude < 1e-8f) dir = bone.forward;
-                    tip = bone.position + dir.normalized * 0.012f;
-                    return true;
-                }
-            }
-
+            Transform bone = art == null ? null : (right ? art.artFingerRt13 : art.artFingerLf13);
+            if (bone != null) { tip = bone.position; return true; }
             Hand hand = right ? Player.RightHand : Player.LeftHand;
-            if (hand != null)
-            {
-                if (hand.palmPositionTransform != null)
-                {
-                    float sx = right ? 0.01f : -0.01f;
-                    tip = hand.palmPositionTransform.TransformPoint(new Vector3(sx, 0.02f, 0.06f));
-                    return true;
-                }
-                tip = hand.transform.TransformPoint(new Vector3(0f, 0.02f, 0.05f));
-                return true;
-            }
+            if (hand?.palmPositionTransform != null) { tip = hand.palmPositionTransform.position; return true; }
+            if (hand != null) { tip = hand.transform.position; return true; }
         }
         catch { }
         return false;
@@ -725,6 +771,35 @@ public static class GhostHolo
 
         _insideIndex = -1;
         _hoverIndex = -1;
+
+        BuildColliders();
+    }
+
+    /// <summary>
+    /// Навешивает коллайдеры на кнопки и плиту ПОСЛЕ принудительного апдейта
+    /// Canvas. Ключевой момент: у только что созданных дочерних RectTransform
+    /// поле rect ещё нулевое до ближайшей перестройки Canvas, поэтому
+    /// GetWorldCorners в том же кадре давал нулевой размер и коллайдер не
+    /// создавался вообще — оттого палец и проходил насквозь, и тапы молчали.
+    /// ForceUpdateCanvases считает layout немедленно.
+    /// </summary>
+    private static void BuildColliders()
+    {
+        try { Canvas.ForceUpdateCanvases(); } catch { }
+
+        int made = 0;
+        for (int i = 0; i < _buttons.Count; i++)
+        {
+            var b = _buttons[i];
+            if (b?.Rt == null) continue;
+            if (b.Col == null) b.Col = AddTouchCollider(b.Rt.gameObject, b.Rt);
+            if (b.Col != null) made++;
+        }
+
+        if (_panel != null && _panel.GetComponent<Collider>() == null)
+            AddTouchCollider(_panel.gameObject, _panel);
+
+        MelonLogger.Msg($"[Ghost] colliders: {made}/{_buttons.Count} buttons + panel");
     }
 
     private static void BuildNick()
@@ -1004,8 +1079,9 @@ public static class GhostHolo
             OnClick = act,
             DangerStyle = danger,
             AccentStyle = accent,
-            BaseScale = Vector3.one,
-            Col = AddTouchCollider(go, rt)
+            BaseScale = Vector3.one
+            // коллайдер навешивается позже в BuildColliders(): rect дочернего
+            // RectTransform в этот момент ещё нулевой
         });
     }
 
@@ -1023,21 +1099,16 @@ public static class GhostHolo
     {
         try
         {
-            var corners = new Vector3[4];
-            rt.GetWorldCorners(corners);            // 0 BL, 1 TL, 2 TR, 3 BR
-            Vector3 worldCenter = (corners[0] + corners[2]) * 0.5f;
-            float wW = (corners[2] - corners[1]).magnitude;
-            float wH = (corners[1] - corners[0]).magnitude;
-            if (wW < 1e-5f || wH < 1e-5f) return null;
+            // rt.rect уже в ЛОКАЛЬНЫХ единицах Canvas и учитывает растянутые
+            // якоря (у таких строк sizeDelta = 0, а rect.width = ширине родителя).
+            Rect r = rt.rect;
+            if (r.width < 1e-3f || r.height < 1e-3f) return null;
 
-            Vector3 ls = rt.lossyScale;
-            float sx = Mathf.Max(1e-6f, Mathf.Abs(ls.x));
-            float sy = Mathf.Max(1e-6f, Mathf.Abs(ls.y));
-            float sz = Mathf.Max(1e-6f, Mathf.Abs(ls.z));
+            float sz = Mathf.Max(1e-6f, Mathf.Abs(rt.lossyScale.z));
 
             var box = go.AddComponent<BoxCollider>();
-            box.center = rt.InverseTransformPoint(worldCenter);
-            box.size = new Vector3(wW / sx, wH / sy, TouchThickness / sz);
+            box.center = new Vector3(r.center.x, r.center.y, 0f);
+            box.size = new Vector3(r.width, r.height, TouchThickness / sz);
             box.isTrigger = false;                  // палец реально упирается
             return box;
         }
