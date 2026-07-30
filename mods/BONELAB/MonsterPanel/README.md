@@ -25,6 +25,17 @@ Silent (no BoneMenu) — stock Fusion tools work even when the lobby locks them:
 
 Same pattern as Slow Mo / Despawn All unlocks.
 
+## Remote Action + Kill Host (2.30.40+)
+
+After **Kill Aura** in BoneMenu (Fusion only):
+
+- **Remote Action** — lobby player list (deferred rebuild, `maxElements=0`, Quest-safe). Open a player → **Kick** / **Ban**. Host player shows a hint to use Kill Host (PermissionCommand cannot kick/ban the host).
+  - If you are host: uses stock `NetworkHelper.KickUser` / `BanUser`.
+  - If you are client (EOS): forged `PermissionCommandRequest` with **Sender = 0** (host SmallID) → host treats it as OWNER and applies Kick/Ban.
+- **Kill Host** — button right after Remote Action. Forged `Disconnect` to the host’s PlatformID via `MessageSender.SendFromServer` (EOS layer has no IsHost gate). Host receives ClientsOnly Disconnect and leaves → lobby collapses. No-op if you are already host.
+
+Cooldown ~0.85s between actions to avoid spam / menu thrash.
+
 ---
 
 Страница **MONSTER Panel** в BoneMenu, два тумблера (без кнопок — вкл/выкл):

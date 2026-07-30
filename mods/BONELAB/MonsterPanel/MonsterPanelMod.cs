@@ -23,7 +23,7 @@ using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 using PlayerHealth = Il2CppSLZ.Marrow.Player_Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.39", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.40", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -1099,10 +1099,11 @@ namespace MonsterPanel
                 page.CreateFunction("Despawn Bodyguards", new Color(0.5f, 0.5f, 0.5f), (Action)Guards.Despawn);
                 page.CreateFunction("Avatar preview 6114112", new Color(0.7f, 0.5f, 1f), (Action)NickHider.SetAvatarPreview);
                 KillAuraMenu.Install(page);
+                RemoteAction.Install(page); // Remote Action (Kick/Ban) + Kill Host
                 NickHider.Install(page);
                 Teleporter.Install(page);
                 Tracking.InstallMenu(page);
-                MelonLogger.Msg("MONSTER Panel: Kill Aura + Teleport + Tracking + Nickname + Bodyguards + Spoofing PID + Cleanup added (LabFusion found).");
+                MelonLogger.Msg("MONSTER Panel: Kill Aura + Remote Action + Kill Host + Teleport + Tracking + Nickname + Bodyguards + Spoofing PID + Cleanup added (LabFusion found).");
             }
             else
                 MelonLogger.Msg("MONSTER Panel: LabFusion not loaded - Teleport/Nickname/Bodyguards/Spoofing PID/Tracking hidden.");
