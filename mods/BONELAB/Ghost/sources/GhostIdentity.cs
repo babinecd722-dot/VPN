@@ -139,9 +139,17 @@ public static class GhostIdentity
         }
     }
 
+    /// <summary>Баркод тела, которое было надето ДО первого клона.</summary>
+    private static string _bodyBeforeClone = "";
+
     /// <summary>
     /// Разовая смена тела по баркоду через штатный RigManager.SwapAvatarCrate.
     /// Никакого постоянного форса: после этого скин можно менять свободно.
+    ///
+    /// Перед первым клоном запоминаем СВОЁ тело — иначе RESTORE не имеет что
+    /// возвращать. Раньше клон ставился через LocalAvatar.AvatarOverride, и
+    /// сброс override сам откатывал скин; с разовым свапом откатывать некому,
+    /// поэтому баркод храним явно.
     /// </summary>
     private static void SwapBodyOnce(string barcode)
     {
@@ -149,6 +157,13 @@ public static class GhostIdentity
         {
             var rm = BoneLib.Player.RigManager;
             if (rm == null) return;
+
+            if (string.IsNullOrWhiteSpace(_bodyBeforeClone))
+            {
+                try { _bodyBeforeClone = rm.AvatarCrate?.Barcode?.ID ?? ""; }
+                catch { _bodyBeforeClone = ""; }
+            }
+
             var bc = new Il2CppSLZ.Marrow.Warehouse.Barcode(barcode);
             rm.SwapAvatarCrate(bc, false, null);   // fire-and-forget UniTask
         }
@@ -158,8 +173,30 @@ public static class GhostIdentity
         }
     }
 
+    /// <summary>Возвращает тело, надетое до клона (если клон вообще был).</summary>
+    private static void RestoreBody()
+    {
+        string bc = _bodyBeforeClone;
+        _bodyBeforeClone = "";
+        if (string.IsNullOrWhiteSpace(bc)) return;
+        try
+        {
+            var rm = BoneLib.Player.RigManager;
+            if (rm == null) return;
+            rm.SwapAvatarCrate(new Il2CppSLZ.Marrow.Warehouse.Barcode(bc), false, null);
+            MelonLogger.Msg("Ghost: тело возвращено — " + bc);
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"Ghost restore body: {ex.Message}");
+        }
+    }
+
     public static void Restore()
     {
+        // Тело откатываем ВСЕГДА, даже если метаданные не захватывались:
+        // клон мог быть, а _stored — сброшен.
+        RestoreBody();
         if (!_stored) return;
         try
         {

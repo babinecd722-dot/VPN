@@ -1242,8 +1242,17 @@ public static class GhostHolo
 
         var glowHost = SubRect(_pFigure, "Glow");
         var solidHost = SubRect(_pFigure, "Solid");
-        for (int i = 0; i < GhostDiag.ZoneCount; i++)
-            RenderZone(glowHost, solidHost, _geo[i], Vector2.zero, 1f, _vis[i].Glow, _vis[i].Solid);
+        // порядок отрисовки: корпус → ноги → руки → голова (голова поверх всего)
+        var drawOrder = new[]
+        {
+            GhostDiag.Zone.Torso, GhostDiag.Zone.LegL, GhostDiag.Zone.LegR,
+            GhostDiag.Zone.ArmL, GhostDiag.Zone.ArmR, GhostDiag.Zone.Head
+        };
+        foreach (var dz in drawOrder)
+        {
+            int zi = (int)dz;
+            RenderZone(glowHost, solidHost, _geo[zi], Vector2.zero, 1f, _vis[zi].Glow, _vis[zi].Solid);
+        }
 
         // бегущая линия сканера поверх силуэта
         _pFigScan = MakeImage(_pFigure, "ScanLine", new Color(0.30f, 1f, 1f, 0.22f));
@@ -2049,21 +2058,43 @@ public static class GhostHolo
     private static float V(float v, float lo, float hi, float def)
         => (float.IsNaN(v) || float.IsInfinity(v) || v < lo || v > hi) ? def : v;
 
+    /// <summary>
+    /// Собирает силуэт ТОЛЬКО из длин сегментов аватара, без полей-позиций.
+    ///
+    /// Почему так. У Avatar есть и позиции (_chinY, _waistY, _crotchBottom), и
+    /// длины (_skullHeight, _chestHeight, _legUpperLength…). В какой системе
+    /// хранятся позиции — в метрах от пола или в долях роста — снаружи не
+    /// проверить, а ошибка ломает фигуру полностью: голова уезжает к центру и
+    /// её накрывает корпус, а торс растягивается на весь рост. Именно это и
+    /// вылезло на устройстве («головы нет, вместо торса хрень»).
+    ///
+    /// Длины же все в одной системе между собой, поэтому скелет складывается
+    /// снизу вверх: стопа → голень → бедро → таз → грудь → шея → череп. Каждое
+    /// значение переводится в ДОЛЮ роста и проверяется по норме — мусор
+    /// заменяется человеческой пропорцией. Абсолютный масштаб потом всё равно
+    /// задаёт NormalizeGeometry, так что единицы исходных полей роли не играют.
+    /// </summary>
     private static ZoneGeo[] BuildGeometry()
     {
         var g = new ZoneGeo[GhostDiag.ZoneCount];
         for (int i = 0; i < g.Length; i++) g[i] = new ZoneGeo();
 
-        // ── дефолт: усреднённая человеческая фигура (если мерок не достать) ──
-        float height = 1.78f;
-        float headTop = 1.78f, chinY = 1.55f, shoulderY = 1.45f;
-        float waistY = 1.08f, hipY = 1.00f, crotchY = 0.84f;
-        float headRx = 0.088f, neckRx = 0.055f;
-        float chestRx = 0.175f, waistRx = 0.140f, hipRx = 0.165f, clav = 0.165f;
-        float armU = 0.30f, armLo = 0.27f, carpal = 0.095f;
-        float legU = 0.44f, legLo = 0.42f, footL = 0.26f;
-        float rArmU = 0.050f, rArmLo = 0.042f, rWrist = 0.034f;
-        float rThigh = 0.082f, rCalf = 0.058f, rAnkle = 0.040f;
+        // Нормальные доли роста (сумма пяти опорных сегментов = 0.93 роста).
+        const float dSkull = 0.130f, dChest = 0.215f, dPelvis = 0.105f, dNeck = 0.045f;
+        const float dLegU = 0.245f, dLegLo = 0.235f, dFoot = 0.146f;
+        const float dArmU = 0.172f, dArmLo = 0.157f, dCarpal = 0.052f, dClav = 0.093f;
+        const float dHeadRx = 0.049f, dNeckRx = 0.031f;
+        const float dChestRx = 0.098f, dWaistRx = 0.079f, dHipRx = 0.093f;
+        const float dRArmU = 0.028f, dRArmLo = 0.024f, dRWrist = 0.019f;
+        const float dRThigh = 0.046f, dRCalf = 0.033f, dRAnkle = 0.022f;
+        const float CoreSum = dLegU + dLegLo + dPelvis + dChest + dSkull;   // 0.93
+
+        float rSkull = 0f, rChest = 0f, rPelvis = 0f;
+        float rLegU = 0f, rLegLo = 0f, rFoot = 0f;
+        float rArmU = 0f, rArmLo = 0f, rCarpal = 0f, rClav = 0f;
+        float rHeadRx = 0f, rNeckRx = 0f, rChestRx = 0f, rWaistRx = 0f, rHipRx = 0f;
+        float rRArmU = 0f, rRArmLo = 0f, rRWrist = 0f;
+        float rRThigh = 0f, rRCalf = 0f, rRAnkle = 0f;
 
         _avHeight = 0f; _avMass = 0f; _avStr = 0f; _avAgi = 0f; _avVit = 0f;
 
@@ -2074,52 +2105,28 @@ public static class GhostHolo
         {
             try
             {
-                height = V(av._height, 0.4f, 4f, height);
-                headTop = V(av._headTop, 0.3f, 4.5f, height);
-                chinY = V(av._chinY, 0.2f, 4.5f, height * 0.872f);
-                waistY = V(av._waistY, 0.15f, 4.5f, height * 0.607f);
-                hipY = V(av._highHipY, 0.15f, 4.5f, height * 0.562f);
-                crotchY = V(av._crotchBottom, 0.1f, 4.5f, height * 0.472f);
-                shoulderY = V(av._t1HeightPercent * height, 0.2f, 4.5f, height * 0.815f);
-                _avHeight = height;
+                rSkull = av._skullHeight; rChest = av._chestHeight; rPelvis = av._pelvisHeight;
+                rLegU = av._legUpperLength; rLegLo = av._legLowerLength; rFoot = av._footLength;
+                rArmU = av._armUpperLength; rArmLo = av._armLowerLength;
+                rCarpal = av._carpalLength; rClav = av._clavicleLength;
             }
             catch { }
-
             try
             {
-                headRx = V(av._headEllipseX, 0.01f, 0.5f, headRx);
-                neckRx = V(av._neckEllipseX, 0.01f, 0.4f, neckRx);
-                chestRx = V(av._chestEllipseX, 0.03f, 0.8f, chestRx);
-                waistRx = V(av._waistEllipseX, 0.03f, 0.8f, waistRx);
-                hipRx = V(av._hipsEllipseX, 0.03f, 0.8f, hipRx);
-                clav = V(av._clavicleLength, 0.03f, 0.6f, clav);
+                rHeadRx = av._headEllipseX; rNeckRx = av._neckEllipseX;
+                rChestRx = av._chestEllipseX; rWaistRx = av._waistEllipseX; rHipRx = av._hipsEllipseX;
             }
             catch { }
-
             try
             {
-                armU = V(av._armUpperLength, 0.05f, 1f, armU);
-                armLo = V(av._armLowerLength, 0.05f, 1f, armLo);
-                carpal = V(av._carpalLength, 0.01f, 0.4f, carpal);
-                legU = V(av._legUpperLength, 0.05f, 1.2f, legU);
-                legLo = V(av._legLowerLength, 0.05f, 1.2f, legLo);
-                footL = V(av._footLength, 0.03f, 0.6f, footL);
+                rRArmU = av._upperarmEllipse.XRadius; rRArmLo = av._forearmEllipse.XRadius;
+                rRWrist = av._wristEllipse.XRadius; rRThigh = av._thighUpperEllipse.XRadius;
+                rRCalf = av._calfEllipse.XRadius; rRAnkle = av._ankleEllipse.XRadius;
             }
             catch { }
-
             try
             {
-                rArmU = V(av._upperarmEllipse.XRadius, 0.005f, 0.3f, rArmU);
-                rArmLo = V(av._forearmEllipse.XRadius, 0.005f, 0.3f, rArmLo);
-                rWrist = V(av._wristEllipse.XRadius, 0.005f, 0.3f, rWrist);
-                rThigh = V(av._thighUpperEllipse.XRadius, 0.005f, 0.4f, rThigh);
-                rCalf = V(av._calfEllipse.XRadius, 0.005f, 0.4f, rCalf);
-                rAnkle = V(av._ankleEllipse.XRadius, 0.005f, 0.3f, rAnkle);
-            }
-            catch { }
-
-            try
-            {
+                _avHeight = V(av._height, 0.4f, 4f, 0f);
                 _avMass = V(av._massTotal, 0.1f, 1000f, 0f);
                 _avStr = V(av._strengthUpper, 0f, 20f, 0f);
                 _avAgi = V(av._agility, 0f, 20f, 0f);
@@ -2128,93 +2135,147 @@ public static class GhostHolo
             catch { }
         }
 
-        _avTitle = AvatarName();
+        // Опорная единица — собранный из длин «рост». В ней же измерены все
+        // остальные поля аватара, поэтому деление на неё даёт чистые доли.
+        float core = Pos(rLegU) + Pos(rLegLo) + Pos(rPelvis) + Pos(rChest) + Pos(rSkull);
+        float u = core > 1e-5f ? core / CoreSum : (_avHeight > 1e-5f ? _avHeight : 0f);
 
-        // ── перевод в пиксели канваса, фигура центрирована по вертикали ──
-        float k = FigureH / Mathf.Max(0.3f, height);
-        float half = height * 0.5f;
-        Func<float, float> Y = m => (m - half) * k;
-        Func<float, float> X = m => m * k;
+        float fSkull = Frac(rSkull, dSkull, u), fChest = Frac(rChest, dChest, u);
+        float fPelvis = Frac(rPelvis, dPelvis, u), fNeck = dNeck;
+        float fLegU = Frac(rLegU, dLegU, u), fLegLo = Frac(rLegLo, dLegLo, u);
+        float fFoot = Frac(rFoot, dFoot, u);
+        float fArmU = Frac(rArmU, dArmU, u), fArmLo = Frac(rArmLo, dArmLo, u);
+        float fCarpal = Frac(rCarpal, dCarpal, u), fClav = Frac(rClav, dClav, u);
+        float fHeadRx = Frac(rHeadRx, dHeadRx, u), fNeckRx = Frac(rNeckRx, dNeckRx, u);
+        float fChestRx = Frac(rChestRx, dChestRx, u), fWaistRx = Frac(rWaistRx, dWaistRx, u);
+        float fHipRx = Frac(rHipRx, dHipRx, u);
+        float fRArmU = Frac(rRArmU, dRArmU, u), fRArmLo = Frac(rRArmLo, dRArmLo, u);
+        float fRWrist = Frac(rRWrist, dRWrist, u);
+        float fRThigh = Frac(rRThigh, dRThigh, u), fRCalf = Frac(rRCalf, dRCalf, u);
+        float fRAnkle = Frac(rRAnkle, dRAnkle, u);
+
+        // Мерки в лог: если на устройстве пропорции всё же уедут, здесь сразу
+        // видно, что именно вернул аватар и что из этого признано мусором.
+        try
+        {
+            MelonLogger.Msg($"[Ghost] avatar raw: h={_avHeight:0.###} u={u:0.###} " +
+                $"skull={rSkull:0.###} chest={rChest:0.###} pelvis={rPelvis:0.###} " +
+                $"legU={rLegU:0.###} legLo={rLegLo:0.###} armU={rArmU:0.###} armLo={rArmLo:0.###} " +
+                $"clav={rClav:0.###} chestRx={rChestRx:0.###} waistRx={rWaistRx:0.###} " +
+                $"hipRx={rHipRx:0.###} headRx={rHeadRx:0.###} rThigh={rRThigh:0.###}");
+            MelonLogger.Msg($"[Ghost] avatar frac: skull={fSkull:0.###} chest={fChest:0.###} " +
+                $"pelvis={fPelvis:0.###} legU={fLegU:0.###} legLo={fLegLo:0.###} " +
+                $"chestRx={fChestRx:0.###} waistRx={fWaistRx:0.###} hipRx={fHipRx:0.###} " +
+                $"headRx={fHeadRx:0.###}");
+        }
+        catch { }
+
+        // ── скелет снизу вверх, всё в долях роста ──
+        float yAnkle = fRAnkle;
+        float yKnee = yAnkle + fLegLo;
+        float yHip = yKnee + fLegU;
+        float yWaist = yHip + fPelvis;
+        float yShoul = yWaist + fChest;
+        float yChin = yShoul + fNeck;
+        float yTop = yChin + fSkull;
+
+        float k = FigureH;                        // 1.0 доли = вся высота силуэта
+        float mid = (yTop + 0f) * 0.5f;
+        Func<float, float> Y = f => (f - mid) * k;
+        Func<float, float> X = f => f * k;
 
         // ГОЛОВА (+ шея — GhostDiag относит Neck к этой зоне)
         var head = g[(int)GhostDiag.Zone.Head];
-        float skullH = Mathf.Max(6f, (headTop - chinY) * k);
-        float skullCy = Y((headTop + chinY) * 0.5f);
-        head.Blob(new Vector2(0f, skullCy), X(headRx) * 2f, skullH);
-        head.Capsule(new Vector2(0f, Y(chinY)), new Vector2(0f, Y(shoulderY) + 1f), X(neckRx));
-        head.Bone(new Vector2(0f, Y(headTop)), X(headRx) * 0.6f);
-        head.Bone(new Vector2(0f, skullCy), X(headRx));
-        head.Bone(new Vector2(0f, Y(chinY)), X(neckRx));
-        head.Bone(new Vector2(0f, Y(shoulderY)), X(neckRx));
+        float skullH = Mathf.Max(6f, (yTop - yChin) * k);
+        float skullCy = Y((yTop + yChin) * 0.5f);
+        head.Blob(new Vector2(0f, skullCy), X(fHeadRx) * 2f, skullH);
+        head.Capsule(new Vector2(0f, Y(yChin)), new Vector2(0f, Y(yShoul) + 1f), X(fNeckRx));
+        head.Bone(new Vector2(0f, Y(yTop)), X(fHeadRx) * 0.6f);
+        head.Bone(new Vector2(0f, skullCy), X(fHeadRx));
+        head.Bone(new Vector2(0f, Y(yChin)), X(fNeckRx));
+        head.Bone(new Vector2(0f, Y(yShoul)), X(fNeckRx));
 
-        // ТОРС. Тремя эллипсами (грудь/живот/таз) он выглядел стопкой шаров.
-        // Рисуем настоящий профиль: корпус нарезан горизонтальными ломтями, а
-        // ширина каждого взята из мерок аватара на этой высоте — плечи шире,
-        // талия уже, таз снова шире. Силуэт получается сужающийся, как тело.
+        // ТОРС: корпус нарезан ломтями, ширина каждого — из мерок на этой высоте
         var torso = g[(int)GhostDiag.Zone.Torso];
         const int Slices = 11;
-        float topY = shoulderY, botY = crotchY;
-        float sliceH = Mathf.Max(2.2f, (topY - botY) * k / Slices * 1.85f);
+        float sliceH = Mathf.Max(2.2f, (yShoul - yHip) * k / Slices * 1.85f);
         for (int i = 0; i < Slices; i++)
         {
-            float f = (i + 0.5f) / Slices;                 // 0 плечи … 1 пах
-            float my = Mathf.Lerp(topY, botY, f);
-            float rx = TorsoRadius(my, shoulderY, waistY, hipY, crotchY,
-                                   chestRx, waistRx, hipRx);
+            float f = (i + 0.5f) / Slices;                 // 0 плечи … 1 таз
+            float my = Mathf.Lerp(yShoul, yHip, f);
+            float rx = TorsoRadius(my, yShoul, yWaist, yHip, fChestRx, fWaistRx, fHipRx);
             torso.Blob(new Vector2(0f, Y(my)), X(rx) * 2f, sliceH, 1);
         }
-        // общий мягкий ореол корпуса — один, иначе ломти дают полосы
-        float halCy = Y((topY + botY) * 0.5f);
-        torso.Blob(new Vector2(0f, halCy), X(chestRx) * 2f + 5f, (topY - botY) * k + 5f, 2);
-        torso.Bone(new Vector2(0f, Y(shoulderY)), X(chestRx));
-        torso.Bone(new Vector2(0f, Y(waistY)), X(waistRx));
-        torso.Bone(new Vector2(0f, Y(crotchY)), X(hipRx));
+        torso.Blob(new Vector2(0f, Y((yShoul + yHip) * 0.5f)), X(fChestRx) * 2f + 5f,
+                   (yShoul - yHip) * k + 5f, 2);           // общий мягкий ореол
+        torso.Bone(new Vector2(0f, Y(yShoul)), X(fChestRx));
+        torso.Bone(new Vector2(0f, Y(yWaist)), X(fWaistRx));
+        torso.Bone(new Vector2(0f, Y(yHip)), X(fHipRx));
 
-        // РУКИ: плечо → предплечье → кисть, слегка отведены от корпуса
+        // РУКИ: плечо → предплечье → кисть, в лёгкой A-позе
         for (int s = -1; s <= 1; s += 2)
         {
             var arm = g[(int)(s < 0 ? GhostDiag.Zone.ArmL : GhostDiag.Zone.ArmR)];
-            Vector2 sh = new Vector2(s * X(clav), Y(shoulderY) - 1f);
+            Vector2 sh = new Vector2(s * X(fClav), Y(yShoul) - 1f);
             Vector2 dU = new Vector2(s * 0.40f, -0.917f).normalized;
-            Vector2 el = sh + dU * X(armU);
+            Vector2 el = sh + dU * X(fArmU);
             Vector2 dL = new Vector2(s * 0.30f, -0.954f).normalized;
-            Vector2 wr = el + dL * X(armLo);
-            Vector2 hd = wr + dL * X(carpal * 1.5f);
+            Vector2 wr = el + dL * X(fArmLo);
+            Vector2 hd = wr + dL * X(fCarpal * 1.5f);
 
-            arm.Capsule(sh, el, X(rArmU));
-            arm.Capsule(el, wr, X(rArmLo));
-            arm.Capsule(wr, hd, X(rWrist) * 1.2f);
-            arm.Bone(sh, X(rArmU));
-            arm.Bone(el, X(rArmLo));
-            arm.Bone(wr, X(rWrist));
-            arm.Bone(hd, X(rWrist) * 1.2f);
+            arm.Capsule(sh, el, X(fRArmU));
+            arm.Capsule(el, wr, X(fRArmLo));
+            arm.Capsule(wr, hd, X(fRWrist) * 1.2f);
+            arm.Bone(sh, X(fRArmU));
+            arm.Bone(el, X(fRArmLo));
+            arm.Bone(wr, X(fRWrist));
+            arm.Bone(hd, X(fRWrist) * 1.2f);
         }
 
         // НОГИ: бедро → голень → стопа
         for (int s = -1; s <= 1; s += 2)
         {
             var leg = g[(int)(s < 0 ? GhostDiag.Zone.LegL : GhostDiag.Zone.LegR)];
-            Vector2 hip = new Vector2(s * X(hipRx * 0.52f), Y(crotchY) + 2f);
+            Vector2 hip = new Vector2(s * X(fHipRx * 0.52f), Y(yHip) + 1f);
             Vector2 dT = new Vector2(s * 0.07f, -0.997f).normalized;
-            Vector2 kn = hip + dT * X(legU);
+            Vector2 kn = hip + dT * X(fLegU);
             Vector2 dC = new Vector2(s * 0.02f, -0.9998f).normalized;
-            Vector2 an = kn + dC * X(legLo);
+            Vector2 an = kn + dC * X(fLegLo);
 
-            leg.Capsule(hip, kn, X(rThigh));
-            leg.Capsule(kn, an, X(rCalf));
-            // стопа в фронтальной проекции — короткий широкий объём
-            Vector2 ft = an + new Vector2(s * 1.5f, -X(footL) * 0.16f);
-            leg.Blob(ft, X(rAnkle) * 2.7f, Mathf.Max(4f, X(footL) * 0.34f));
-            leg.Bone(hip, X(rThigh));
-            leg.Bone(kn, X(rCalf));
-            leg.Bone(an, X(rAnkle));
-            leg.Bone(ft, X(rAnkle));
+            leg.Capsule(hip, kn, X(fRThigh));
+            leg.Capsule(kn, an, X(fRCalf));
+            Vector2 ft = an + new Vector2(s * 1.5f, -X(fFoot) * 0.16f);
+            leg.Blob(ft, X(fRAnkle) * 2.7f, Mathf.Max(4f, X(fFoot) * 0.34f));
+            leg.Bone(hip, X(fRThigh));
+            leg.Bone(kn, X(fRCalf));
+            leg.Bone(an, X(fRAnkle));
+            leg.Bone(ft, X(fRAnkle));
         }
 
-        // Мерки бывают любые (кастомные аватары — вообще что угодно), поэтому
-        // силуэт в конце подгоняется под бюджет панели целиком, а не «на веру».
         NormalizeGeometry(g, FigureH, 150f);
         return g;
+    }
+
+    private static float Pos(float v)
+        => (float.IsNaN(v) || float.IsInfinity(v) || v <= 0f) ? 0f : v;
+
+    /// <summary>
+    /// Переводит мерку в долю роста и проверяет по норме. Всё, что отличается от
+    /// человеческой пропорции более чем вдвое-втрое, считаем мусором (не та
+    /// единица, ноль, кривой кастомный аватар) и берём норму.
+    /// </summary>
+    private static float Frac(float raw, float def, float u)
+    {
+        if (u > 1e-5f)
+        {
+            float v = Pos(raw);
+            if (v > 0f)
+            {
+                float f = v / u;
+                if (f >= def * 0.45f && f <= def * 2.40f) return f;
+            }
+        }
+        return def;
     }
 
     /// <summary>Впечатывает всю фигуру в заданный габарит и центрирует её.</summary>
@@ -2238,19 +2299,16 @@ public static class GhostHolo
 
     /// <summary>Полуширина корпуса на высоте y — по опорным меркам аватара.</summary>
     private static float TorsoRadius(float y, float shoulderY, float waistY, float hipY,
-                                     float crotchY, float chestRx, float waistRx, float hipRx)
+                                     float chestRx, float waistRx, float hipRx)
     {
         float chestY = Mathf.Lerp(waistY, shoulderY, 0.62f);
         if (y >= chestY)
-        {
-            float f = Mathf.InverseLerp(chestY, shoulderY, y);
-            return Mathf.Lerp(chestRx, chestRx * 0.90f, f);      // к плечам чуть уже
-        }
+            return Mathf.Lerp(chestRx, chestRx * 0.90f, Mathf.InverseLerp(chestY, shoulderY, y));
         if (y >= waistY)
             return Mathf.Lerp(waistRx, chestRx, Mathf.InverseLerp(waistY, chestY, y));
-        if (y >= hipY)
-            return Mathf.Lerp(hipRx * 0.97f, waistRx, Mathf.InverseLerp(hipY, waistY, y));
-        return Mathf.Lerp(hipRx * 0.80f, hipRx * 0.97f, Mathf.InverseLerp(crotchY, hipY, y));
+        // от талии к тазу шире, у самого низа чуть сужается к бёдрам
+        float f = Mathf.InverseLerp(hipY, waistY, y);
+        return Mathf.Lerp(hipRx * 0.88f, waistRx, f * f);
     }
 
     private static Vector2 Rotate(Vector2 v, float deg)
@@ -2378,14 +2436,17 @@ public static class GhostHolo
             var tex = new Texture2D(R, R, TextureFormat.RGBA32, false);
             tex.wrapMode = TextureWrapMode.Clamp;
             float c = (R - 1) * 0.5f;
+            // одним SetPixels: по пикселю через Il2Cpp — это 4096 переходов границы
+            var buf = new Color[R * R];
             for (int yy = 0; yy < R; yy++)
                 for (int xx = 0; xx < R; xx++)
                 {
                     float dx = (xx - c) / c, dy = (yy - c) / c;
                     float d = Mathf.Sqrt(dx * dx + dy * dy);
                     float a = 1f - Mathf.SmoothStep(0.86f, 1f, d);
-                    tex.SetPixel(xx, yy, new Color(1f, 1f, 1f, Mathf.Clamp01(a)));
+                    buf[yy * R + xx] = new Color(1f, 1f, 1f, Mathf.Clamp01(a));
                 }
+            tex.SetPixels(buf);
             tex.Apply(false);
             _circle = Sprite.Create(tex, new Rect(0, 0, R, R), new Vector2(0.5f, 0.5f), 100f);
         }
