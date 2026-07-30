@@ -23,7 +23,7 @@ using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 using PlayerHealth = Il2CppSLZ.Marrow.Player_Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.40", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.41", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
