@@ -16,7 +16,7 @@ namespace BePrime.Ghost;
 /// </summary>
 public static class GhostHolo
 {
-    private enum Tab { Nick, Lobby, Custom }
+    private enum Tab { Nick, Lobby, Custom, Player }
 
     // Landscape holo plate (~19cm x ~7cm)
     private const float CanvasW = 480f;
@@ -104,7 +104,16 @@ public static class GhostHolo
         public float HoverBlend;
         public Vector3 BaseScale;
         public Collider Col;      // реальный коллайдер кнопки — и стоп пальцу, и детект тапа
+        public int DiagZone = -1; // >=0 — это зона тела на вкладке PLAYER (цвет свой)
     }
+
+    // ─── состояние вкладки PLAYER ───
+    private static RectTransform _pFigure;
+    private static readonly Image[] _pZone = new Image[GhostDiag.ZoneCount];
+    private static Text _pAvatar, _pTitle, _pCause, _pDmg, _pHp;
+    private static Image _pHealBtnBg;
+    private static int _pSel = -1;
+    private static float _pSlide;             // 0 фигура по центру, 1 сдвинута под деталь
 
     public static void Tick()
     {
@@ -130,6 +139,7 @@ public static class GhostHolo
         AnimateScan(dt);
         AnimateButtons(dt);
         AnimateToast(dt);
+        if (_tab == Tab.Player) { GhostDiag.Refresh(); AnimatePlayer(dt); }
         HandleTouch();
     }
 
@@ -153,6 +163,9 @@ public static class GhostHolo
         // направлением и первые кадры «доезжала» на место
         _touchDown = false;
         _outInit = false;
+        _pFigure = null; _pAvatar = null; _pTitle = null; _pCause = null;
+        _pDmg = null; _pHp = null; _pHealBtnBg = null; _pSel = -1;
+        for (int i = 0; i < _pZone.Length; i++) _pZone[i] = null;
         if (_root != null)
         {
             Object.Destroy(_root);
@@ -526,6 +539,9 @@ public static class GhostHolo
                 : 1f;
             b.Rt.localScale = b.BaseScale * punch;
 
+            // Зоны тела красит диагностика (AnimatePlayer) — стандартный стиль не трогаем.
+            if (b.DiagZone >= 0) continue;
+
             Color idle = b.DangerStyle ? new Color(Danger.r, Danger.g, Danger.b, 0.16f)
                 : (b.AccentStyle ? RowActive : RowIdle);
             Color hot = b.DangerStyle ? Danger : RowHover;
@@ -770,12 +786,14 @@ public static class GhostHolo
         AddTab(0, "IDENTITY", Tab.Nick);
         AddTab(1, "LOBBY", Tab.Lobby);
         AddTab(2, "MOD.IO", Tab.Custom);
+        AddTab(3, "PLAYER", Tab.Player);
 
         switch (tab)
         {
             case Tab.Nick: BuildNick(); break;
             case Tab.Lobby: BuildLobby(); break;
             case Tab.Custom: BuildCustom(); break;
+            case Tab.Player: BuildPlayer(); break;
         }
 
         if (_headerSub != null)
@@ -816,30 +834,31 @@ public static class GhostHolo
 
     private static void BuildNick()
     {
-        // Left column — identity ops
+        // Left column — identity ops. Раскладка: одна широкая кнопка сверху,
+        // три пресета чипами в ряд, широкий RESTORE снизу — всё влезает и
+        // касаться удобнее, чем пятью тесными строками (RESTORE раньше вылезал).
         var left = MakeSection(_content, "ID", "IDENTITY", 0f, 0f, 0.48f, 1f);
-        float y = -4f;
-        AddRow(left, ref y, "HIDE NAME", "braille blank", () =>
+
+        AddRowFrac(left, 0f, 1f, -4f, 22f, "HIDE NAME", "blank", () =>
         {
             GhostIdentity.ApplyInvisible();
             Notify("NICK", "Name hidden");
         });
-        AddRow(left, ref y, "SET · GHOST", "preset", () =>
+
+        AddRowFrac(left, 0f, 0.335f, -32f, 22f, "GHOST", null, () =>
         {
-            GhostIdentity.ApplyPreset("GHOST");
-            Notify("NICK", "Set to GHOST");
-        });
-        AddRow(left, ref y, "SET · UNKNOWN", "preset", () =>
+            GhostIdentity.ApplyPreset("GHOST"); Notify("NICK", "Set to GHOST");
+        }, accent: true);
+        AddRowFrac(left, 0.34f, 0.66f, -32f, 22f, "UNKNOWN", null, () =>
         {
-            GhostIdentity.ApplyPreset("UNKNOWN");
-            Notify("NICK", "Set to UNKNOWN");
-        });
-        AddRow(left, ref y, "SET · ANON", "preset", () =>
+            GhostIdentity.ApplyPreset("UNKNOWN"); Notify("NICK", "Set to UNKNOWN");
+        }, accent: true);
+        AddRowFrac(left, 0.665f, 1f, -32f, 22f, "ANON", null, () =>
         {
-            GhostIdentity.ApplyPreset("ANON");
-            Notify("NICK", "Set to ANON");
-        });
-        AddRow(left, ref y, "RESTORE PROFILE", "revert", () =>
+            GhostIdentity.ApplyPreset("ANON"); Notify("NICK", "Set to ANON");
+        }, accent: true);
+
+        AddRowFrac(left, 0f, 1f, -60f, 22f, "RESTORE PROFILE", "revert", () =>
         {
             GhostIdentity.Restore();
             Notify("RESTORE", "Real profile back");
@@ -982,7 +1001,240 @@ public static class GhostHolo
         }
     }
 
+    // ─────────────────── PLAYER: диагностика тела ───────────────────
+
+    // Расстановка зон в системе координат фигуры (центр = 0,0), пиксели.
+    private static readonly (GhostDiag.Zone z, float x, float y, float w, float h)[] ZoneLayout =
+    {
+        (GhostDiag.Zone.Head,   0f,  30f, 15f, 15f),
+        (GhostDiag.Zone.Torso,  0f,   5f, 24f, 28f),
+        (GhostDiag.Zone.ArmL, -18f,   7f,  7f, 26f),
+        (GhostDiag.Zone.ArmR,  18f,   7f,  7f, 26f),
+        (GhostDiag.Zone.LegL,  -7f, -26f,  9f, 24f),
+        (GhostDiag.Zone.LegR,   7f, -26f,  9f, 24f),
+    };
+
+    private static void BuildPlayer()
+    {
+        _pSel = -1;
+        _pSlide = 0f;
+        for (int i = 0; i < _pZone.Length; i++) _pZone[i] = null;
+
+        // Левая половина — секция с фигурой (без клипа, чтобы не обрезало тело)
+        var body = MakeSection(_content, "BODY", "БИО-СКАН", 0f, 0f, 0.52f, 1f, false);
+
+        // Контейнер фигуры (его двигаем при выборе зоны)
+        var figGo = new GameObject("Figure");
+        figGo.transform.SetParent(body, false);
+        _pFigure = figGo.AddComponent<RectTransform>();
+        SetAnchors(_pFigure, 0.5f, 0.5f, 0.5f, 0.5f);
+        _pFigure.sizeDelta = new Vector2(100f, 82f);
+        _pFigure.anchoredPosition = new Vector2(0f, 4f);
+
+        foreach (var zl in ZoneLayout)
+            AddZoneButton(_pFigure, zl.z, zl.x, zl.y, zl.w, zl.h);
+
+        // Аватар (стоковый / кастомный)
+        _pAvatar = MakeText(body, "Av", "АВАТАР: " + AvatarName(), 8, Cyan, TextAnchor.LowerCenter);
+        SetAnchors(_pAvatar.rectTransform, 0f, 0f, 1f, 0f);
+        _pAvatar.rectTransform.pivot = new Vector2(0.5f, 0f);
+        _pAvatar.rectTransform.sizeDelta = new Vector2(0f, 12f);
+        _pAvatar.rectTransform.anchoredPosition = new Vector2(0f, 1f);
+
+        // Правая половина — деталь выбранной зоны + починка
+        var info = MakeSection(_content, "DIAG", "ДИАГНОСТИКА", 0.54f, 0f, 1f, 1f);
+
+        _pTitle = MakeText(info, "Zt", "ВЫБЕРИ ЗОНУ", 11, Yellow, TextAnchor.UpperLeft);
+        SetAnchors(_pTitle.rectTransform, 0f, 1f, 1f, 1f);
+        _pTitle.rectTransform.pivot = new Vector2(0f, 1f);
+        _pTitle.rectTransform.sizeDelta = new Vector2(0f, 14f);
+        _pTitle.rectTransform.anchoredPosition = new Vector2(2f, -1f);
+
+        _pCause = MakeText(info, "Zc", "", 9, TextCol, TextAnchor.UpperLeft);
+        SetAnchors(_pCause.rectTransform, 0f, 1f, 1f, 1f);
+        _pCause.rectTransform.pivot = new Vector2(0f, 1f);
+        _pCause.rectTransform.sizeDelta = new Vector2(0f, 12f);
+        _pCause.rectTransform.anchoredPosition = new Vector2(2f, -16f);
+
+        _pDmg = MakeText(info, "Zd", "", 9, DangerText, TextAnchor.UpperLeft);
+        SetAnchors(_pDmg.rectTransform, 0f, 1f, 1f, 1f);
+        _pDmg.rectTransform.pivot = new Vector2(0f, 1f);
+        _pDmg.rectTransform.sizeDelta = new Vector2(0f, 12f);
+        _pDmg.rectTransform.anchoredPosition = new Vector2(2f, -29f);
+
+        _pHp = MakeText(info, "Zh", "", 9, TextCol, TextAnchor.UpperLeft);
+        SetAnchors(_pHp.rectTransform, 0f, 1f, 1f, 1f);
+        _pHp.rectTransform.pivot = new Vector2(0f, 1f);
+        _pHp.rectTransform.sizeDelta = new Vector2(0f, 12f);
+        _pHp.rectTransform.anchoredPosition = new Vector2(2f, -42f);
+
+        // Починка выбранной зоны — во всю ширину
+        _pHealBtnBg = AddPlayerButton(info, "HEALTH", 0f, -56f, 15f, () =>
+        {
+            if (_pSel < 0) { Notify("DIAG", "Сначала выбери зону"); return; }
+            if (GhostDiag.Heal((GhostDiag.Zone)_pSel))
+                Notify("HEALTH", GhostDiag.ZoneName((GhostDiag.Zone)_pSel) + " восстановлена");
+            RefreshDetail();
+        });
+
+        AddPlayerButton(info, "ПОЛНЫЙ РЕМОНТ", 0f, -73f, 13f, () =>
+        {
+            GhostDiag.HealAll();
+            Notify("HEALTH", "Тело восстановлено");
+            RefreshDetail();
+        });
+
+        GhostDiag.Refresh();
+        RefreshDetail();
+    }
+
+    private static void AddZoneButton(RectTransform parent, GhostDiag.Zone z, float x, float y, float w, float h)
+    {
+        var go = new GameObject("Zone_" + z);
+        go.transform.SetParent(parent, false);
+        var rt = go.AddComponent<RectTransform>();
+        SetAnchors(rt, 0.5f, 0.5f, 0.5f, 0.5f);
+        rt.sizeDelta = new Vector2(w, h);
+        rt.anchoredPosition = new Vector2(x, y);
+
+        var img = go.AddComponent<Image>();
+        img.color = Color.gray;
+        img.raycastTarget = false;
+        _pZone[(int)z] = img;
+
+        int zi = (int)z;
+        _buttons.Add(new HoloBtn
+        {
+            Rt = rt,
+            Bg = img,
+            Label = null,
+            OnClick = () => SelectZone(zi),
+            BaseScale = Vector3.one,
+            DiagZone = zi
+        });
+    }
+
+    /// <summary>Полноширинная кнопка для правой панели. Возвращает её фон.</summary>
+    private static Image AddPlayerButton(RectTransform parent, string label, float x, float y, float h, Action act)
+    {
+        var go = new GameObject("PB_" + label);
+        go.transform.SetParent(parent, false);
+        var rt = go.AddComponent<RectTransform>();
+        rt.anchorMin = new Vector2(0f, 1f);
+        rt.anchorMax = new Vector2(1f, 1f);
+        rt.pivot = new Vector2(0f, 1f);
+        rt.sizeDelta = new Vector2(0f, h);
+        rt.anchoredPosition = new Vector2(x, y);
+
+        var bg = go.AddComponent<Image>();
+        bg.color = RowIdle;
+        bg.raycastTarget = false;
+
+        var txt = MakeText(rt, "L", label, 10, Yellow, TextAnchor.MiddleCenter);
+        Stretch(txt.rectTransform);
+        txt.fontStyle = FontStyle.Bold;
+
+        _buttons.Add(new HoloBtn
+        {
+            Rt = rt, Bg = bg, Label = txt, OnClick = act,
+            AccentStyle = true, BaseScale = Vector3.one
+        });
+        return bg;
+    }
+
+    private static void SelectZone(int zi)
+    {
+        _pSel = zi;
+        RefreshDetail();
+    }
+
+    private static void RefreshDetail()
+    {
+        if (_pTitle == null) return;
+        if (_pSel < 0)
+        {
+            _pTitle.text = "ВЫБЕРИ ЗОНУ";
+            _pCause.text = "Коснись части тела на скане";
+            _pDmg.text = "";
+            _pHp.text = "";
+            return;
+        }
+        var z = (GhostDiag.Zone)_pSel;
+        var info = GhostDiag.Get(z);
+        _pTitle.text = GhostDiag.ZoneName(z);
+        bool hurt = info.Hits > 0 && info.LastHitAt > -100f;
+        _pCause.text = hurt ? "Причина: " + GhostDiag.CauseName(info.LastCause) : "Причина: —";
+        _pDmg.text = hurt ? $"Повреждение: {info.LastDamage:0} ({info.Hits} попад.)" : "Повреждение: нет";
+        int hp = Mathf.RoundToInt(info.Ratio * 100f);
+        _pHp.text = $"Целостность: {hp}%";
+    }
+
+    private static string AvatarName()
+    {
+        try
+        {
+            if (GhostMod.FusionLoaded)
+            {
+                string t = LabFusion.Player.LocalPlayer.Metadata?.AvatarTitle?.GetValueOrEmpty();
+                if (!string.IsNullOrWhiteSpace(t)) return t.ToUpperInvariant();
+            }
+        }
+        catch { }
+        return "STRONG";   // кастом/неизвестно — дефолтное тело BONELAB
+    }
+
+    /// <summary>Каждый кадр на вкладке PLAYER: цвет зон по здоровью + сдвиг фигуры.</summary>
+    private static void AnimatePlayer(float dt)
+    {
+        // цвет зон: зелёный -> жёлтый -> красный по целостности
+        for (int i = 0; i < _pZone.Length; i++)
+        {
+            var img = _pZone[i];
+            if (img == null) continue;
+            var info = GhostDiag.Get((GhostDiag.Zone)i);
+            Color c = HealthColor(info.Ratio);
+
+            // недавнее попадание — вспышка
+            float since = Time.time - info.LastHitAt;
+            if (since < 0.6f)
+            {
+                float f = 1f - since / 0.6f;
+                c = Color.Lerp(c, Color.white, f * 0.7f);
+            }
+            // выбранная зона — подсветка пульсом
+            if (i == _pSel)
+            {
+                float p = 0.5f + 0.5f * Mathf.Sin(Time.unscaledTime * 6f);
+                c = Color.Lerp(c, Cyan, 0.35f + 0.35f * p);
+            }
+            c.a = 0.92f;
+            img.color = c;
+        }
+
+        // фигура слегка отъезжает влево, когда выбрана зона (деталь читается)
+        float target = _pSel >= 0 ? 1f : 0f;
+        _pSlide = Mathf.MoveTowards(_pSlide, target, dt * 4f);
+        if (_pFigure != null)
+            _pFigure.anchoredPosition = new Vector2(Mathf.Lerp(0f, -10f, _pSlide), 0f);
+
+        // живое обновление детали (HP тикает)
+        if (_pSel >= 0) RefreshDetail();
+    }
+
+    private static Color HealthColor(float ratio)
+    {
+        // 1 зелёный, 0.5 жёлтый, 0 красный — киберпанк-неон
+        if (ratio >= 0.5f)
+            return Color.Lerp(new Color(1f, 0.85f, 0.1f, 1f), new Color(0.2f, 1f, 0.45f, 1f),
+                              (ratio - 0.5f) * 2f);
+        return Color.Lerp(new Color(1f, 0.18f, 0.28f, 1f), new Color(1f, 0.85f, 0.1f, 1f),
+                          ratio * 2f);
+    }
+
     private static RectTransform MakeSection(Transform parent, string id, string title, float x0, float y0, float x1, float y1)
+        => MakeSection(parent, id, title, x0, y0, x1, y1, true);
+
+    private static RectTransform MakeSection(Transform parent, string id, string title, float x0, float y0, float x1, float y1, bool clip)
     {
         var go = new GameObject("Sec_" + id);
         go.transform.SetParent(parent, false);
@@ -1015,6 +1267,10 @@ public static class GhostHolo
         SetAnchors(brt, 0f, 0f, 1f, 1f);
         brt.offsetMin = new Vector2(5f, 4f);
         brt.offsetMax = new Vector2(-5f, -16f);
+        // Страховка: что бы ни положили в секцию, за её границы оно не вылезет —
+        // раньше «красные» кнопки торчали из панели именно из-за переполнения.
+        // Секцию с 2D-фигурой не клипуем (clip=false), иначе обрежет тело.
+        if (clip) { try { body.AddComponent<RectMask2D>(); } catch { } }
         return brt;
     }
 
@@ -1029,20 +1285,70 @@ public static class GhostHolo
         y -= 14f;
     }
 
+    private const int TabCount = 4;
+
     private static void AddTab(int index, string label, Tab tab)
     {
         var tabs = _panel.Find("Tabs");
         if (tabs == null) return;
-        float w = 78f;
-        float x = 6f + index * (w + 6f);
-        bool active = _tab == tab;
-        AddRowAt(tabs, x, -2f, w, 18f, label, null, () => QueueRebuild(tab), false, active);
+        // Четыре вкладки на всю ширину бара — без пустого места справа.
+        AddRowFrac(tabs, index / (float)TabCount, (index + 1) / (float)TabCount,
+                   -2f, 18f, label, null, () => QueueRebuild(tab), false, _tab == tab);
     }
 
     private static void AddRow(Transform host, ref float y, string label, string sub, Action act, bool danger = false, bool accent = false)
     {
         AddRowAt(host, 0f, y, -1f, 20f, label, sub, act, danger, accent);
         y -= 22f;
+    }
+
+    /// <summary>
+    /// Строка, растянутая между долями fx0..fx1 ширины родителя — так кнопки
+    /// сами подгоняются под размер секции и не вылезают. y — верх (пиксели вниз).
+    /// </summary>
+    private static void AddRowFrac(Transform host, float fx0, float fx1, float y, float h,
+                                   string label, string sub, Action act, bool danger = false, bool accent = false)
+    {
+        var go = new GameObject("Row_" + label);
+        go.transform.SetParent(host, false);
+        var rt = go.AddComponent<RectTransform>();
+        rt.anchorMin = new Vector2(fx0, 1f);
+        rt.anchorMax = new Vector2(fx1, 1f);
+        rt.pivot = new Vector2(0.5f, 1f);
+        rt.sizeDelta = new Vector2(-3f, h);          // -3 = зазор между чипами
+        rt.anchoredPosition = new Vector2(0f, y);
+
+        var fill = go.AddComponent<Image>();
+        fill.color = accent ? RowActive : (danger ? new Color(Danger.r, Danger.g, Danger.b, 0.16f) : RowIdle);
+        fill.raycastTarget = false;
+
+        var accentBar = MakeImage(rt, "Acc", danger ? DangerText : Yellow).rectTransform;
+        SetAnchors(accentBar, 0f, 0.12f, 0f, 0.88f);
+        accentBar.pivot = new Vector2(0f, 0.5f);
+        accentBar.sizeDelta = new Vector2(2f, 0f);
+        accentBar.anchoredPosition = new Vector2(2f, 0f);
+        var accentImg = accentBar.GetComponent<Image>();
+
+        var txt = MakeText(rt, "L", label, sub == null ? 10 : 10,
+                           danger ? DangerText : (accent ? Yellow : TextCol),
+                           sub == null ? TextAnchor.MiddleCenter : TextAnchor.MiddleLeft);
+        Stretch(txt.rectTransform);
+        txt.rectTransform.offsetMin = new Vector2(sub == null ? 0f : 8f, 0f);
+        txt.rectTransform.offsetMax = new Vector2(-4f, 0f);
+        if (accent || danger) txt.fontStyle = FontStyle.Bold;
+
+        if (!string.IsNullOrEmpty(sub))
+        {
+            var st = MakeText(rt, "S", sub, 8, TextDim, TextAnchor.MiddleRight);
+            SetAnchors(st.rectTransform, 0.45f, 0f, 1f, 1f);
+            st.rectTransform.offsetMax = new Vector2(-4f, 0f);
+        }
+
+        _buttons.Add(new HoloBtn
+        {
+            Rt = rt, Bg = fill, Accent = accentImg, Label = txt, OnClick = act,
+            DangerStyle = danger, AccentStyle = accent, BaseScale = Vector3.one
+        });
     }
 
     private static void AddRowAt(Transform host, float x, float y, float w, float h, string label, string sub, Action act, bool danger = false, bool accent = false)

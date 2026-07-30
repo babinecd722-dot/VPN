@@ -28,6 +28,9 @@ public class GhostMod : MelonMod
         if (FusionLoaded)
             GhostLobby.Install(HarmonyInstance);
 
+        // Диагностика тела работает и без Fusion — это локальное здоровье игрока.
+        GhostDiag.Install(HarmonyInstance);
+
         Hooking.OnLevelLoaded += _ =>
         {
             if (Enabled && FusionLoaded)

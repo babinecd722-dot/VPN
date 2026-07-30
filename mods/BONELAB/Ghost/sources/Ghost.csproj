@@ -30,6 +30,7 @@
     <Reference Include="UnityEngine.UIModule"><HintPath>$(RefsRoot)/UnityEngine.UIModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="UnityEngine.TextRenderingModule"><HintPath>$(RefsRoot)/UnityEngine.TextRenderingModule.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Il2CppSLZ.Marrow"><HintPath>$(RefsRoot)/Il2CppSLZ.Marrow.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Il2CppUniTask"><HintPath>$(RefsRoot)/Il2CppUniTask.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="LabFusion"><HintPath>$(RefsRoot)/LabFusion.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
 

@@ -115,19 +115,20 @@ public static class GhostIdentity
 
             ApplyAvatarMeta(title, modId);
 
-            // Best-effort body swap if their rig crate is known
+            // Тело клонируем РАЗОВЫМ свапом, а не LocalAvatar.AvatarOverride.
+            // Override — постоянный форс: Fusion возвращает твой аватар к
+            // клонированному при каждой попытке сменить скин (то самое
+            // «зацикливается, не могу переодеться»). SwapAvatarCrate меняет
+            // тело один раз, дальше аватар свободно меняется как обычно.
             try
             {
                 if (NetworkPlayerManager.TryGetPlayer(id.SmallID, out NetworkPlayer np) &&
                     np != null && np.HasRig && np.RigRefs?.RigManager != null)
                 {
                     var aref = np.RigRefs.RigManager.AvatarCrate;
-                    if (aref != null && aref.Barcode != null)
-                    {
-                        string barcode = aref.Barcode.ID;
-                        if (!string.IsNullOrWhiteSpace(barcode))
-                            LocalAvatar.AvatarOverride = barcode;
-                    }
+                    string barcode = aref?.Barcode?.ID;
+                    if (!string.IsNullOrWhiteSpace(barcode))
+                        SwapBodyOnce(barcode);
                 }
             }
             catch { /* avatar body optional */ }
@@ -135,6 +136,25 @@ public static class GhostIdentity
         catch (Exception ex)
         {
             MelonLogger.Warning($"Ghost clone: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Разовая смена тела по баркоду через штатный RigManager.SwapAvatarCrate.
+    /// Никакого постоянного форса: после этого скин можно менять свободно.
+    /// </summary>
+    private static void SwapBodyOnce(string barcode)
+    {
+        try
+        {
+            var rm = BoneLib.Player.RigManager;
+            if (rm == null) return;
+            var bc = new Il2CppSLZ.Marrow.Warehouse.Barcode(barcode);
+            rm.SwapAvatarCrate(bc, false, null);   // fire-and-forget UniTask
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"Ghost body swap: {ex.Message}");
         }
     }
 
