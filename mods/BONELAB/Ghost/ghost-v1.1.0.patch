@@ -1,5 +1,5 @@
 diff --git a/sources/BuildInfo.cs b/sources/BuildInfo.cs
-index f3d7450..d3624e2 100644
+index f3d7450..6940c03 100644
 --- a/sources/BuildInfo.cs
 +++ b/sources/BuildInfo.cs
 @@ -4,6 +4,6 @@ public static class BuildInfo
@@ -7,7 +7,7 @@ index f3d7450..d3624e2 100644
      public const string Name = "Ghost";
      public const string Author = "BE PRIME";
 -    public const string Version = "1.0.8";
-+    public const string Version = "1.0.9";
++    public const string Version = "1.1.0";
      public const string DownloadLink = "https://t.me/be_primex";
  }
 diff --git a/sources/Ghost.csproj b/sources/Ghost.csproj
@@ -35,7 +35,7 @@ index 6cfd1b1..3eaaca8 100644
    </ItemGroup>
  
 diff --git a/sources/GhostHolo.cs b/sources/GhostHolo.cs
-index 6fa5867..9bc6f7e 100644
+index 6fa5867..afd8cf4 100644
 --- a/sources/GhostHolo.cs
 +++ b/sources/GhostHolo.cs
 @@ -45,10 +45,11 @@ public static class GhostHolo
@@ -98,7 +98,7 @@ index 6fa5867..9bc6f7e 100644
      /// </summary>
      private static void AttachToLeftForearm()
      {
-@@ -369,52 +395,75 @@ public static class GhostHolo
+@@ -369,52 +395,80 @@ public static class GhostHolo
              Transform wrist = art?.artWristLf;
              Hand hand = Player.LeftHand;
  
@@ -140,8 +140,11 @@ index 6fa5867..9bc6f7e 100644
 -            if (outward.sqrMagnitude < 1e-8f) return;
 +            Vector3 basePos = Vector3.Lerp(elbowPos, wristPos, AlongArm);
 +
-+            // Лицо панели — на игрока. Берём направление к голове и убираем
-+            // составляющую вдоль руки, чтобы панель осталась «лежащей» на ней.
++            // Сторона, куда панель ОТКЛОНЕНА от руки — к игроку. Само лицо
++            // Canvas направим в другую сторону: у мирового Canvas читаемая
++            // сторона та, куда смотрит forward (по направлению взгляда игрока),
++            // поэтому forward = -outward. В прошлой версии я передал +outward и
++            // панель встала задом к игроку — текст читался зеркально (TSOHG).
 +            Vector3 outward = Vector3.zero;
 +            Transform head = Player.Head;
 +            if (head != null)
@@ -200,12 +203,14 @@ index 6fa5867..9bc6f7e 100644
 +            }
  
 -            _root.transform.SetPositionAndRotation(posMid, rot);
++            // Панель приподнята над рукой в сторону игрока (+outward),
++            // а её ЛИЦО смотрит на игрока — значит forward = -outward.
 +            Vector3 pos = basePos + _outSmooth * LiftOffArm;
-+            _root.transform.SetPositionAndRotation(pos, Quaternion.LookRotation(_outSmooth, up));
++            _root.transform.SetPositionAndRotation(pos, Quaternion.LookRotation(-_outSmooth, up));
          }
          catch { /* rig missing */ }
      }
-@@ -514,47 +563,68 @@ public static class GhostHolo
+@@ -514,47 +568,68 @@ public static class GhostHolo
          }
      }
  
@@ -295,7 +300,7 @@ index 6fa5867..9bc6f7e 100644
              _insideIndex = -1;
          }
      }
-@@ -605,23 +675,38 @@ public static class GhostHolo
+@@ -605,23 +680,38 @@ public static class GhostHolo
          catch (Exception ex) { MelonLogger.Warning($"Ghost btn: {ex.Message}"); }
      }
  

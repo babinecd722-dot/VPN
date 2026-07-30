@@ -417,8 +417,11 @@ public static class GhostHolo
 
             Vector3 basePos = Vector3.Lerp(elbowPos, wristPos, AlongArm);
 
-            // Лицо панели — на игрока. Берём направление к голове и убираем
-            // составляющую вдоль руки, чтобы панель осталась «лежащей» на ней.
+            // Сторона, куда панель ОТКЛОНЕНА от руки — к игроку. Само лицо
+            // Canvas направим в другую сторону: у мирового Canvas читаемая
+            // сторона та, куда смотрит forward (по направлению взгляда игрока),
+            // поэтому forward = -outward. В прошлой версии я передал +outward и
+            // панель встала задом к игроку — текст читался зеркально (TSOHG).
             Vector3 outward = Vector3.zero;
             Transform head = Player.Head;
             if (head != null)
@@ -462,8 +465,10 @@ public static class GhostHolo
                 if (Vector3.Dot(Vector3.Cross(up, _outSmooth), along) < 0f) up = -up;
             }
 
+            // Панель приподнята над рукой в сторону игрока (+outward),
+            // а её ЛИЦО смотрит на игрока — значит forward = -outward.
             Vector3 pos = basePos + _outSmooth * LiftOffArm;
-            _root.transform.SetPositionAndRotation(pos, Quaternion.LookRotation(_outSmooth, up));
+            _root.transform.SetPositionAndRotation(pos, Quaternion.LookRotation(-_outSmooth, up));
         }
         catch { /* rig missing */ }
     }
