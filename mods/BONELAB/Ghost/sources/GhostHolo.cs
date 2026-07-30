@@ -46,13 +46,18 @@ public static class GhostHolo
     private static int _insideIndex = -1;
     private static float _clickLockUntil;
     private static bool _touchDown;
-    private const float ClickCooldown = 0.28f;
+    private const float ClickCooldown = 0.20f;
 
-    // Всё в мировых метрах: расстояние от кончика пальца до поверхности кнопки.
-    private const float TouchThickness = 0.016f; // толщина коллайдера кнопки
-    private const float HoverDist = 0.040f;      // ближе этого — подсветка
-    private const float TouchEnter = 0.018f;     // ближе этого — нажатие
-    private const float TouchExit = 0.030f;      // дальше этого — отпустил
+    // Всё в мировых метрах. Физического упора нет — палец при тычке проходит
+    // сквозь плоскость. Коллайдер кнопки делаем слоем ±14 мм вокруг стекла, а
+    // нажатие засчитываем, только когда кончик оказался ВНУТРИ слоя (ClosestPoint
+    // == 0). Это даёт две вещи разом: тап идёт лишь при реальном дотягивании до
+    // панели (а не пока рука висит рядом и читает), и быстрый тычок ловится —
+    // при толстом слое кончик хоть на кадр, да оказывается внутри.
+    private const float TouchThickness = 0.028f; // слой контакта: ±14 мм у стекла
+    private const float HoverDist = 0.050f;      // ближе этого — подсветка
+    private const float TouchEnter = 0.001f;      // фактически «кончик внутри слоя»
+    private const float TouchExit = 0.012f;      // дальше этого — отпустил
 
     private static float _toastT = 1f;
     private static float _toastHoldUntil;
@@ -66,23 +71,25 @@ public static class GhostHolo
     private static float _baseScale = WorldScale;
     private static float _scanT;
 
-    // CP2077-ish yellow holo glass
-    private static readonly Color Glass = new Color(0.18f, 0.14f, 0.02f, 0.42f);
-    private static readonly Color GlassDeep = new Color(0.10f, 0.08f, 0.01f, 0.55f);
-    private static readonly Color Frame = new Color(1f, 0.90f, 0.12f, 0.55f);
-    private static readonly Color Yellow = new Color(1f, 0.91f, 0.14f, 0.95f);
-    private static readonly Color YellowSoft = new Color(1f, 0.86f, 0.20f, 0.55f);
-    private static readonly Color YellowDim = new Color(0.70f, 0.55f, 0.08f, 0.35f);
-    private static readonly Color YellowHot = new Color(1f, 0.96f, 0.55f, 0.85f);
-    private static readonly Color RowIdle = new Color(1f, 0.88f, 0.15f, 0.10f);
-    private static readonly Color RowHover = new Color(1f, 0.90f, 0.20f, 0.28f);
-    private static readonly Color RowActive = new Color(1f, 0.85f, 0.10f, 0.38f);
-    private static readonly Color TextCol = new Color(1f, 0.94f, 0.55f, 0.92f);
-    private static readonly Color TextDim = new Color(0.85f, 0.72f, 0.25f, 0.70f);
-    private static readonly Color Danger = new Color(1f, 0.32f, 0.18f, 0.55f);
-    private static readonly Color DangerText = new Color(1f, 0.55f, 0.40f, 0.95f);
-    private static readonly Color ToastBg = new Color(0.12f, 0.10f, 0.02f, 0.72f);
-    private static readonly Color Scan = new Color(1f, 0.92f, 0.20f, 0.07f);
+    // Cyberpunk 2077: неоновый жёлтый на почти чёрном стекле + циановый акцент.
+    private static readonly Color Glass = new Color(0.03f, 0.05f, 0.06f, 0.66f);
+    private static readonly Color GlassDeep = new Color(0.01f, 0.02f, 0.03f, 0.78f);
+    private static readonly Color Frame = new Color(1f, 0.92f, 0.10f, 0.85f);
+    private static readonly Color Yellow = new Color(1f, 0.93f, 0.15f, 1f);
+    private static readonly Color YellowSoft = new Color(1f, 0.88f, 0.20f, 0.60f);
+    private static readonly Color YellowDim = new Color(0.70f, 0.60f, 0.08f, 0.40f);
+    private static readonly Color YellowHot = new Color(1f, 0.98f, 0.60f, 0.95f);
+    private static readonly Color Cyan = new Color(0.10f, 0.95f, 1f, 1f);        // фирменный акцент CP
+    private static readonly Color CyanSoft = new Color(0.12f, 0.85f, 1f, 0.55f);
+    private static readonly Color RowIdle = new Color(0.55f, 0.85f, 0.95f, 0.06f);
+    private static readonly Color RowHover = new Color(0.12f, 0.90f, 1f, 0.30f);   // циановый ховер
+    private static readonly Color RowActive = new Color(1f, 0.88f, 0.12f, 0.34f);
+    private static readonly Color TextCol = new Color(0.92f, 0.98f, 1f, 0.92f);
+    private static readonly Color TextDim = new Color(0.55f, 0.80f, 0.88f, 0.70f);
+    private static readonly Color Danger = new Color(1f, 0.20f, 0.36f, 0.55f);     // неон-маджента
+    private static readonly Color DangerText = new Color(1f, 0.40f, 0.55f, 0.98f);
+    private static readonly Color ToastBg = new Color(0.02f, 0.03f, 0.04f, 0.82f);
+    private static readonly Color Scan = new Color(0.20f, 0.95f, 1f, 0.06f);
 
     private sealed class HoloBtn
     {
@@ -184,14 +191,10 @@ public static class GhostHolo
             _baseScale = WorldScale;
             _root.transform.localScale = Vector3.one * _baseScale;
 
-            // Кинематический Rigidbody: панель двигается трансформом каждый кадр,
-            // и без RB её коллайдеры считались бы статикой — двигать статику
-            // дорого и неправильно. С кинематическим RB это корректный «движущийся
-            // стенд», об который физическая рука упирается.
-            var rb = _root.AddComponent<Rigidbody>();
-            rb.isKinematic = true;
-            rb.useGravity = false;
-            rb.interpolation = RigidbodyInterpolation.Interpolate;
+            // Rigidbody СНЯТ намеренно: физический коллайдер, метущийся вместе с
+            // рукой, толкал ragdoll-части игрока — от этого «колбасило». Голограмма
+            // должна быть насквозь проходимой. Коллайдеры оставлены только как
+            // геометрия для ClosestPoint (isTrigger = true), физики на них нет.
 
             // Soft outer glow frame
             var glow = MakeImage(_root.transform, "Glow", new Color(1f, 0.85f, 0.1f, 0.12f));
@@ -519,20 +522,28 @@ public static class GhostHolo
                 b.PressAnim = Mathf.Max(0f, b.PressAnim - dt / 0.14f);
 
             float punch = b.PressAnim > 0f
-                ? 1f - Mathf.Sin((1f - b.PressAnim) * Mathf.PI) * 0.06f
+                ? 1f - Mathf.Sin((1f - b.PressAnim) * Mathf.PI) * 0.10f
                 : 1f;
             b.Rt.localScale = b.BaseScale * punch;
 
-            Color idle = b.DangerStyle ? new Color(Danger.r, Danger.g, Danger.b, 0.18f)
+            Color idle = b.DangerStyle ? new Color(Danger.r, Danger.g, Danger.b, 0.16f)
                 : (b.AccentStyle ? RowActive : RowIdle);
             Color hot = b.DangerStyle ? Danger : RowHover;
-            b.Bg.color = Color.Lerp(idle, hot, b.HoverBlend);
+            Color bg = Color.Lerp(idle, hot, b.HoverBlend);
+            // Яркая циановая вспышка на момент нажатия — чтобы тап был ЯВНО виден.
+            if (b.PressAnim > 0f)
+            {
+                Color flash = b.DangerStyle ? DangerText : Cyan;
+                bg = Color.Lerp(bg, flash, b.PressAnim);
+            }
+            b.Bg.color = bg;
 
             if (b.Accent != null)
             {
-                Color a = b.DangerStyle ? DangerText : Yellow;
-                a.a = Mathf.Lerp(0.35f, 0.95f, b.HoverBlend);
-                if (b.AccentStyle) a.a = 0.95f;
+                Color a = b.DangerStyle ? DangerText : (b.HoverBlend > 0.02f ? Cyan : Yellow);
+                a.a = Mathf.Lerp(0.40f, 1f, b.HoverBlend);
+                if (b.AccentStyle) a.a = 1f;
+                if (b.PressAnim > 0f) a = Cyan;
                 b.Accent.color = a;
             }
 
@@ -540,7 +551,8 @@ public static class GhostHolo
             {
                 Color tc = b.DangerStyle ? DangerText : TextCol;
                 if (b.AccentStyle) tc = Yellow;
-                tc.a = Mathf.Lerp(0.75f, 1f, b.HoverBlend);
+                if (b.PressAnim > 0.4f) tc = Color.white;
+                tc.a = Mathf.Lerp(0.80f, 1f, b.HoverBlend);
                 b.Label.color = tc;
             }
         }
@@ -1109,7 +1121,7 @@ public static class GhostHolo
             var box = go.AddComponent<BoxCollider>();
             box.center = new Vector3(r.center.x, r.center.y, 0f);
             box.size = new Vector3(r.width, r.height, TouchThickness / sz);
-            box.isTrigger = false;                  // палец реально упирается
+            box.isTrigger = true;                   // только геометрия для ClosestPoint, без физики
             return box;
         }
         catch { return null; }
