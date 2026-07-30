@@ -24,6 +24,16 @@ public static class GhostDiag
     public enum Zone { Head, Torso, ArmL, ArmR, LegL, LegR }
     public const int ZoneCount = 6;
 
+    /// <summary>Одно попадание для детального вида части тела.</summary>
+    public struct Mark
+    {
+        public PlayerDamageReceiver.BodyPart Part; // точная под-часть (кисть/предплечье/…)
+        public Vector2 Dir;                        // откуда прилетело, в 2D экрана
+        public AttackType Type;                    // пуля / удар / порез / ожог
+        public float Damage;
+        public float At;
+    }
+
     public sealed class ZoneInfo
     {
         public float Ratio = 1f;       // 1 цел .. 0 уничтожен
@@ -31,6 +41,9 @@ public static class GhostDiag
         public float LastDamage;       // сколько сняло последним ударом
         public float LastHitAt = -999f;// когда (Time.time)
         public int Hits;               // сколько раз задевало с последней починки
+        public readonly System.Collections.Generic.List<Mark> Marks =
+            new System.Collections.Generic.List<Mark>();
+        public const int MaxMarks = 6;
     }
 
     private static readonly ZoneInfo[] _zones = NewZones();
@@ -67,12 +80,44 @@ public static class GhostDiag
         {
             Zone z = MapPart(part);
             var info = _zones[(int)z];
-            info.LastCause = attack != null ? attack.attackType : AttackType.None;
-            info.LastDamage = attack != null ? Mathf.Abs(attack.damage) : 0f;
+            var type = attack != null ? attack.attackType : AttackType.None;
+            float dmg = attack != null ? Mathf.Abs(attack.damage) : 0f;
+
+            info.LastCause = type;
+            info.LastDamage = dmg;
             info.LastHitAt = Time.time;
             info.Hits++;
+
+            info.Marks.Add(new Mark
+            {
+                Part = part,
+                Dir = attack != null ? Project2D(attack.direction) : new Vector2(0f, 1f),
+                Type = type,
+                Damage = dmg,
+                At = Time.time,
+            });
+            while (info.Marks.Count > ZoneInfo.MaxMarks) info.Marks.RemoveAt(0);
         }
         catch { }
+    }
+
+    /// <summary>
+    /// Проецирует мировое направление удара в 2D панели: x — вбок относительно
+    /// взгляда игрока, y — вверх. Так «красная траектория» показывает реальный
+    /// угол, откуда прилетело.
+    /// </summary>
+    private static Vector2 Project2D(Vector3 worldDir)
+    {
+        try
+        {
+            var head = Player.Head;
+            Vector3 right = head != null ? head.right : Vector3.right;
+            Vector3 up = head != null ? head.up : Vector3.up;
+            Vector2 v = new Vector2(Vector3.Dot(worldDir, right), Vector3.Dot(worldDir, up));
+            if (v.sqrMagnitude < 1e-6f) return new Vector2(0f, 1f);
+            return v.normalized;
+        }
+        catch { return new Vector2(0f, 1f); }
     }
 
     private static Zone MapPart(PlayerDamageReceiver.BodyPart p)
@@ -173,6 +218,7 @@ public static class GhostDiag
             info.Hits = 0;
             info.LastDamage = 0f;
             info.LastHitAt = -999f;
+            info.Marks.Clear();
             Refresh();
             return true;
         }
@@ -195,6 +241,54 @@ public static class GhostDiag
         Zone.ArmR => "ПРАВАЯ РУКА",
         Zone.LegL => "ЛЕВАЯ НОГА",
         Zone.LegR => "ПРАВАЯ НОГА",
+        _ => "?"
+    };
+
+    /// <summary>Позиция вдоль части: 0 — верх (плечо/бедро), 1 — низ (кисть/стопа).</summary>
+    public static float AlongAxis(PlayerDamageReceiver.BodyPart p)
+    {
+        switch (p)
+        {
+            case PlayerDamageReceiver.BodyPart.Head: return 0.15f;
+            case PlayerDamageReceiver.BodyPart.Neck: return 0.30f;
+            case PlayerDamageReceiver.BodyPart.Chest: return 0.30f;
+            case PlayerDamageReceiver.BodyPart.Spine: return 0.55f;
+            case PlayerDamageReceiver.BodyPart.Pelvis: return 0.80f;
+            case PlayerDamageReceiver.BodyPart.ArmUpperLf:
+            case PlayerDamageReceiver.BodyPart.ArmUpperRt: return 0.20f;
+            case PlayerDamageReceiver.BodyPart.ArmLowerLf:
+            case PlayerDamageReceiver.BodyPart.ArmLowerRt: return 0.55f;
+            case PlayerDamageReceiver.BodyPart.HandLf:
+            case PlayerDamageReceiver.BodyPart.HandRt: return 0.90f;
+            case PlayerDamageReceiver.BodyPart.LegUpperLf:
+            case PlayerDamageReceiver.BodyPart.LegUpperRt: return 0.20f;
+            case PlayerDamageReceiver.BodyPart.LegLowerLf:
+            case PlayerDamageReceiver.BodyPart.LegLowerRt: return 0.55f;
+            case PlayerDamageReceiver.BodyPart.FootLf:
+            case PlayerDamageReceiver.BodyPart.FootRt: return 0.92f;
+            default: return 0.5f;
+        }
+    }
+
+    public static string PartName(PlayerDamageReceiver.BodyPart p) => p switch
+    {
+        PlayerDamageReceiver.BodyPart.Head => "Голова",
+        PlayerDamageReceiver.BodyPart.Neck => "Шея",
+        PlayerDamageReceiver.BodyPart.Chest => "Грудь",
+        PlayerDamageReceiver.BodyPart.Spine => "Живот",
+        PlayerDamageReceiver.BodyPart.Pelvis => "Таз",
+        PlayerDamageReceiver.BodyPart.ArmUpperLf => "Левое плечо",
+        PlayerDamageReceiver.BodyPart.ArmLowerLf => "Левое предплечье",
+        PlayerDamageReceiver.BodyPart.HandLf => "Левая кисть",
+        PlayerDamageReceiver.BodyPart.ArmUpperRt => "Правое плечо",
+        PlayerDamageReceiver.BodyPart.ArmLowerRt => "Правое предплечье",
+        PlayerDamageReceiver.BodyPart.HandRt => "Правая кисть",
+        PlayerDamageReceiver.BodyPart.LegUpperLf => "Левое бедро",
+        PlayerDamageReceiver.BodyPart.LegLowerLf => "Левая голень",
+        PlayerDamageReceiver.BodyPart.FootLf => "Левая стопа",
+        PlayerDamageReceiver.BodyPart.LegUpperRt => "Правое бедро",
+        PlayerDamageReceiver.BodyPart.LegLowerRt => "Правая голень",
+        PlayerDamageReceiver.BodyPart.FootRt => "Правая стопа",
         _ => "?"
     };
 

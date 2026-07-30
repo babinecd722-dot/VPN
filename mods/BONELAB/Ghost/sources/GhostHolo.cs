@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using BoneLib;
 using Il2CppSLZ.Marrow;
+using Il2CppSLZ.Marrow.Data;
 using LabFusion.Player;
 using MelonLoader;
 using UnityEngine;
@@ -108,12 +109,16 @@ public static class GhostHolo
     }
 
     // ─── состояние вкладки PLAYER ───
-    private static RectTransform _pFigure;
+    private static RectTransform _pFigure;    // общий силуэт
+    private static RectTransform _pPartView;  // увеличенная выбранная часть
     private static readonly Image[] _pZone = new Image[GhostDiag.ZoneCount];
     private static Text _pAvatar, _pTitle, _pCause, _pDmg, _pHp;
     private static Image _pHealBtnBg;
     private static int _pSel = -1;
     private static float _pSlide;             // 0 фигура по центру, 1 сдвинута под деталь
+    private static CanvasGroup _pPartCg;      // прозрачность детали
+    private static readonly List<Image> _pHitFx = new List<Image>(); // пульсирующие пули
+    private static Sprite _circle;            // мягкий круг для пуль/крови/раны
 
     public static void Tick()
     {
@@ -165,6 +170,7 @@ public static class GhostHolo
         _outInit = false;
         _pFigure = null; _pAvatar = null; _pTitle = null; _pCause = null;
         _pDmg = null; _pHp = null; _pHealBtnBg = null; _pSel = -1;
+        _pPartView = null; _pPartCg = null; _pSlide = 0f; _pHitFx.Clear();
         for (int i = 0; i < _pZone.Length; i++) _pZone[i] = null;
         if (_root != null)
         {
@@ -1034,6 +1040,21 @@ public static class GhostHolo
         foreach (var zl in ZoneLayout)
             AddZoneButton(_pFigure, zl.z, zl.x, zl.y, zl.w, zl.h);
 
+        // Крупный план выбранной части: сюда рисуем рану — точку попадания,
+        // траекторию и кровь. Пока зона не выбрана — скрыт (alpha 0, off).
+        var pvGo = new GameObject("PartView");
+        pvGo.transform.SetParent(body, false);
+        _pPartView = pvGo.AddComponent<RectTransform>();
+        SetAnchors(_pPartView, 0.5f, 0.5f, 0.5f, 0.5f);
+        _pPartView.sizeDelta = new Vector2(64f, 92f);
+        _pPartView.anchoredPosition = new Vector2(-42f, 4f);
+        _pPartCg = pvGo.AddComponent<CanvasGroup>();
+        _pPartCg.alpha = 0f;
+        _pPartCg.interactable = false;
+        _pPartCg.blocksRaycasts = false;
+        pvGo.SetActive(false);
+        _pHitFx.Clear();
+
         // Аватар (стоковый / кастомный)
         _pAvatar = MakeText(body, "Av", "АВАТАР: " + AvatarName(), 8, Cyan, TextAnchor.LowerCenter);
         SetAnchors(_pAvatar.rectTransform, 0f, 0f, 1f, 0f);
@@ -1145,7 +1166,180 @@ public static class GhostHolo
     private static void SelectZone(int zi)
     {
         _pSel = zi;
+        BuildPartView((GhostDiag.Zone)zi);
         RefreshDetail();
+    }
+
+    // ── цвета раны ──
+    private static readonly Color LimbFill = new Color(0.10f, 0.55f, 0.70f, 0.42f);
+    private static readonly Color LimbEdge = new Color(0.35f, 0.95f, 1f, 0.70f);
+    private static readonly Color LimbCore = new Color(0.20f, 0.80f, 0.95f, 0.16f);
+    private static readonly Color Bullet = new Color(1f, 0.20f, 0.18f, 1f);
+    private static readonly Color BulletHot = new Color(1f, 0.85f, 0.55f, 1f);
+    private static readonly Color Traj = new Color(1f, 0.22f, 0.20f, 0.85f);
+    private static readonly Color TrajGlow = new Color(1f, 0.30f, 0.25f, 0.30f);
+    private static readonly Color Blood = new Color(0.62f, 0.02f, 0.06f, 0.88f);
+    private static readonly Color BloodDark = new Color(0.32f, 0.01f, 0.03f, 0.82f);
+    private static readonly Color Bruise = new Color(0.42f, 0.10f, 0.52f, 0.62f);
+    private static readonly Color Burn = new Color(1f, 0.48f, 0.10f, 0.80f);
+
+    /// <summary>
+    /// Рисует крупный план выбранной части тела и все раны на ней. Для каждого
+    /// попадания (GhostDiag.Mark) визуал зависит от типа: пуля — красная точка +
+    /// траектория сзади + кровь; тупой — синяк; порез — красная линия поперёк;
+    /// колющий — короткий прокол; ожог — оранжевое пятно. Позиция раны вдоль
+    /// части берётся из настоящей под-части (AlongAxis), угол — из направления
+    /// удара (Mark.Dir). Данные реальные — из хука урона.
+    /// </summary>
+    private static void BuildPartView(GhostDiag.Zone z)
+    {
+        if (_pPartView == null) return;
+        for (int i = _pPartView.childCount - 1; i >= 0; i--)
+            Object.Destroy(_pPartView.GetChild(i).gameObject);
+        _pHitFx.Clear();
+
+        // Силуэт части — вертикальная «капсула» (эллипс из мягкого круга).
+        const float limbW = 30f, limbH = 84f;
+        var core = MakeImage(_pPartView, "Limb", LimbFill);
+        core.sprite = Circle(); core.type = Image.Type.Simple;
+        var crt = core.rectTransform;
+        SetAnchors(crt, 0.5f, 0.5f, 0.5f, 0.5f);
+        crt.sizeDelta = new Vector2(limbW, limbH);
+        var edge = MakeImage(_pPartView, "LimbEdge", LimbEdge);
+        edge.sprite = Circle(); edge.type = Image.Type.Simple;
+        var ert = edge.rectTransform;
+        SetAnchors(ert, 0.5f, 0.5f, 0.5f, 0.5f);
+        ert.sizeDelta = new Vector2(limbW + 3f, limbH + 3f);
+        edge.transform.SetAsFirstSibling();  // обводка позади заливки
+        var gloss = MakeImage(_pPartView, "Gloss", LimbCore);
+        gloss.sprite = Circle(); gloss.type = Image.Type.Simple;
+        SetAnchors(gloss.rectTransform, 0.5f, 0.5f, 0.5f, 0.5f);
+        gloss.rectTransform.sizeDelta = new Vector2(limbW * 0.5f, limbH * 0.8f);
+        gloss.rectTransform.anchoredPosition = new Vector2(-limbW * 0.18f, 0f);
+
+        // подпись части (мелкая, вверху)
+        var cap = MakeText(_pPartView, "Cap", GhostDiag.ZoneName(z), 8, LimbEdge, TextAnchor.UpperCenter);
+        SetAnchors(cap.rectTransform, 0f, 1f, 1f, 1f);
+        cap.rectTransform.pivot = new Vector2(0.5f, 1f);
+        cap.rectTransform.sizeDelta = new Vector2(0f, 10f);
+        cap.rectTransform.anchoredPosition = new Vector2(0f, 2f);
+
+        var info = GhostDiag.Get(z);
+        float halfW = limbW * 0.5f;
+        float topY = limbH * 0.5f - 4f, botY = -limbH * 0.5f + 4f;
+
+        if (info.Marks.Count == 0)
+        {
+            var ok = MakeText(_pPartView, "OK", "ЦЕЛА", 8, new Color(0.2f, 1f, 0.45f, 0.9f), TextAnchor.LowerCenter);
+            SetAnchors(ok.rectTransform, 0f, 0f, 1f, 0f);
+            ok.rectTransform.pivot = new Vector2(0.5f, 0f);
+            ok.rectTransform.sizeDelta = new Vector2(0f, 10f);
+            ok.rectTransform.anchoredPosition = new Vector2(0f, -2f);
+            return;
+        }
+
+        for (int mi = 0; mi < info.Marks.Count; mi++)
+        {
+            var m = info.Marks[mi];
+            float t = GhostDiag.AlongAxis(m.Part);
+            float y = Mathf.Lerp(topY, botY, t);
+            Vector2 dir = m.Dir.sqrMagnitude > 1e-4f ? m.Dir.normalized : new Vector2(0f, -1f);
+            Vector2 perp = new Vector2(-dir.y, dir.x);
+            // Пуля идёт вдоль dir → вошла со стороны -dir. Точка входа на кромке.
+            Vector2 hit = new Vector2(Mathf.Clamp(-dir.x * halfW, -halfW, halfW), y);
+            bool newest = mi == info.Marks.Count - 1;
+
+            var tp = m.Type;
+            if ((tp & AttackType.Blunt) != 0 && (tp & (AttackType.Piercing | AttackType.Stabbing | AttackType.Slicing)) == 0)
+            {
+                // синяк — мягкое багрово-фиолетовое пятно, без пробоины
+                MakeDot(_pPartView, hit, 20f, Bruise);
+                MakeDot(_pPartView, hit, 12f, new Color(Bruise.r, Bruise.g, Bruise.b, 0.9f));
+            }
+            else if ((tp & AttackType.Slicing) != 0)
+            {
+                // порез — красная линия поперёк части + кровь по краям
+                Vector2 a = hit - perp * (halfW + 3f);
+                Vector2 b = hit + perp * (halfW + 3f);
+                MakeLine(_pPartView, a, b, 3.2f, Blood);
+                MakeLine(_pPartView, a, b, 1.4f, Bullet);
+                MakeDot(_pPartView, hit, 10f, Blood);
+            }
+            else
+            {
+                // выстрел / прокол — кровь, траектория сзади и красная пуля
+                bool stab = (tp & AttackType.Stabbing) != 0;
+                Vector2 outTip = hit - dir * (stab ? 16f : 30f);
+                if (!stab)
+                    MakeLine(_pPartView, outTip, hit, 4.5f, TrajGlow); // ореол траектории
+                MakeLine(_pPartView, outTip, hit, 1.6f, Traj);
+                // кровь в месте входа (кластер)
+                Vector2 inner = hit + dir * 3f;
+                MakeDot(_pPartView, inner, 15f, BloodDark);
+                MakeDot(_pPartView, inner + perp * 3f, 9f, Blood);
+                MakeDot(_pPartView, inner - perp * 4f, 7f, Blood);
+                if ((tp & AttackType.Fire) != 0)
+                    MakeDot(_pPartView, hit, 13f, Burn);
+                // красная пуля поверх всего
+                var slug = MakeDot(_pPartView, hit, newest ? 8f : 6f, Bullet);
+                var glowSlug = MakeDot(_pPartView, hit, newest ? 13f : 10f, new Color(Bullet.r, Bullet.g, Bullet.b, 0.30f));
+                glowSlug.transform.SetSiblingIndex(slug.transform.GetSiblingIndex());
+                MakeDot(_pPartView, hit + new Vector2(-1.4f, 1.4f), 2.6f, BulletHot); // блик
+                _pHitFx.Add(slug);
+            }
+        }
+    }
+
+    /// <summary>Мягкий круг-спрайт (пуля, кровь, капсула). Строится один раз.</summary>
+    private static Sprite Circle()
+    {
+        if (_circle != null) return _circle;
+        try
+        {
+            const int R = 48;
+            var tex = new Texture2D(R, R, TextureFormat.RGBA32, false);
+            tex.wrapMode = TextureWrapMode.Clamp;
+            float c = (R - 1) * 0.5f;
+            for (int yy = 0; yy < R; yy++)
+                for (int xx = 0; xx < R; xx++)
+                {
+                    float dx = (xx - c) / c, dy = (yy - c) / c;
+                    float d = Mathf.Sqrt(dx * dx + dy * dy);
+                    float a = 1f - Mathf.SmoothStep(0.82f, 1f, d);
+                    tex.SetPixel(xx, yy, new Color(1f, 1f, 1f, Mathf.Clamp01(a)));
+                }
+            tex.Apply(false);
+            _circle = Sprite.Create(tex, new Rect(0, 0, R, R), new Vector2(0.5f, 0.5f), 100f);
+        }
+        catch { }
+        return _circle;
+    }
+
+    /// <summary>Линия-Image между двумя локальными точками (траектория/порез).</summary>
+    private static Image MakeLine(Transform parent, Vector2 a, Vector2 b, float thickness, Color col)
+    {
+        var img = MakeImage(parent, "Line", col);
+        var rt = img.rectTransform;
+        SetAnchors(rt, 0.5f, 0.5f, 0.5f, 0.5f);
+        Vector2 d = b - a;
+        float len = d.magnitude;
+        rt.sizeDelta = new Vector2(len, thickness);
+        rt.anchoredPosition = (a + b) * 0.5f;
+        rt.localRotation = Quaternion.Euler(0f, 0f, Mathf.Atan2(d.y, d.x) * Mathf.Rad2Deg);
+        return img;
+    }
+
+    /// <summary>Круглая точка (пуля / капля крови) на мягком спрайте.</summary>
+    private static Image MakeDot(Transform parent, Vector2 pos, float size, Color col)
+    {
+        var img = MakeImage(parent, "Dot", col);
+        img.sprite = Circle();
+        img.type = Image.Type.Simple;
+        var rt = img.rectTransform;
+        SetAnchors(rt, 0.5f, 0.5f, 0.5f, 0.5f);
+        rt.sizeDelta = new Vector2(size, size);
+        rt.anchoredPosition = pos;
+        return img;
     }
 
     private static void RefreshDetail()
@@ -1211,11 +1405,40 @@ public static class GhostHolo
             img.color = c;
         }
 
-        // фигура слегка отъезжает влево, когда выбрана зона (деталь читается)
+        // Выбор зоны: фигура уезжает ВПРАВО и уменьшается, а слева
+        // «выезжает» крупный план части тела с раной.
         float target = _pSel >= 0 ? 1f : 0f;
-        _pSlide = Mathf.MoveTowards(_pSlide, target, dt * 4f);
+        _pSlide = Mathf.MoveTowards(_pSlide, target, dt * 5f);
+        float e = EaseOutCubic(_pSlide);
         if (_pFigure != null)
-            _pFigure.anchoredPosition = new Vector2(Mathf.Lerp(0f, -10f, _pSlide), 0f);
+        {
+            _pFigure.anchoredPosition = new Vector2(Mathf.Lerp(0f, 34f, e), 4f);
+            _pFigure.localScale = Vector3.one * Mathf.Lerp(1f, 0.62f, e);
+        }
+        if (_pPartView != null)
+        {
+            bool show = _pSlide > 0.02f;
+            if (_pPartView.gameObject.activeSelf != show)
+                _pPartView.gameObject.SetActive(show);
+            if (show)
+            {
+                _pPartView.anchoredPosition = new Vector2(Mathf.Lerp(-58f, -40f, e), 4f);
+                _pPartView.localScale = Vector3.one * Mathf.Lerp(0.7f, 1f, e);
+                if (_pPartCg != null) _pPartCg.alpha = e;
+            }
+        }
+
+        // пульс красных пуль — «свежая рана дышит»
+        if (_pHitFx.Count > 0)
+        {
+            float p = 0.5f + 0.5f * Mathf.Sin(Time.unscaledTime * 7f);
+            for (int i = 0; i < _pHitFx.Count; i++)
+            {
+                var fx = _pHitFx[i];
+                if (fx == null) continue;
+                fx.rectTransform.localScale = Vector3.one * (0.9f + 0.22f * p);
+            }
+        }
 
         // живое обновление детали (HP тикает)
         if (_pSel >= 0) RefreshDetail();

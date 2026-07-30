@@ -1,5 +1,5 @@
 diff --git a/sources/BuildInfo.cs b/sources/BuildInfo.cs
-index f3d7450..beeb2e6 100644
+index f3d7450..dd74e97 100644
 --- a/sources/BuildInfo.cs
 +++ b/sources/BuildInfo.cs
 @@ -4,6 +4,6 @@ public static class BuildInfo
@@ -7,7 +7,7 @@ index f3d7450..beeb2e6 100644
      public const string Name = "Ghost";
      public const string Author = "BE PRIME";
 -    public const string Version = "1.0.8";
-+    public const string Version = "1.2.0";
++    public const string Version = "1.2.1";
      public const string DownloadLink = "https://t.me/be_primex";
  }
 diff --git a/sources/Ghost.csproj b/sources/Ghost.csproj
@@ -35,11 +35,330 @@ index 6cfd1b1..70eed77 100644
      <Reference Include="LabFusion"><HintPath>$(RefsRoot)/LabFusion.dll</HintPath><Private>false</Private></Reference>
    </ItemGroup>
  
+diff --git a/sources/GhostDiag.cs b/sources/GhostDiag.cs
+new file mode 100644
+index 0000000..2dcfd79
+--- /dev/null
++++ b/sources/GhostDiag.cs
+@@ -0,0 +1,305 @@
++using System;
++using BoneLib;
++using HarmonyLib;
++using Il2CppSLZ.Marrow;
++using Il2CppSLZ.Marrow.Combat;
++using Il2CppSLZ.Marrow.Data;
++using MelonLoader;
++using UnityEngine;
++
++namespace BePrime.Ghost;
++
++/// <summary>
++/// Диагностика тела игрока в духе Cyberpunk: реальный урон по зонам, причина
++/// (пуля / удар / порез / ожог) и починка.
++///
++/// Данные НЕ выдуманные. BONELAB хранит здоровье по конечностям
++/// (Health.cur_arm_lf/rt, cur_leg_lf/rt) плюс общий curr_Health/max_Health, а
++/// Player_Health.OnReceivedDamage(attack, part) сообщает и точную часть тела,
++/// и тип атаки. Мы это перехватываем, копим по шести зонам и умеем чинить:
++/// вернуть HP конечности и стереть кровь (Health.ResetHits).
++/// </summary>
++public static class GhostDiag
++{
++    public enum Zone { Head, Torso, ArmL, ArmR, LegL, LegR }
++    public const int ZoneCount = 6;
++
++    /// <summary>Одно попадание для детального вида части тела.</summary>
++    public struct Mark
++    {
++        public PlayerDamageReceiver.BodyPart Part; // точная под-часть (кисть/предплечье/…)
++        public Vector2 Dir;                        // откуда прилетело, в 2D экрана
++        public AttackType Type;                    // пуля / удар / порез / ожог
++        public float Damage;
++        public float At;
++    }
++
++    public sealed class ZoneInfo
++    {
++        public float Ratio = 1f;       // 1 цел .. 0 уничтожен
++        public AttackType LastCause;   // чем в последний раз задело
++        public float LastDamage;       // сколько сняло последним ударом
++        public float LastHitAt = -999f;// когда (Time.time)
++        public int Hits;               // сколько раз задевало с последней починки
++        public readonly System.Collections.Generic.List<Mark> Marks =
++            new System.Collections.Generic.List<Mark>();
++        public const int MaxMarks = 6;
++    }
++
++    private static readonly ZoneInfo[] _zones = NewZones();
++    private static bool _hooked;
++
++    public static ZoneInfo Get(Zone z) => _zones[(int)z];
++
++    private static ZoneInfo[] NewZones()
++    {
++        var a = new ZoneInfo[ZoneCount];
++        for (int i = 0; i < a.Length; i++) a[i] = new ZoneInfo();
++        return a;
++    }
++
++    // ─────────────── хук урона ───────────────
++
++    public static void Install(HarmonyLib.Harmony h)
++    {
++        if (_hooked || h == null) return;
++        try
++        {
++            var m = AccessTools.Method(typeof(Player_Health), nameof(Player_Health.OnReceivedDamage));
++            if (m == null) { MelonLogger.Warning("Ghost diag: OnReceivedDamage не найден"); return; }
++            h.Patch(m, postfix: new HarmonyMethod(typeof(GhostDiag), nameof(OnDamage)));
++            _hooked = true;
++            MelonLogger.Msg("Ghost diag: damage hook ready");
++        }
++        catch (Exception e) { MelonLogger.Warning("Ghost diag hook: " + e.Message); }
++    }
++
++    private static void OnDamage(Attack attack, PlayerDamageReceiver.BodyPart part)
++    {
++        try
++        {
++            Zone z = MapPart(part);
++            var info = _zones[(int)z];
++            var type = attack != null ? attack.attackType : AttackType.None;
++            float dmg = attack != null ? Mathf.Abs(attack.damage) : 0f;
++
++            info.LastCause = type;
++            info.LastDamage = dmg;
++            info.LastHitAt = Time.time;
++            info.Hits++;
++
++            info.Marks.Add(new Mark
++            {
++                Part = part,
++                Dir = attack != null ? Project2D(attack.direction) : new Vector2(0f, 1f),
++                Type = type,
++                Damage = dmg,
++                At = Time.time,
++            });
++            while (info.Marks.Count > ZoneInfo.MaxMarks) info.Marks.RemoveAt(0);
++        }
++        catch { }
++    }
++
++    /// <summary>
++    /// Проецирует мировое направление удара в 2D панели: x — вбок относительно
++    /// взгляда игрока, y — вверх. Так «красная траектория» показывает реальный
++    /// угол, откуда прилетело.
++    /// </summary>
++    private static Vector2 Project2D(Vector3 worldDir)
++    {
++        try
++        {
++            var head = Player.Head;
++            Vector3 right = head != null ? head.right : Vector3.right;
++            Vector3 up = head != null ? head.up : Vector3.up;
++            Vector2 v = new Vector2(Vector3.Dot(worldDir, right), Vector3.Dot(worldDir, up));
++            if (v.sqrMagnitude < 1e-6f) return new Vector2(0f, 1f);
++            return v.normalized;
++        }
++        catch { return new Vector2(0f, 1f); }
++    }
++
++    private static Zone MapPart(PlayerDamageReceiver.BodyPart p)
++    {
++        switch (p)
++        {
++            case PlayerDamageReceiver.BodyPart.Head:
++            case PlayerDamageReceiver.BodyPart.Neck:
++                return Zone.Head;
++            case PlayerDamageReceiver.BodyPart.ArmUpperLf:
++            case PlayerDamageReceiver.BodyPart.ArmLowerLf:
++            case PlayerDamageReceiver.BodyPart.HandLf:
++                return Zone.ArmL;
++            case PlayerDamageReceiver.BodyPart.ArmUpperRt:
++            case PlayerDamageReceiver.BodyPart.ArmLowerRt:
++            case PlayerDamageReceiver.BodyPart.HandRt:
++                return Zone.ArmR;
++            case PlayerDamageReceiver.BodyPart.LegUpperLf:
++            case PlayerDamageReceiver.BodyPart.LegLowerLf:
++            case PlayerDamageReceiver.BodyPart.FootLf:
++                return Zone.LegL;
++            case PlayerDamageReceiver.BodyPart.LegUpperRt:
++            case PlayerDamageReceiver.BodyPart.LegLowerRt:
++            case PlayerDamageReceiver.BodyPart.FootRt:
++                return Zone.LegR;
++            default:
++                return Zone.Torso;   // Chest, Spine, Pelvis
++        }
++    }
++
++    // ─────────────── чтение реального HP ───────────────
++
++    private static Player_Health Ph()
++    {
++        try { return Player.RigManager?.health?.TryCast<Player_Health>(); }
++        catch { return null; }
++    }
++
++    /// <summary>Обновляет Ratio каждой зоны из настоящих полей здоровья BONELAB.</summary>
++    public static void Refresh()
++    {
++        try
++        {
++            var ph = Ph();
++            if (ph == null) return;
++
++            float max = ph.max_Health > 1e-3f ? ph.max_Health : 100f;
++            float body = Mathf.Clamp01(ph.curr_Health / max);
++
++            _zones[(int)Zone.Head].Ratio = body;
++            _zones[(int)Zone.Torso].Ratio = body;
++            _zones[(int)Zone.ArmL].Ratio = Mathf.Clamp01(ph.cur_arm_lf / max);
++            _zones[(int)Zone.ArmR].Ratio = Mathf.Clamp01(ph.cur_arm_rt / max);
++            _zones[(int)Zone.LegL].Ratio = Mathf.Clamp01(ph.cur_leg_lf / max);
++            _zones[(int)Zone.LegR].Ratio = Mathf.Clamp01(ph.cur_leg_rt / max);
++        }
++        catch { }
++    }
++
++    public static float BodyPercent()
++    {
++        try
++        {
++            var ph = Ph();
++            if (ph == null) return 1f;
++            float max = ph.max_Health > 1e-3f ? ph.max_Health : 100f;
++            return Mathf.Clamp01(ph.curr_Health / max);
++        }
++        catch { return 1f; }
++    }
++
++    // ─────────────── починка ───────────────
++
++    /// <summary>Чинит зону: возвращает HP конечности/тела и стирает кровь.</summary>
++    public static bool Heal(Zone z)
++    {
++        try
++        {
++            var ph = Ph();
++            if (ph == null) return false;
++            float max = ph.max_Health > 1e-3f ? ph.max_Health : 100f;
++
++            switch (z)
++            {
++                case Zone.ArmL: ph.cur_arm_lf = max; break;
++                case Zone.ArmR: ph.cur_arm_rt = max; break;
++                case Zone.LegL: ph.cur_leg_lf = max; break;
++                case Zone.LegR: ph.cur_leg_rt = max; break;
++                default:                            // голова/торс — общий пул
++                    ph.curr_Health = max;
++                    break;
++            }
++
++            // Кровь и пробоины стираются целиком — точечно их снять API не даёт.
++            try { ph.ResetHits(); } catch { }
++
++            var info = _zones[(int)z];
++            info.Hits = 0;
++            info.LastDamage = 0f;
++            info.LastHitAt = -999f;
++            info.Marks.Clear();
++            Refresh();
++            return true;
++        }
++        catch (Exception e) { MelonLogger.Warning("Ghost heal: " + e.Message); return false; }
++    }
++
++    /// <summary>Полная починка всего тела.</summary>
++    public static void HealAll()
++    {
++        for (int i = 0; i < ZoneCount; i++) Heal((Zone)i);
++    }
++
++    // ─────────────── текст для UI ───────────────
++
++    public static string ZoneName(Zone z) => z switch
++    {
++        Zone.Head => "ГОЛОВА",
++        Zone.Torso => "ТОРС",
++        Zone.ArmL => "ЛЕВАЯ РУКА",
++        Zone.ArmR => "ПРАВАЯ РУКА",
++        Zone.LegL => "ЛЕВАЯ НОГА",
++        Zone.LegR => "ПРАВАЯ НОГА",
++        _ => "?"
++    };
++
++    /// <summary>Позиция вдоль части: 0 — верх (плечо/бедро), 1 — низ (кисть/стопа).</summary>
++    public static float AlongAxis(PlayerDamageReceiver.BodyPart p)
++    {
++        switch (p)
++        {
++            case PlayerDamageReceiver.BodyPart.Head: return 0.15f;
++            case PlayerDamageReceiver.BodyPart.Neck: return 0.30f;
++            case PlayerDamageReceiver.BodyPart.Chest: return 0.30f;
++            case PlayerDamageReceiver.BodyPart.Spine: return 0.55f;
++            case PlayerDamageReceiver.BodyPart.Pelvis: return 0.80f;
++            case PlayerDamageReceiver.BodyPart.ArmUpperLf:
++            case PlayerDamageReceiver.BodyPart.ArmUpperRt: return 0.20f;
++            case PlayerDamageReceiver.BodyPart.ArmLowerLf:
++            case PlayerDamageReceiver.BodyPart.ArmLowerRt: return 0.55f;
++            case PlayerDamageReceiver.BodyPart.HandLf:
++            case PlayerDamageReceiver.BodyPart.HandRt: return 0.90f;
++            case PlayerDamageReceiver.BodyPart.LegUpperLf:
++            case PlayerDamageReceiver.BodyPart.LegUpperRt: return 0.20f;
++            case PlayerDamageReceiver.BodyPart.LegLowerLf:
++            case PlayerDamageReceiver.BodyPart.LegLowerRt: return 0.55f;
++            case PlayerDamageReceiver.BodyPart.FootLf:
++            case PlayerDamageReceiver.BodyPart.FootRt: return 0.92f;
++            default: return 0.5f;
++        }
++    }
++
++    public static string PartName(PlayerDamageReceiver.BodyPart p) => p switch
++    {
++        PlayerDamageReceiver.BodyPart.Head => "Голова",
++        PlayerDamageReceiver.BodyPart.Neck => "Шея",
++        PlayerDamageReceiver.BodyPart.Chest => "Грудь",
++        PlayerDamageReceiver.BodyPart.Spine => "Живот",
++        PlayerDamageReceiver.BodyPart.Pelvis => "Таз",
++        PlayerDamageReceiver.BodyPart.ArmUpperLf => "Левое плечо",
++        PlayerDamageReceiver.BodyPart.ArmLowerLf => "Левое предплечье",
++        PlayerDamageReceiver.BodyPart.HandLf => "Левая кисть",
++        PlayerDamageReceiver.BodyPart.ArmUpperRt => "Правое плечо",
++        PlayerDamageReceiver.BodyPart.ArmLowerRt => "Правое предплечье",
++        PlayerDamageReceiver.BodyPart.HandRt => "Правая кисть",
++        PlayerDamageReceiver.BodyPart.LegUpperLf => "Левое бедро",
++        PlayerDamageReceiver.BodyPart.LegLowerLf => "Левая голень",
++        PlayerDamageReceiver.BodyPart.FootLf => "Левая стопа",
++        PlayerDamageReceiver.BodyPart.LegUpperRt => "Правое бедро",
++        PlayerDamageReceiver.BodyPart.LegLowerRt => "Правая голень",
++        PlayerDamageReceiver.BodyPart.FootRt => "Правая стопа",
++        _ => "?"
++    };
++
++    public static string CauseName(AttackType t)
++    {
++        // Flags — берём самый характерный признак
++        if ((t & AttackType.Piercing) != 0) return "Пулевое ранение";
++        if ((t & AttackType.Stabbing) != 0) return "Колющий удар";
++        if ((t & AttackType.Slicing) != 0) return "Резаная рана";
++        if ((t & AttackType.Fire) != 0) return "Ожог";
++        if ((t & AttackType.Blunt) != 0) return "Тупой удар";
++        return "Повреждение";
++    }
++}
 diff --git a/sources/GhostHolo.cs b/sources/GhostHolo.cs
-index 6fa5867..d46c05c 100644
+index 6fa5867..cf79848 100644
 --- a/sources/GhostHolo.cs
 +++ b/sources/GhostHolo.cs
-@@ -16,7 +16,7 @@ namespace BePrime.Ghost;
+@@ -2,6 +2,7 @@ using System;
+ using System.Collections.Generic;
+ using BoneLib;
+ using Il2CppSLZ.Marrow;
++using Il2CppSLZ.Marrow.Data;
+ using LabFusion.Player;
+ using MelonLoader;
+ using UnityEngine;
+@@ -16,7 +17,7 @@ namespace BePrime.Ghost;
  /// </summary>
  public static class GhostHolo
  {
@@ -48,7 +367,7 @@ index 6fa5867..d46c05c 100644
  
      // Landscape holo plate (~19cm x ~7cm)
      private const float CanvasW = 480f;
-@@ -45,11 +45,19 @@ public static class GhostHolo
+@@ -45,11 +46,19 @@ public static class GhostHolo
      private static int _hoverIndex = -1;
      private static int _insideIndex = -1;
      private static float _clickLockUntil;
@@ -73,7 +392,7 @@ index 6fa5867..d46c05c 100644
  
      private static float _toastT = 1f;
      private static float _toastHoldUntil;
-@@ -63,23 +71,25 @@ public static class GhostHolo
+@@ -63,23 +72,25 @@ public static class GhostHolo
      private static float _baseScale = WorldScale;
      private static float _scanT;
  
@@ -116,7 +435,7 @@ index 6fa5867..d46c05c 100644
  
      private sealed class HoloBtn
      {
-@@ -93,8 +103,18 @@ public static class GhostHolo
+@@ -93,8 +104,22 @@ public static class GhostHolo
          public float PressAnim;
          public float HoverBlend;
          public Vector3 BaseScale;
@@ -125,17 +444,21 @@ index 6fa5867..d46c05c 100644
      }
  
 +    // ─── состояние вкладки PLAYER ───
-+    private static RectTransform _pFigure;
++    private static RectTransform _pFigure;    // общий силуэт
++    private static RectTransform _pPartView;  // увеличенная выбранная часть
 +    private static readonly Image[] _pZone = new Image[GhostDiag.ZoneCount];
 +    private static Text _pAvatar, _pTitle, _pCause, _pDmg, _pHp;
 +    private static Image _pHealBtnBg;
 +    private static int _pSel = -1;
 +    private static float _pSlide;             // 0 фигура по центру, 1 сдвинута под деталь
++    private static CanvasGroup _pPartCg;      // прозрачность детали
++    private static readonly List<Image> _pHitFx = new List<Image>(); // пульсирующие пули
++    private static Sprite _circle;            // мягкий круг для пуль/крови/раны
 +
      public static void Tick()
      {
          if (!GhostMod.Enabled)
-@@ -119,6 +139,7 @@ public static class GhostHolo
+@@ -119,6 +144,7 @@ public static class GhostHolo
          AnimateScan(dt);
          AnimateButtons(dt);
          AnimateToast(dt);
@@ -143,7 +466,7 @@ index 6fa5867..d46c05c 100644
          HandleTouch();
      }
  
-@@ -138,6 +159,13 @@ public static class GhostHolo
+@@ -138,6 +164,14 @@ public static class GhostHolo
          _buttons.Clear();
          _hoverIndex = -1;
          _insideIndex = -1;
@@ -153,11 +476,12 @@ index 6fa5867..d46c05c 100644
 +        _outInit = false;
 +        _pFigure = null; _pAvatar = null; _pTitle = null; _pCause = null;
 +        _pDmg = null; _pHp = null; _pHealBtnBg = null; _pSel = -1;
++        _pPartView = null; _pPartCg = null; _pSlide = 0f; _pHitFx.Clear();
 +        for (int i = 0; i < _pZone.Length; i++) _pZone[i] = null;
          if (_root != null)
          {
              Object.Destroy(_root);
-@@ -176,6 +204,11 @@ public static class GhostHolo
+@@ -176,6 +210,11 @@ public static class GhostHolo
              _baseScale = WorldScale;
              _root.transform.localScale = Vector3.one * _baseScale;
  
@@ -169,7 +493,7 @@ index 6fa5867..d46c05c 100644
              // Soft outer glow frame
              var glow = MakeImage(_root.transform, "Glow", new Color(1f, 0.85f, 0.1f, 0.12f));
              Stretch(glow.rectTransform);
-@@ -224,7 +257,7 @@ public static class GhostHolo
+@@ -224,7 +263,7 @@ public static class GhostHolo
  
              BuildToast();
              _appearT = 0f;
@@ -178,7 +502,7 @@ index 6fa5867..d46c05c 100644
          }
          catch (Exception ex)
          {
-@@ -353,9 +386,30 @@ public static class GhostHolo
+@@ -353,9 +392,30 @@ public static class GhostHolo
          ApplyToastVisual();
      }
  
@@ -211,7 +535,7 @@ index 6fa5867..d46c05c 100644
      /// </summary>
      private static void AttachToLeftForearm()
      {
-@@ -369,52 +423,80 @@ public static class GhostHolo
+@@ -369,52 +429,80 @@ public static class GhostHolo
              Transform wrist = art?.artWristLf;
              Hand hand = Player.LeftHand;
  
@@ -219,12 +543,12 @@ index 6fa5867..d46c05c 100644
 +            Vector3 elbowPos, wristPos;
 +
 +            if (lower != null && wrist != null)
-             {
++            {
 +                elbowPos = lower.position;
 +                wristPos = wrist.position;
 +            }
 +            else
-+            {
+             {
 +                // ART-рига нет — строим отрезок предплечья от кисти назад
                  if (hand == null) return;
                  Transform palm = hand.palmPositionTransform != null ? hand.palmPositionTransform : hand.transform;
@@ -323,7 +647,7 @@ index 6fa5867..d46c05c 100644
          }
          catch { /* rig missing */ }
      }
-@@ -453,20 +535,31 @@ public static class GhostHolo
+@@ -453,20 +541,31 @@ public static class GhostHolo
                  b.PressAnim = Mathf.Max(0f, b.PressAnim - dt / 0.14f);
  
              float punch = b.PressAnim > 0f
@@ -361,7 +685,7 @@ index 6fa5867..d46c05c 100644
                  b.Accent.color = a;
              }
  
-@@ -474,7 +567,8 @@ public static class GhostHolo
+@@ -474,7 +573,8 @@ public static class GhostHolo
              {
                  Color tc = b.DangerStyle ? DangerText : TextCol;
                  if (b.AccentStyle) tc = Yellow;
@@ -371,7 +695,7 @@ index 6fa5867..d46c05c 100644
                  b.Label.color = tc;
              }
          }
-@@ -514,86 +608,78 @@ public static class GhostHolo
+@@ -514,86 +614,78 @@ public static class GhostHolo
          }
      }
  
@@ -509,7 +833,7 @@ index 6fa5867..d46c05c 100644
      private static void FireButton(int index)
      {
          if (index < 0 || index >= _buttons.Count) return;
-@@ -605,30 +691,83 @@ public static class GhostHolo
+@@ -605,30 +697,83 @@ public static class GhostHolo
          catch (Exception ex) { MelonLogger.Warning($"Ghost btn: {ex.Message}"); }
      }
  
@@ -531,15 +855,15 @@ index 6fa5867..d46c05c 100644
          {
 -            RigManager rm = Player.RigManager;
 -            if (rm?.physicsRig?.artOutput?.artFingerRt13 != null)
--            {
++            ArtRig art = Player.RigManager?.physicsRig?.artOutput;
++            if (art != null)
+             {
 -                tip = rm.physicsRig.artOutput.artFingerRt13.position;
 -                return true;
 -            }
 -            Hand hand = Player.RightHand;
 -            if (hand != null)
-+            ArtRig art = Player.RigManager?.physicsRig?.artOutput;
-+            if (art != null)
-             {
+-            {
 -                if (hand.palmPositionTransform != null)
 -                {
 -                    tip = hand.palmPositionTransform.TransformPoint(new Vector3(0.01f, 0.02f, 0.06f));
@@ -610,7 +934,7 @@ index 6fa5867..d46c05c 100644
          return false;
      }
  
-@@ -647,12 +786,14 @@ public static class GhostHolo
+@@ -647,12 +792,14 @@ public static class GhostHolo
          AddTab(0, "IDENTITY", Tab.Nick);
          AddTab(1, "LOBBY", Tab.Lobby);
          AddTab(2, "MOD.IO", Tab.Custom);
@@ -625,7 +949,7 @@ index 6fa5867..d46c05c 100644
          }
  
          if (_headerSub != null)
-@@ -660,34 +801,64 @@ public static class GhostHolo
+@@ -660,34 +807,64 @@ public static class GhostHolo
  
          _insideIndex = -1;
          _hoverIndex = -1;
@@ -706,7 +1030,7 @@ index 6fa5867..d46c05c 100644
          {
              GhostIdentity.Restore();
              Notify("RESTORE", "Real profile back");
-@@ -830,7 +1001,240 @@ public static class GhostHolo
+@@ -830,7 +1007,457 @@ public static class GhostHolo
          }
      }
  
@@ -742,6 +1066,21 @@ index 6fa5867..d46c05c 100644
 +
 +        foreach (var zl in ZoneLayout)
 +            AddZoneButton(_pFigure, zl.z, zl.x, zl.y, zl.w, zl.h);
++
++        // Крупный план выбранной части: сюда рисуем рану — точку попадания,
++        // траекторию и кровь. Пока зона не выбрана — скрыт (alpha 0, off).
++        var pvGo = new GameObject("PartView");
++        pvGo.transform.SetParent(body, false);
++        _pPartView = pvGo.AddComponent<RectTransform>();
++        SetAnchors(_pPartView, 0.5f, 0.5f, 0.5f, 0.5f);
++        _pPartView.sizeDelta = new Vector2(64f, 92f);
++        _pPartView.anchoredPosition = new Vector2(-42f, 4f);
++        _pPartCg = pvGo.AddComponent<CanvasGroup>();
++        _pPartCg.alpha = 0f;
++        _pPartCg.interactable = false;
++        _pPartCg.blocksRaycasts = false;
++        pvGo.SetActive(false);
++        _pHitFx.Clear();
 +
 +        // Аватар (стоковый / кастомный)
 +        _pAvatar = MakeText(body, "Av", "АВАТАР: " + AvatarName(), 8, Cyan, TextAnchor.LowerCenter);
@@ -854,7 +1193,180 @@ index 6fa5867..d46c05c 100644
 +    private static void SelectZone(int zi)
 +    {
 +        _pSel = zi;
++        BuildPartView((GhostDiag.Zone)zi);
 +        RefreshDetail();
++    }
++
++    // ── цвета раны ──
++    private static readonly Color LimbFill = new Color(0.10f, 0.55f, 0.70f, 0.42f);
++    private static readonly Color LimbEdge = new Color(0.35f, 0.95f, 1f, 0.70f);
++    private static readonly Color LimbCore = new Color(0.20f, 0.80f, 0.95f, 0.16f);
++    private static readonly Color Bullet = new Color(1f, 0.20f, 0.18f, 1f);
++    private static readonly Color BulletHot = new Color(1f, 0.85f, 0.55f, 1f);
++    private static readonly Color Traj = new Color(1f, 0.22f, 0.20f, 0.85f);
++    private static readonly Color TrajGlow = new Color(1f, 0.30f, 0.25f, 0.30f);
++    private static readonly Color Blood = new Color(0.62f, 0.02f, 0.06f, 0.88f);
++    private static readonly Color BloodDark = new Color(0.32f, 0.01f, 0.03f, 0.82f);
++    private static readonly Color Bruise = new Color(0.42f, 0.10f, 0.52f, 0.62f);
++    private static readonly Color Burn = new Color(1f, 0.48f, 0.10f, 0.80f);
++
++    /// <summary>
++    /// Рисует крупный план выбранной части тела и все раны на ней. Для каждого
++    /// попадания (GhostDiag.Mark) визуал зависит от типа: пуля — красная точка +
++    /// траектория сзади + кровь; тупой — синяк; порез — красная линия поперёк;
++    /// колющий — короткий прокол; ожог — оранжевое пятно. Позиция раны вдоль
++    /// части берётся из настоящей под-части (AlongAxis), угол — из направления
++    /// удара (Mark.Dir). Данные реальные — из хука урона.
++    /// </summary>
++    private static void BuildPartView(GhostDiag.Zone z)
++    {
++        if (_pPartView == null) return;
++        for (int i = _pPartView.childCount - 1; i >= 0; i--)
++            Object.Destroy(_pPartView.GetChild(i).gameObject);
++        _pHitFx.Clear();
++
++        // Силуэт части — вертикальная «капсула» (эллипс из мягкого круга).
++        const float limbW = 30f, limbH = 84f;
++        var core = MakeImage(_pPartView, "Limb", LimbFill);
++        core.sprite = Circle(); core.type = Image.Type.Simple;
++        var crt = core.rectTransform;
++        SetAnchors(crt, 0.5f, 0.5f, 0.5f, 0.5f);
++        crt.sizeDelta = new Vector2(limbW, limbH);
++        var edge = MakeImage(_pPartView, "LimbEdge", LimbEdge);
++        edge.sprite = Circle(); edge.type = Image.Type.Simple;
++        var ert = edge.rectTransform;
++        SetAnchors(ert, 0.5f, 0.5f, 0.5f, 0.5f);
++        ert.sizeDelta = new Vector2(limbW + 3f, limbH + 3f);
++        edge.transform.SetAsFirstSibling();  // обводка позади заливки
++        var gloss = MakeImage(_pPartView, "Gloss", LimbCore);
++        gloss.sprite = Circle(); gloss.type = Image.Type.Simple;
++        SetAnchors(gloss.rectTransform, 0.5f, 0.5f, 0.5f, 0.5f);
++        gloss.rectTransform.sizeDelta = new Vector2(limbW * 0.5f, limbH * 0.8f);
++        gloss.rectTransform.anchoredPosition = new Vector2(-limbW * 0.18f, 0f);
++
++        // подпись части (мелкая, вверху)
++        var cap = MakeText(_pPartView, "Cap", GhostDiag.ZoneName(z), 8, LimbEdge, TextAnchor.UpperCenter);
++        SetAnchors(cap.rectTransform, 0f, 1f, 1f, 1f);
++        cap.rectTransform.pivot = new Vector2(0.5f, 1f);
++        cap.rectTransform.sizeDelta = new Vector2(0f, 10f);
++        cap.rectTransform.anchoredPosition = new Vector2(0f, 2f);
++
++        var info = GhostDiag.Get(z);
++        float halfW = limbW * 0.5f;
++        float topY = limbH * 0.5f - 4f, botY = -limbH * 0.5f + 4f;
++
++        if (info.Marks.Count == 0)
++        {
++            var ok = MakeText(_pPartView, "OK", "ЦЕЛА", 8, new Color(0.2f, 1f, 0.45f, 0.9f), TextAnchor.LowerCenter);
++            SetAnchors(ok.rectTransform, 0f, 0f, 1f, 0f);
++            ok.rectTransform.pivot = new Vector2(0.5f, 0f);
++            ok.rectTransform.sizeDelta = new Vector2(0f, 10f);
++            ok.rectTransform.anchoredPosition = new Vector2(0f, -2f);
++            return;
++        }
++
++        for (int mi = 0; mi < info.Marks.Count; mi++)
++        {
++            var m = info.Marks[mi];
++            float t = GhostDiag.AlongAxis(m.Part);
++            float y = Mathf.Lerp(topY, botY, t);
++            Vector2 dir = m.Dir.sqrMagnitude > 1e-4f ? m.Dir.normalized : new Vector2(0f, -1f);
++            Vector2 perp = new Vector2(-dir.y, dir.x);
++            // Пуля идёт вдоль dir → вошла со стороны -dir. Точка входа на кромке.
++            Vector2 hit = new Vector2(Mathf.Clamp(-dir.x * halfW, -halfW, halfW), y);
++            bool newest = mi == info.Marks.Count - 1;
++
++            var tp = m.Type;
++            if ((tp & AttackType.Blunt) != 0 && (tp & (AttackType.Piercing | AttackType.Stabbing | AttackType.Slicing)) == 0)
++            {
++                // синяк — мягкое багрово-фиолетовое пятно, без пробоины
++                MakeDot(_pPartView, hit, 20f, Bruise);
++                MakeDot(_pPartView, hit, 12f, new Color(Bruise.r, Bruise.g, Bruise.b, 0.9f));
++            }
++            else if ((tp & AttackType.Slicing) != 0)
++            {
++                // порез — красная линия поперёк части + кровь по краям
++                Vector2 a = hit - perp * (halfW + 3f);
++                Vector2 b = hit + perp * (halfW + 3f);
++                MakeLine(_pPartView, a, b, 3.2f, Blood);
++                MakeLine(_pPartView, a, b, 1.4f, Bullet);
++                MakeDot(_pPartView, hit, 10f, Blood);
++            }
++            else
++            {
++                // выстрел / прокол — кровь, траектория сзади и красная пуля
++                bool stab = (tp & AttackType.Stabbing) != 0;
++                Vector2 outTip = hit - dir * (stab ? 16f : 30f);
++                if (!stab)
++                    MakeLine(_pPartView, outTip, hit, 4.5f, TrajGlow); // ореол траектории
++                MakeLine(_pPartView, outTip, hit, 1.6f, Traj);
++                // кровь в месте входа (кластер)
++                Vector2 inner = hit + dir * 3f;
++                MakeDot(_pPartView, inner, 15f, BloodDark);
++                MakeDot(_pPartView, inner + perp * 3f, 9f, Blood);
++                MakeDot(_pPartView, inner - perp * 4f, 7f, Blood);
++                if ((tp & AttackType.Fire) != 0)
++                    MakeDot(_pPartView, hit, 13f, Burn);
++                // красная пуля поверх всего
++                var slug = MakeDot(_pPartView, hit, newest ? 8f : 6f, Bullet);
++                var glowSlug = MakeDot(_pPartView, hit, newest ? 13f : 10f, new Color(Bullet.r, Bullet.g, Bullet.b, 0.30f));
++                glowSlug.transform.SetSiblingIndex(slug.transform.GetSiblingIndex());
++                MakeDot(_pPartView, hit + new Vector2(-1.4f, 1.4f), 2.6f, BulletHot); // блик
++                _pHitFx.Add(slug);
++            }
++        }
++    }
++
++    /// <summary>Мягкий круг-спрайт (пуля, кровь, капсула). Строится один раз.</summary>
++    private static Sprite Circle()
++    {
++        if (_circle != null) return _circle;
++        try
++        {
++            const int R = 48;
++            var tex = new Texture2D(R, R, TextureFormat.RGBA32, false);
++            tex.wrapMode = TextureWrapMode.Clamp;
++            float c = (R - 1) * 0.5f;
++            for (int yy = 0; yy < R; yy++)
++                for (int xx = 0; xx < R; xx++)
++                {
++                    float dx = (xx - c) / c, dy = (yy - c) / c;
++                    float d = Mathf.Sqrt(dx * dx + dy * dy);
++                    float a = 1f - Mathf.SmoothStep(0.82f, 1f, d);
++                    tex.SetPixel(xx, yy, new Color(1f, 1f, 1f, Mathf.Clamp01(a)));
++                }
++            tex.Apply(false);
++            _circle = Sprite.Create(tex, new Rect(0, 0, R, R), new Vector2(0.5f, 0.5f), 100f);
++        }
++        catch { }
++        return _circle;
++    }
++
++    /// <summary>Линия-Image между двумя локальными точками (траектория/порез).</summary>
++    private static Image MakeLine(Transform parent, Vector2 a, Vector2 b, float thickness, Color col)
++    {
++        var img = MakeImage(parent, "Line", col);
++        var rt = img.rectTransform;
++        SetAnchors(rt, 0.5f, 0.5f, 0.5f, 0.5f);
++        Vector2 d = b - a;
++        float len = d.magnitude;
++        rt.sizeDelta = new Vector2(len, thickness);
++        rt.anchoredPosition = (a + b) * 0.5f;
++        rt.localRotation = Quaternion.Euler(0f, 0f, Mathf.Atan2(d.y, d.x) * Mathf.Rad2Deg);
++        return img;
++    }
++
++    /// <summary>Круглая точка (пуля / капля крови) на мягком спрайте.</summary>
++    private static Image MakeDot(Transform parent, Vector2 pos, float size, Color col)
++    {
++        var img = MakeImage(parent, "Dot", col);
++        img.sprite = Circle();
++        img.type = Image.Type.Simple;
++        var rt = img.rectTransform;
++        SetAnchors(rt, 0.5f, 0.5f, 0.5f, 0.5f);
++        rt.sizeDelta = new Vector2(size, size);
++        rt.anchoredPosition = pos;
++        return img;
 +    }
 +
 +    private static void RefreshDetail()
@@ -920,11 +1432,40 @@ index 6fa5867..d46c05c 100644
 +            img.color = c;
 +        }
 +
-+        // фигура слегка отъезжает влево, когда выбрана зона (деталь читается)
++        // Выбор зоны: фигура уезжает ВПРАВО и уменьшается, а слева
++        // «выезжает» крупный план части тела с раной.
 +        float target = _pSel >= 0 ? 1f : 0f;
-+        _pSlide = Mathf.MoveTowards(_pSlide, target, dt * 4f);
++        _pSlide = Mathf.MoveTowards(_pSlide, target, dt * 5f);
++        float e = EaseOutCubic(_pSlide);
 +        if (_pFigure != null)
-+            _pFigure.anchoredPosition = new Vector2(Mathf.Lerp(0f, -10f, _pSlide), 0f);
++        {
++            _pFigure.anchoredPosition = new Vector2(Mathf.Lerp(0f, 34f, e), 4f);
++            _pFigure.localScale = Vector3.one * Mathf.Lerp(1f, 0.62f, e);
++        }
++        if (_pPartView != null)
++        {
++            bool show = _pSlide > 0.02f;
++            if (_pPartView.gameObject.activeSelf != show)
++                _pPartView.gameObject.SetActive(show);
++            if (show)
++            {
++                _pPartView.anchoredPosition = new Vector2(Mathf.Lerp(-58f, -40f, e), 4f);
++                _pPartView.localScale = Vector3.one * Mathf.Lerp(0.7f, 1f, e);
++                if (_pPartCg != null) _pPartCg.alpha = e;
++            }
++        }
++
++        // пульс красных пуль — «свежая рана дышит»
++        if (_pHitFx.Count > 0)
++        {
++            float p = 0.5f + 0.5f * Mathf.Sin(Time.unscaledTime * 7f);
++            for (int i = 0; i < _pHitFx.Count; i++)
++            {
++                var fx = _pHitFx[i];
++                if (fx == null) continue;
++                fx.rectTransform.localScale = Vector3.one * (0.9f + 0.22f * p);
++            }
++        }
 +
 +        // живое обновление детали (HP тикает)
 +        if (_pSel >= 0) RefreshDetail();
@@ -947,7 +1488,7 @@ index 6fa5867..d46c05c 100644
      {
          var go = new GameObject("Sec_" + id);
          go.transform.SetParent(parent, false);
-@@ -863,6 +1267,10 @@ public static class GhostHolo
+@@ -863,6 +1490,10 @@ public static class GhostHolo
          SetAnchors(brt, 0f, 0f, 1f, 1f);
          brt.offsetMin = new Vector2(5f, 4f);
          brt.offsetMax = new Vector2(-5f, -16f);
@@ -958,7 +1499,7 @@ index 6fa5867..d46c05c 100644
          return brt;
      }
  
-@@ -877,14 +1285,15 @@ public static class GhostHolo
+@@ -877,14 +1508,15 @@ public static class GhostHolo
          y -= 14f;
      }
  
@@ -978,7 +1519,7 @@ index 6fa5867..d46c05c 100644
      }
  
      private static void AddRow(Transform host, ref float y, string label, string sub, Action act, bool danger = false, bool accent = false)
-@@ -893,6 +1302,55 @@ public static class GhostHolo
+@@ -893,6 +1525,55 @@ public static class GhostHolo
          y -= 22f;
      }
  
@@ -1034,7 +1575,7 @@ index 6fa5867..d46c05c 100644
      private static void AddRowAt(Transform host, float x, float y, float w, float h, string label, string sub, Action act, bool danger = false, bool accent = false)
      {
          var go = new GameObject("Row_" + label);
-@@ -940,9 +1398,41 @@ public static class GhostHolo
+@@ -940,9 +1621,41 @@ public static class GhostHolo
              DangerStyle = danger,
              AccentStyle = accent,
              BaseScale = Vector3.one
