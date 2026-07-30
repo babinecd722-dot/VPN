@@ -47,10 +47,12 @@ public static class GhostHolo
     private static float _clickLockUntil;
     private static bool _touchDown;
     private const float ClickCooldown = 0.28f;
-    private const float PlaneMax = 0.055f;    // дальше этого палец панель не видит
-    private const float PlaneEnter = 0.022f;  // ближе этого — нажатие
-    private const float PlaneExit = 0.038f;   // дальше этого — отпустил
-    private const float EdgePad = 0.12f;
+
+    // Всё в мировых метрах: расстояние от кончика пальца до поверхности кнопки.
+    private const float TouchThickness = 0.016f; // толщина коллайдера кнопки
+    private const float HoverDist = 0.030f;      // ближе этого — подсветка
+    private const float TouchEnter = 0.012f;     // ближе этого — нажатие
+    private const float TouchExit = 0.022f;      // дальше этого — отпустил
 
     private static float _toastT = 1f;
     private static float _toastHoldUntil;
@@ -94,6 +96,7 @@ public static class GhostHolo
         public float PressAnim;
         public float HoverBlend;
         public Vector3 BaseScale;
+        public Collider Col;      // реальный коллайдер кнопки — и стоп пальцу, и детект тапа
     }
 
     public static void Tick()
@@ -181,6 +184,15 @@ public static class GhostHolo
             _baseScale = WorldScale;
             _root.transform.localScale = Vector3.one * _baseScale;
 
+            // Кинематический Rigidbody: панель двигается трансформом каждый кадр,
+            // и без RB её коллайдеры считались бы статикой — двигать статику
+            // дорого и неправильно. С кинематическим RB это корректный «движущийся
+            // стенд», об который физическая рука упирается.
+            var rb = _root.AddComponent<Rigidbody>();
+            rb.isKinematic = true;
+            rb.useGravity = false;
+            rb.interpolation = RigidbodyInterpolation.Interpolate;
+
             // Soft outer glow frame
             var glow = MakeImage(_root.transform, "Glow", new Color(1f, 0.85f, 0.1f, 0.12f));
             Stretch(glow.rectTransform);
@@ -230,6 +242,11 @@ public static class GhostHolo
             BuildToast();
             _appearT = 0f;
             Rebuild(_tab);
+
+            // Коллайдер всей стеклянной плиты — палец упирается в поверхность,
+            // а не проваливается сквозь голограмму. Кнопки сидят на этой же
+            // плоскости и детектятся своими коллайдерами.
+            AddTouchCollider(_panel.gameObject, _panel);
         }
         catch (Exception ex)
         {
@@ -571,17 +588,17 @@ public static class GhostHolo
     /// <summary>
     /// Нажатие пальцем.
     ///
-    /// Что было не так. Срабатывание требовало, чтобы на ПРОШЛОМ кадре палец был
-    /// дальше 1.8 см, а на текущем — ближе: то есть нужно было попасть в зону
-    /// толщиной 1.8 см ровно между двумя кадрами. При 72 кадрах в секунду палец
-    /// эту зону перескакивает, а если он уже держится рядом с панелью, условие
-    /// не выполнится вообще никогда. Отсюда «тапы не работают».
+    /// Раньше срабатывание считалось по расстоянию до ПЛОСКОСТИ Canvas, и было
+    /// две беды. Первая: нужно было попасть в зону толщиной 1.8 см ровно между
+    /// двумя кадрами — при 72 к/с палец её перескакивает. Вторая: та математика
+    /// зависела от того, как повёрнут Canvas, а мы его как раз крутили.
     ///
-    /// Теперь состояние с гистерезисом: касание засчитывается по ВХОДУ в зону
-    /// контакта и сбрасывается только когда палец вышел за зону отпускания.
-    /// Ловить конкретный кадр больше не нужно.
-    ///
-    /// Опрашиваются кончики обеих рук: тыкать можно любой.
+    /// Теперь у каждой кнопки настоящий BoxCollider, и расстояние берём как
+    /// Collider.ClosestPoint — это ровно «насколько кончик пальца близко к телу
+    /// кнопки», без плоскостей и знаков, независимо от ориентации. Плюс тот же
+    /// коллайдер физически упирает палец (не проходит насквозь). Гистерезис:
+    /// нажали при входе в зону контакта, отпустили при выходе за зону отпускания.
+    /// Опрашиваются кончики обеих рук.
     /// </summary>
     private static void HandleTouch()
     {
@@ -594,7 +611,7 @@ public static class GhostHolo
         }
 
         int best = -1;
-        float bestAbs = float.MaxValue;
+        float bestDist = float.MaxValue;
 
         for (int h = 0; h < 2; h++)
         {
@@ -603,70 +620,28 @@ public static class GhostHolo
             for (int i = 0; i < _buttons.Count; i++)
             {
                 HoloBtn b = _buttons[i];
-                if (b?.Rt == null) continue;
-                if (!TryHitRect(tip, b.Rt, EdgePad, out float plane, out bool inside)) continue;
-                if (!inside) continue;
-                float a = Mathf.Abs(plane);
-                if (a > PlaneMax) continue;
-                if (a < bestAbs) { bestAbs = a; best = i; }
+                if (b?.Col == null) continue;
+                Vector3 cp = b.Col.ClosestPoint(tip);       // тело кнопки, любая ориентация
+                float d = Vector3.Distance(cp, tip);
+                if (d < bestDist) { bestDist = d; best = i; }
             }
         }
 
-        _hoverIndex = best;
+        _hoverIndex = (best >= 0 && bestDist <= HoverDist) ? best : -1;
 
-        if (best < 0)
+        if (best < 0 || bestDist > TouchExit)
         {
             _touchDown = false;
             _insideIndex = -1;
             return;
         }
 
-        if (!_touchDown && bestAbs <= PlaneEnter)
+        if (!_touchDown && bestDist <= TouchEnter)
         {
             _touchDown = true;
             _insideIndex = best;
             if (Time.unscaledTime >= _clickLockUntil) FireButton(best);
         }
-        else if (_touchDown && bestAbs > PlaneExit)
-        {
-            _touchDown = false;
-            _insideIndex = -1;
-        }
-    }
-
-    private static bool TryHitRect(Vector3 tip, RectTransform rt, float edgePad, out float planeDist, out bool inside)
-    {
-        planeDist = 99f;
-        inside = false;
-        if (rt == null) return false;
-
-        Vector3[] corners = new Vector3[4];
-        rt.GetWorldCorners(corners);
-        Vector3 bl = corners[0], tl = corners[1], tr = corners[2];
-        Vector3 right = tr - tl;
-        Vector3 up = tl - bl;
-        Vector3 normal = Vector3.Cross(right, up);
-        if (normal.sqrMagnitude < 1e-10f) return false;
-        normal.Normalize();
-
-        Vector3 center = (bl + tr) * 0.5f;
-        planeDist = Vector3.Dot(tip - center, normal);
-
-        float w = right.magnitude;
-        float h = up.magnitude;
-        if (w < 1e-5f || h < 1e-5f) return false;
-
-        Vector3 rN = right / w;
-        Vector3 uN = up / h;
-        Vector3 projected = tip - normal * planeDist;
-        Vector3 local = projected - bl;
-        float u = Vector3.Dot(local, rN);
-        float v = Vector3.Dot(local, uN);
-
-        float padW = w * edgePad;
-        float padH = h * edgePad;
-        inside = u >= -padW && u <= w + padW && v >= -padH && v <= h + padH;
-        return true;
     }
 
     private static void FireButton(int index)
@@ -1029,8 +1004,44 @@ public static class GhostHolo
             OnClick = act,
             DangerStyle = danger,
             AccentStyle = accent,
-            BaseScale = Vector3.one
+            BaseScale = Vector3.one,
+            Col = AddTouchCollider(go, rt)
         });
+    }
+
+    /// <summary>
+    /// Даёт кнопке настоящий BoxCollider: об него палец физически упирается
+    /// (не проходит насквозь), а тап детектится через ClosestPoint — это не
+    /// зависит от того, как повёрнут Canvas, в отличие от прежней математики
+    /// плоскости, которая и не срабатывала.
+    ///
+    /// Размер берём из мировых углов rect и переводим в локальные единицы через
+    /// lossyScale: у растянутых строк sizeDelta не отражает реальную ширину, а
+    /// углы отражают всегда.
+    /// </summary>
+    private static Collider AddTouchCollider(GameObject go, RectTransform rt)
+    {
+        try
+        {
+            var corners = new Vector3[4];
+            rt.GetWorldCorners(corners);            // 0 BL, 1 TL, 2 TR, 3 BR
+            Vector3 worldCenter = (corners[0] + corners[2]) * 0.5f;
+            float wW = (corners[2] - corners[1]).magnitude;
+            float wH = (corners[1] - corners[0]).magnitude;
+            if (wW < 1e-5f || wH < 1e-5f) return null;
+
+            Vector3 ls = rt.lossyScale;
+            float sx = Mathf.Max(1e-6f, Mathf.Abs(ls.x));
+            float sy = Mathf.Max(1e-6f, Mathf.Abs(ls.y));
+            float sz = Mathf.Max(1e-6f, Mathf.Abs(ls.z));
+
+            var box = go.AddComponent<BoxCollider>();
+            box.center = rt.InverseTransformPoint(worldCenter);
+            box.size = new Vector3(wW / sx, wH / sy, TouchThickness / sz);
+            box.isTrigger = false;                  // палец реально упирается
+            return box;
+        }
+        catch { return null; }
     }
 
     private static void ClearContent()
