@@ -23,7 +23,7 @@ using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 using PlayerHealth = Il2CppSLZ.Marrow.Player_Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.41", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.42", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -1968,7 +1968,10 @@ namespace MonsterPanel
                 return p;
             }
 
-            /// <summary>Teleport local player next to target (Fusion LocalPlayer path).</summary>
+            /// <summary>
+            /// Teleport local player next to target.
+            /// Local Fusion teleport + SendFromServer PlayerRepTeleport to self (EOS hole).
+            /// </summary>
             private static void TeleportSelfTo(byte sid)
             {
                 try
@@ -1999,16 +2002,15 @@ namespace MonsterPanel
                         return;
                     }
 
-                    // Fusion path — syncs correctly (unlike raw RigManager.Teleport edge cases).
-                    LocalPlayer.TeleportToPosition(land, -side);
+                    TeleportBring.TeleportLocalTo(land, -side);
                     MelonLogger.Msg($"Teleport: went to {MenuName(np)} (sid {sid}) @ {land}");
                 }
                 catch (Exception e) { MelonLogger.Warning("Teleport self: " + e.Message); }
             }
 
             /// <summary>
-            /// Pull player to me. Host uses SendPlayerTeleport; client uses permission
-            /// request + PlayerRepTeleport relay (host MonsterPanel unlocks ClientsOnly relay).
+            /// Pull player to me. Host: SendPlayerTeleport. Client: SendFromServer
+            /// PlayerRepTeleport to victim PlatformID (EOS — no IsHost / no Teleportation perm).
             /// </summary>
             private static void BringToMe(byte sid)
             {

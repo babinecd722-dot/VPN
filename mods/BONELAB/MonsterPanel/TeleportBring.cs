@@ -1,7 +1,9 @@
 using System;
+using System.Reflection;
 using HarmonyLib;
 using LabFusion.Data;
 using LabFusion.Network;
+using LabFusion.Network.Serialization;
 using LabFusion.Player;
 using LabFusion.Representation;
 using LabFusion.Senders;
@@ -11,27 +13,29 @@ using UnityEngine;
 namespace MonsterPanel;
 
 /// <summary>
-/// Make Bring-to-me work as host <b>and</b> client.
+/// Bring / Teleport-to-player that work as host <b>and</b> client on EOS.
 ///
-/// Why vanilla RelayNative(PlayerRepTeleport, ToTarget) fails for clients:
-///   PlayerRepTeleportMessage.ExpectedReceiver = ClientsOnly.
-///   Client → server ToTarget hits CheckExpectedConditions → MessageExpectedClientException
-///   → host never forwards the teleport.
+/// Client Bring used to fail: PlayerRepTeleport is ClientsOnly, so ToTarget via
+/// server throws MessageExpectedClientException before relay. PermissionCommand
+/// TELEPORT_* also needs lobby Teleportation rights (often OWNER-only).
 ///
-/// Fix when we are host:
-///   - Allow PlayerRepTeleport ToTarget/ToTargets through CheckExpectedConditions
-///     so client Bring requests are relayed.
-///   - Honor PermissionCommand TELEPORT_TO_ME / TELEPORT_TO_THEM without lobby
-///     Teleportation permission gate (MonsterPanel host = always allow).
+/// Fix — same EOS hole as Kill Host / Remote Action:
+///   MessageSender.SendFromServer(victimPlatformId, PlayerRepTeleport)
+///   has no IsHost check on EpicGamesNetworkLayer. Victim receives ClientsOnly
+///   teleport and runs LocalPlayer.TeleportToPosition.
 ///
-/// Fix when we Bring:
-///   - Host: PlayerSender.SendPlayerTeleport (direct).
-///   - Client: RelayNative ToTarget (works if host has this patch) + PermissionCommand
-///     fallback (works on vanilla hosts that grant Teleportation).
+/// Host path stays stock PlayerSender.SendPlayerTeleport.
+/// Host-side Harmony patches still help when <b>we</b> are host (relay + no perm gate).
 /// </summary>
 internal static class TeleportBring
 {
+    private const int ClientSendBurst = 3;
+
     private static bool _installed;
+
+    // Cached EOSMessenger.SendPacket(ProductUserId, NetMessage, NetworkChannel, bool)
+    private static MethodInfo _eosSendPacket;
+    private static bool _eosSendLookupDone;
 
     internal static void Install(HarmonyLib.Harmony harmony)
     {
@@ -51,12 +55,14 @@ internal static class TeleportBring
 
             if (ok < 2)
             {
-                MelonLogger.Warning($"[TeleportBring] Incomplete ({ok}/2) — client Bring may still fail.");
-                return;
+                MelonLogger.Warning($"[TeleportBring] Incomplete ({ok}/2) — host relay assist partial.");
+            }
+            else
+            {
+                MelonLogger.Msg($"[TeleportBring] Host relay unlock active ({ok} patches).");
             }
 
             _installed = true;
-            MelonLogger.Msg($"[TeleportBring] Host relay unlock active ({ok} patches).");
         }
         catch (Exception ex)
         {
@@ -163,42 +169,205 @@ internal static class TeleportBring
         }
     }
 
-    /// <summary>Execute Bring for a remote SmallID to a world landing position.</summary>
+    /// <summary>
+    /// Bring remote player to <paramref name="land"/>.
+    /// Host: stock SendPlayerTeleport. Client: SendFromServer PlayerRepTeleport (EOS hole).
+    /// </summary>
     internal static void BringPlayer(byte targetSid, Vector3 land)
     {
-        var data = new PlayerRepTeleportData { Position = land };
-
         if (NetworkInfo.IsHost)
         {
-            // Direct host path — same as Fusion admin teleport.
             PlayerSender.SendPlayerTeleport(targetSid, land);
             MelonLogger.Msg($"[TeleportBring] Host SendPlayerTeleport sid={targetSid} → {land}");
             return;
         }
 
-        // Client: ask host via permission command (works on vanilla hosts with rights,
-        // and always when host runs MonsterPanel TeleportBring patch).
+        PlayerID target = PlayerIDManager.GetPlayerID(targetSid);
+        if (target == null || !target.IsValid || string.IsNullOrEmpty(target.PlatformID))
+        {
+            MelonLogger.Warning($"[TeleportBring] Bring: no PlatformID for sid {targetSid}");
+            return;
+        }
+
+        int sent = ForceTeleportRemote(target.PlatformID, land, bursts: ClientSendBurst);
+        MelonLogger.Msg(
+            $"[TeleportBring] Client Bring sid={targetSid} → {land} sends={sent} (SendFromServer PlayerRepTeleport)");
+
+        // Extra assists (MonsterPanel host / lobbies that grant Teleportation).
         try
         {
             PermissionSender.SendPermissionRequest(PermissionCommandType.TELEPORT_TO_ME, targetSid);
         }
         catch (Exception ex)
         {
-            MelonLogger.Warning($"[TeleportBring] Permission request failed: {ex.Message}");
+            MelonLogger.Warning($"[TeleportBring] Permission assist failed: {ex.Message}");
         }
 
-        // Also relay native ToTarget — forwarded when host has our CheckExpected patch.
         try
         {
             MessageRelay.RelayNative(
-                data,
+                new PlayerRepTeleportData { Position = land },
                 NativeMessageTag.PlayerRepTeleport,
                 new MessageRoute(targetSid, NetworkChannel.Reliable));
-            MelonLogger.Msg($"[TeleportBring] Client relay+permission sid={targetSid} → {land}");
         }
         catch (Exception ex)
         {
-            MelonLogger.Warning($"[TeleportBring] RelayNative failed: {ex.Message}");
+            MelonLogger.Warning($"[TeleportBring] RelayNative assist failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Move local player to <paramref name="land"/> facing <paramref name="forward"/>.
+    /// Local Fusion teleport immediately; also SendFromServer to self (same ClientsOnly path
+    /// a host uses) so pose authority matches server-forced teleports.
+    /// </summary>
+    internal static void TeleportLocalTo(Vector3 land, Vector3 forward)
+    {
+        try
+        {
+            if (forward.sqrMagnitude < 0.0001f)
+                forward = Vector3.forward;
+            LocalPlayer.TeleportToPosition(land, forward);
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[TeleportBring] Local TeleportToPosition: {ex.Message}");
+        }
+
+        if (!NetworkInfo.HasServer)
+            return;
+
+        try
+        {
+            string me = PlayerIDManager.LocalPlatformID;
+            if (string.IsNullOrEmpty(me))
+                return;
+
+            // When we are host, also use stock path (ToTarget to self via relay).
+            if (NetworkInfo.IsHost)
+            {
+                PlayerSender.SendPlayerTeleport(PlayerIDManager.LocalSmallID, land);
+            }
+
+            int sent = ForceTeleportRemote(me, land, bursts: 2);
+            MelonLogger.Msg($"[TeleportBring] Teleport-to-player local+force → {land} sends={sent}");
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[TeleportBring] Self force teleport: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Deliver PlayerRepTeleport to a specific PlatformID via SendFromServer (no IsHost on EOS).
+    /// Victim's PlayerRepTeleportMessage → LocalPlayer.TeleportToPosition.
+    /// </summary>
+    private static int ForceTeleportRemote(string platformId, Vector3 land, int bursts)
+    {
+        if (string.IsNullOrEmpty(platformId) || bursts <= 0)
+            return 0;
+
+        int ok = 0;
+        for (int i = 0; i < bursts; i++)
+        {
+            if (SendTeleportOnce(platformId, land))
+                ok++;
+        }
+        return ok;
+    }
+
+    private static bool SendTeleportOnce(string platformId, Vector3 land)
+    {
+        try
+        {
+            var data = new PlayerRepTeleportData { Position = land };
+
+            using (NetWriter writer = NetWriter.Create())
+            {
+                writer.SerializeValue(ref data);
+                using NetMessage message = NetMessage.Create(
+                    NativeMessageTag.PlayerRepTeleport,
+                    writer,
+                    CommonMessageRoutes.None);
+                MessageSender.SendFromServer(platformId, NetworkChannel.Reliable, message);
+                TryEosSendPacket(platformId, message, isServerHandled: false);
+            }
+
+            // SmallID path when target is still in PlayerID map.
+            try
+            {
+                PlayerID id = PlayerIDManager.GetPlayerID(platformId);
+                if (id != null && id.IsValid)
+                {
+                    using NetWriter writer = NetWriter.Create();
+                    var data2 = new PlayerRepTeleportData { Position = land };
+                    writer.SerializeValue(ref data2);
+                    using NetMessage message = NetMessage.Create(
+                        NativeMessageTag.PlayerRepTeleport,
+                        writer,
+                        CommonMessageRoutes.None);
+                    MessageSender.SendFromServer(id.SmallID, NetworkChannel.Reliable, message);
+                }
+            }
+            catch { /* */ }
+
+            return true;
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[TeleportBring] SendTeleportOnce: {ex.Message}");
+            return false;
+        }
+    }
+
+    private static void TryEosSendPacket(string platformId, NetMessage message, bool isServerHandled)
+    {
+        try
+        {
+            EnsureEosSendPacket();
+            if (_eosSendPacket == null || message == null) return;
+
+            Type puidType = AccessTools.TypeByName("Epic.OnlineServices.ProductUserId");
+            if (puidType == null) return;
+
+            MethodInfo fromString = AccessTools.Method(puidType, "FromString", new[] { typeof(string) });
+            if (fromString == null) return;
+
+            object userId = fromString.Invoke(null, new object[] { platformId });
+            if (userId == null) return;
+
+            _eosSendPacket.Invoke(null, new object[] { userId, message, NetworkChannel.Reliable, isServerHandled });
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[TeleportBring] EOS SendPacket: {ex.Message}");
+        }
+    }
+
+    private static void EnsureEosSendPacket()
+    {
+        if (_eosSendLookupDone) return;
+        _eosSendLookupDone = true;
+        try
+        {
+            Type messenger = AccessTools.TypeByName("LabFusion.Network.EpicGames.EOSMessenger");
+            if (messenger == null) return;
+
+            foreach (MethodInfo m in messenger.GetMethods(
+                         BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public))
+            {
+                if (m.Name != "SendPacket") continue;
+                ParameterInfo[] p = m.GetParameters();
+                if (p.Length == 4 && p[1].ParameterType == typeof(NetMessage) && p[3].ParameterType == typeof(bool))
+                {
+                    _eosSendPacket = m;
+                    break;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            MelonLogger.Warning($"[TeleportBring] EOS lookup: {ex.Message}");
         }
     }
 }

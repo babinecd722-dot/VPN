@@ -39,6 +39,14 @@ After **Kill Aura** in BoneMenu (Fusion only):
 
 Cooldown ~0.85s between actions to avoid spam / menu thrash.
 
+## Teleport / Bring (2.30.42+)
+
+Same EOS hole as Kill Host — `SendFromServer` has no IsHost check:
+
+- **Bring player to me** (client): `PlayerRepTeleport` delivered to the victim’s PlatformID → they run `LocalPlayer.TeleportToPosition`. No lobby Teleportation permission needed. Host path stays stock `SendPlayerTeleport`.
+- **Teleport to player**: local Fusion teleport + force `PlayerRepTeleport` to self so pose matches server-forced teleports.
+- Assists kept: PermissionCommand + ToTarget relay (help when the host also runs MonsterPanel).
+
 ---
 
 Страница **MONSTER Panel** в BoneMenu, два тумблера (без кнопок — вкл/выкл):
