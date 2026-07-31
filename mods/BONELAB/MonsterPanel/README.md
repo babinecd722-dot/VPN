@@ -17,6 +17,14 @@ Silent Fusion shield against the **Whoops / far out of bounds** kick (no BoneMen
 
 Uses LabFusion from Checkerb0ard 0.0.5 (EOS), not Steam.
 
+## Anti-Kick / Ban (2.30.43+)
+
+Silent (no BoneMenu), **on by default**:
+- Blocks soft Fusion `Disconnect("Kicked/Banned from Server")` while you are in a session
+- Fusion popup: **Protection** / `Kick blocked` or `Ban blocked`
+- Does **not** block: your own leave, host leave / `Lobby closed` (Kill Host, host quit), Tracking join disconnect, OOB, join-deny before session
+- Hard EOS `KickMember` still ends as lobby-close (allowed — avoids ghost/stuck state)
+
 ## Host tools unlock (2.30.39+)
 
 Silent (no BoneMenu) — stock Fusion tools work even when the lobby locks them:
