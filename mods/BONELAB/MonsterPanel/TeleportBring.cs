@@ -33,7 +33,8 @@ internal static class TeleportBring
 
     private static bool _installed;
 
-    // Cached EOSMessenger.SendPacket(ProductUserId, NetMessage, NetworkChannel, bool)
+    // Cached EOS send: SendFromServer(string,...) and/or SendPacket(ProductUserId,...)
+    private static MethodInfo _eosSendFromServer;
     private static MethodInfo _eosSendPacket;
     private static bool _eosSendLookupDone;
 
@@ -325,7 +326,16 @@ internal static class TeleportBring
         try
         {
             EnsureEosSendPacket();
-            if (_eosSendPacket == null || message == null) return;
+            if (message == null || string.IsNullOrEmpty(platformId)) return;
+
+            // Preferred: EOSMessenger.SendFromServer(string, channel, message) — same hole as Layer.
+            if (_eosSendFromServer != null)
+            {
+                _eosSendFromServer.Invoke(null, new object[] { platformId, NetworkChannel.Reliable, message });
+                return;
+            }
+
+            if (_eosSendPacket == null) return;
 
             Type puidType = AccessTools.TypeByName("Epic.OnlineServices.ProductUserId");
             if (puidType == null) return;
@@ -350,18 +360,32 @@ internal static class TeleportBring
         _eosSendLookupDone = true;
         try
         {
-            Type messenger = AccessTools.TypeByName("LabFusion.Network.EpicGames.EOSMessenger");
-            if (messenger == null) return;
+            // Fusion 0.1.x keeps EOSMessenger; some builds rename/move messaging — probe both.
+            Type messenger = AccessTools.TypeByName("LabFusion.Network.EpicGames.EOSMessenger")
+                             ?? AccessTools.TypeByName("LabFusion.Network.EpicGames.EOSMessagingComponent");
+            if (messenger == null)
+            {
+                MelonLogger.Warning("[TeleportBring] EOS messenger type not found (MessageSender path still used).");
+                return;
+            }
 
             foreach (MethodInfo m in messenger.GetMethods(
-                         BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public))
+                         BindingFlags.Static | BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public))
             {
-                if (m.Name != "SendPacket") continue;
                 ParameterInfo[] p = m.GetParameters();
-                if (p.Length == 4 && p[1].ParameterType == typeof(NetMessage) && p[3].ParameterType == typeof(bool))
+                if (m.Name == "SendFromServer"
+                    && p.Length == 3
+                    && p[0].ParameterType == typeof(string)
+                    && p[2].ParameterType == typeof(NetMessage))
+                {
+                    _eosSendFromServer = m;
+                }
+                else if (m.Name == "SendPacket"
+                         && p.Length == 4
+                         && p[1].ParameterType == typeof(NetMessage)
+                         && p[3].ParameterType == typeof(bool))
                 {
                     _eosSendPacket = m;
-                    break;
                 }
             }
         }

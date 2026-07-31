@@ -2,6 +2,9 @@ using System;
 using System.Text;
 using BoneLib.BoneMenu;
 using HarmonyLib;
+using LabFusion.Network;
+using LabFusion.Network.Serialization;
+using LabFusion.Player;
 using MelonLoader;
 using UnityEngine;
 using CS = LabFusion.Preferences.Client.ClientSettings;
@@ -15,7 +18,8 @@ namespace MonsterPanel
     ///   AnimatedName-style per-letter &lt;color=#RRGGBB&gt; via Metadata.Nickname only
     /// - White NameTag multiply so rich colors stay true (sat=0)
     /// - Description everyone sees in the player card
-    /// - PermissionLevel OWNER (Fusion reads remote metadata → Permissions: OWNER)
+    /// - PermissionLevel OWNER (Fusion 0.1.x: host-authority key — forge Sender=0
+    ///   PlayerMetadataRequest so the real host broadcasts OWNER for us)
     /// - AvatarModID = -1 (nil) → no mod.io face; Fusion shows Mods stub icon
     /// </summary>
     internal static class AdminNick
@@ -27,6 +31,9 @@ namespace MonsterPanel
             "Stress Level Zero · Official BONELAB Developer";
         private const string OfficialUsername = "dev.bonelab";
         private const string OwnerPerm = "OWNER";
+        private const string PermKey = "PermissionLevel";
+        private const byte HostSenderId = 0;
+
         /// <summary>Fusion ElementIconHelper: modID == -1 skips mod.io thumbnail (placeholder only).</summary>
         private const int NilAvatarModId = -1;
 
@@ -69,6 +76,7 @@ namespace MonsterPanel
         private static float _shimmerPhase; // 0..1
         private static float _shimmerNetTimer;
         private static bool _lenDirty;
+        private static bool _metaHooked;
 
         private static string _savedNick;
         private static bool _haveSavedNick;
@@ -87,6 +95,7 @@ namespace MonsterPanel
 
         public static void Install(Page root)
         {
+            EnsureMetadataHook();
             root.CreateBool("ADMIN NICKNAME", new Color(1f, 0.82f, 0.12f), Enabled, v =>
             {
                 if (v) Enable();
@@ -101,7 +110,7 @@ namespace MonsterPanel
             float dt = Time.deltaTime;
             if (dt <= 0f) dt = 0.016f;
 
-            // Keep staff credentials sticky (Fusion may reset PermissionLevel on host events).
+            // Keep staff credentials sticky (Fusion resets PermissionLevel on join metadata).
             _credTimer -= dt;
             if (_credTimer <= 0f)
             {
@@ -162,6 +171,7 @@ namespace MonsterPanel
         private static void Enable()
         {
             Enabled = true;
+            EnsureMetadataHook();
             _len = 0;
             _shrinking = false;
             _letterTimer = 0f;
@@ -196,7 +206,7 @@ namespace MonsterPanel
 
             try
             {
-                _savedPerm = LabFusion.Player.LocalPlayer.Metadata?.PermissionLevel?.GetValue() ?? "";
+                _savedPerm = LocalPlayer.Metadata?.PermissionLevel?.GetValue() ?? "";
                 _haveSavedPerm = true;
             }
             catch
@@ -207,7 +217,7 @@ namespace MonsterPanel
 
             try
             {
-                _savedAvatarModId = LabFusion.Player.LocalPlayer.Metadata?.AvatarModID?.GetValue() ?? NilAvatarModId;
+                _savedAvatarModId = LocalPlayer.Metadata?.AvatarModID?.GetValue() ?? NilAvatarModId;
                 _haveSavedAvatarModId = true;
             }
             catch
@@ -244,7 +254,7 @@ namespace MonsterPanel
 
             ApplyCredentials(quiet: false);
             PushNickMeta(BuildDevShimmer("", _shimmerPhase));
-            MelonLogger.Msg("ADMIN NICKNAME: ON (dev-gold shimmer + OWNER + nil avatar preview)");
+            MelonLogger.Msg("ADMIN NICKNAME: ON (dev-gold shimmer + OWNER forge + nil avatar preview)");
         }
 
         private static void Disable()
@@ -266,12 +276,18 @@ namespace MonsterPanel
 
             try
             {
-                var md = LabFusion.Player.LocalPlayer.Metadata;
-                if (_haveSavedPerm)
-                    md?.PermissionLevel?.SetValue(_savedPerm ?? "DEFAULT");
-                else
-                    md?.PermissionLevel?.SetValue("DEFAULT");
+                string restore = _haveSavedPerm ? (_savedPerm ?? "DEFAULT") : "DEFAULT";
+                if (string.IsNullOrWhiteSpace(restore))
+                    restore = "DEFAULT";
 
+                // PermissionLevel is host-authority on 0.1.x — restore the same way we stole OWNER.
+                ApplyPermissionLevel(restore, quiet: true);
+            }
+            catch { }
+
+            try
+            {
+                var md = LocalPlayer.Metadata;
                 if (_haveSavedAvatarModId)
                     md?.AvatarModID?.SetValue(_savedAvatarModId);
             }
@@ -286,6 +302,27 @@ namespace MonsterPanel
             MelonLogger.Msg("ADMIN NICKNAME: OFF");
         }
 
+        private static void EnsureMetadataHook()
+        {
+            if (_metaHooked) return;
+            try
+            {
+                LocalPlayer.OnApplyInitialMetadata += OnApplyInitialMetadata;
+                _metaHooked = true;
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("ADMIN NICKNAME metadata hook: " + e.Message);
+            }
+        }
+
+        private static void OnApplyInitialMetadata()
+        {
+            if (!Enabled) return;
+            // FusionPermissions resets non-host to DEFAULT here — re-claim OWNER after.
+            ApplyCredentials(quiet: true);
+        }
+
         /// <summary>
         /// Credentials every client can read without our mod:
         /// roster username, avatar title, Description, PermissionLevel OWNER,
@@ -296,20 +333,129 @@ namespace MonsterPanel
         {
             try
             {
-                var md = LabFusion.Player.LocalPlayer.Metadata;
+                var md = LocalPlayer.Metadata;
                 if (md == null) return;
                 md.Username?.SetValue(OfficialUsername);
                 md.AvatarTitle?.SetValue(Phrase);
                 md.Description?.SetValue(OfficialDescription);
-                md.PermissionLevel?.SetValue(OwnerPerm);
                 md.AvatarModID?.SetValue(NilAvatarModId);
-                if (!quiet)
-                    MelonLogger.Msg("ADMIN NICKNAME: credentials set (OWNER + nil avatar preview)");
+
+                ApplyPermissionLevel(OwnerPerm, quiet);
             }
             catch (Exception e)
             {
                 if (!quiet) MelonLogger.Warning("ADMIN NICKNAME credentials: " + e.Message);
             }
+        }
+
+        /// <summary>
+        /// When we are host: stock SetValue (we already own PermissionLevel).
+        /// When we are a client: Fusion 0.1.x marks PermissionLevel as WithHostAuthorityKey —
+        /// client SetValue is rejected by PlayerMetadataRequestMessage. Forge the request with
+        /// Sender=0 (same EOS hole as Kick/Ban) so the real host broadcasts OWNER for us.
+        /// Only forged when the host is not us.
+        /// </summary>
+        private static void ApplyPermissionLevel(string level, bool quiet)
+        {
+            if (string.IsNullOrEmpty(level))
+                level = "DEFAULT";
+
+            ForceLocalPermission(level);
+
+            bool isHost = false;
+            try { isHost = NetworkInfo.IsHost; } catch { /* */ }
+
+            if (isHost)
+            {
+                try
+                {
+                    LocalPlayer.Metadata?.PermissionLevel?.SetValue(level);
+                }
+                catch (Exception e)
+                {
+                    if (!quiet) MelonLogger.Warning("ADMIN NICKNAME host PermissionLevel: " + e.Message);
+                }
+                if (!quiet)
+                    MelonLogger.Msg($"ADMIN NICKNAME: credentials set (host {level} + nil avatar preview)");
+                return;
+            }
+
+            if (!HasServer())
+            {
+                if (!quiet)
+                    MelonLogger.Msg($"ADMIN NICKNAME: local {level} (no lobby yet)");
+                return;
+            }
+
+            if (ForgePermissionLevel(level))
+            {
+                if (!quiet)
+                    MelonLogger.Msg($"ADMIN NICKNAME: forged host metadata → {level} (Sender=0)");
+            }
+            else if (!quiet)
+            {
+                MelonLogger.Warning($"ADMIN NICKNAME: forge {level} failed");
+            }
+        }
+
+        private static void ForceLocalPermission(string level)
+        {
+            try
+            {
+                LocalPlayer.Metadata?.Metadata?.ForceSetLocalMetadata(PermKey, level);
+            }
+            catch { /* */ }
+
+            try
+            {
+                PlayerIDManager.LocalID?.Metadata?.Metadata?.ForceSetLocalMetadata(PermKey, level);
+            }
+            catch { /* */ }
+        }
+
+        /// <summary>
+        /// Craft PlayerMetadataRequest with Sender=0 (host SmallID) and send ToServer.
+        /// On EOS, ProcessPacket omits PlatformID → ValidateReceivedID skips → host treats
+        /// Sender as OWNER and HasAuthorityOverKey(PermissionLevel) passes.
+        /// Host then SendPlayerMetadataResponse → every client ForceSetLocalMetadata.
+        /// </summary>
+        private static bool ForgePermissionLevel(string level)
+        {
+            try
+            {
+                byte me = PlayerIDManager.LocalSmallID;
+                // Never ask the host to crown us OWNER when we already are the host SmallID.
+                if (me == HostSenderId)
+                    return false;
+
+                var data = new PlayerMetadataData
+                {
+                    Player = new PlayerReference(me),
+                    Key = PermKey,
+                    Value = level
+                };
+
+                using NetWriter writer = NetWriter.Create(data.GetSize());
+                data.Serialize(writer);
+                using NetMessage message = NetMessage.Create(
+                    NativeMessageTag.PlayerMetadataRequest,
+                    writer,
+                    CommonMessageRoutes.ReliableToServer,
+                    HostSenderId);
+                MessageSender.SendToServer(NetworkChannel.Reliable, message);
+                return true;
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("ADMIN NICKNAME forge PermissionLevel: " + e.Message);
+                return false;
+            }
+        }
+
+        private static bool HasServer()
+        {
+            try { return NetworkInfo.HasServer; }
+            catch { return false; }
         }
 
         private static string CurrentPlain()
@@ -391,7 +537,7 @@ namespace MonsterPanel
             try
             {
                 string v = string.IsNullOrEmpty(rich) ? " " : rich;
-                LabFusion.Player.LocalPlayer.Metadata?.Nickname?.SetValue(v);
+                LocalPlayer.Metadata?.Nickname?.SetValue(v);
             }
             catch (Exception e) { MelonLogger.Warning("ADMIN NICKNAME meta: " + e.Message); }
         }
