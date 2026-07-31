@@ -27,7 +27,11 @@ Silent (no BoneMenu), **on by default**:
 
 ## Spoofing PID (Fusion 0.1.x)
 
-Fusion **0.1.0/0.1.1** rotated EOS `DeploymentId`/`ClientSecret` in the release DLL. Spoof mint uses Fusion’s Connect, so LabFusion must be updated; CreateDeviceId retries on `UnexpectedError`.
+Fusion **0.1.0/0.1.1** release DLL refactored EOS:
+- `EOSInterfaces` removed → `EOSRuntime.Context.Connect` (built only after Fusion LogIn)
+- EOS `DeploymentId`/`ClientSecret` rotated in the binary
+
+MonsterPanel **2.30.45+** resolves Connect via `EOSRuntime.Context` (with legacy `EOSInterfaces` fallback), waits for a logged-in `LocalUserId`, and retries `CreateDeviceId` on `UnexpectedError`.
 
 ## Host tools unlock (2.30.39+)
 
