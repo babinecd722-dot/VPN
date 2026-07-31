@@ -221,62 +221,106 @@ namespace MonsterPanel
             MelonLogger.Msg("Spoofing PID: provisioning zero account…");
             BeginFingerprintSpoof();
 
-            // Skip Connect.Logout — it tears down the live Fusion session and feels like a freeze.
-            // DeleteDeviceId alone is enough to force InvalidUser → CreateUser on next Login.
+            // Skip Connect.Logout — tears down the live Fusion session (freeze) and on Fusion 0.1.x
+            // trips OnAuthExpiredUnrecoverable → ForceDisconnect.
+            //
+            // CreateDeviceId first (new fingerprint). Only DeleteDeviceId if we need a clean slate
+            // after DuplicateNotAllowed + Login still returns the original account.
 
-            // 1) Delete existing EOS device credential so Login returns InvalidUser + ContinuanceToken.
-            {
-                bool done = false;
-                try
-                {
-                    var del = new DeleteDeviceIdOptions();
-                    connect.DeleteDeviceId(ref del, null, (ref DeleteDeviceIdCallbackInfo _) => { done = true; });
-                }
-                catch (Exception e)
-                {
-                    MelonLogger.Warning("Spoofing PID: DeleteDeviceId — " + e.Message);
-                    EndFingerprintSpoof();
-                    _provisioning = false;
-                    yield break;
-                }
-                float t = 0f;
-                while (!done && t < 15f) { t += Time.unscaledDeltaTime; yield return null; }
-            }
-
-            // 2) CreateDeviceId with spoofed DeviceModel (new device credential, separate from original).
+            // 1) CreateDeviceId with spoofed DeviceModel — retry on UnexpectedError (Fusion 0.1.x
+            //    EOS deployment rotation / transient Epic flaps).
             bool deviceOk = false;
+            string model = string.IsNullOrEmpty(_fakeDeviceModel) ? "Meta Quest 3" : _fakeDeviceModel;
+            Result lastCreate = Result.UnexpectedError;
+            for (int attempt = 0; attempt < 4 && !deviceOk; attempt++)
             {
+                if (attempt > 0)
+                {
+                    MelonLogger.Msg($"Spoofing PID: CreateDeviceId retry {attempt + 1}/4…");
+                    GenerateFingerprint();
+                    model = _fakeDeviceModel;
+                    float wait = 0f;
+                    while (wait < 1.2f) { wait += Time.unscaledDeltaTime; yield return null; }
+                }
+
                 bool done = false;
-                string model = string.IsNullOrEmpty(_fakeDeviceModel) ? "Meta Quest 3" : _fakeDeviceModel;
+                lastCreate = Result.UnexpectedError;
                 try
                 {
                     var create = new CreateDeviceIdOptions { DeviceModel = model };
                     connect.CreateDeviceId(ref create, null, (ref CreateDeviceIdCallbackInfo info) =>
                     {
+                        lastCreate = info.ResultCode;
                         deviceOk = info.ResultCode == Result.Success || info.ResultCode == Result.DuplicateNotAllowed;
-                        if (!deviceOk)
-                            MelonLogger.Warning("Spoofing PID: CreateDeviceId → " + info.ResultCode);
                         done = true;
                     });
                 }
                 catch (Exception e)
                 {
                     MelonLogger.Warning("Spoofing PID: CreateDeviceId — " + e.Message);
-                    EndFingerprintSpoof();
-                    _provisioning = false;
-                    yield break;
+                    break;
                 }
+
                 float t = 0f;
                 while (!done && t < 15f) { t += Time.unscaledDeltaTime; yield return null; }
                 if (!deviceOk)
-                {
-                    MelonLogger.Warning("Spoofing PID: CreateDeviceId failed.");
-                    EndFingerprintSpoof();
-                    _provisioning = false;
-                    yield break;
-                }
-                SpoofDeviceModel = model;
+                    MelonLogger.Warning("Spoofing PID: CreateDeviceId → " + lastCreate);
             }
+
+            if (!deviceOk)
+            {
+                // Last resort: delete device credential then mint once more.
+                MelonLogger.Msg("Spoofing PID: CreateDeviceId failed — DeleteDeviceId then final mint…");
+                {
+                    bool done = false;
+                    try
+                    {
+                        var del = new DeleteDeviceIdOptions();
+                        connect.DeleteDeviceId(ref del, null, (ref DeleteDeviceIdCallbackInfo _) => { done = true; });
+                    }
+                    catch (Exception e)
+                    {
+                        MelonLogger.Warning("Spoofing PID: DeleteDeviceId — " + e.Message);
+                    }
+                    float t = 0f;
+                    while (!done && t < 15f) { t += Time.unscaledDeltaTime; yield return null; }
+                }
+
+                GenerateFingerprint();
+                model = _fakeDeviceModel;
+                {
+                    bool done = false;
+                    lastCreate = Result.UnexpectedError;
+                    try
+                    {
+                        var create = new CreateDeviceIdOptions { DeviceModel = model };
+                        connect.CreateDeviceId(ref create, null, (ref CreateDeviceIdCallbackInfo info) =>
+                        {
+                            lastCreate = info.ResultCode;
+                            deviceOk = info.ResultCode == Result.Success || info.ResultCode == Result.DuplicateNotAllowed;
+                            done = true;
+                        });
+                    }
+                    catch (Exception e)
+                    {
+                        MelonLogger.Warning("Spoofing PID: CreateDeviceId (final) — " + e.Message);
+                    }
+                    float t = 0f;
+                    while (!done && t < 15f) { t += Time.unscaledDeltaTime; yield return null; }
+                }
+            }
+
+            if (!deviceOk)
+            {
+                MelonLogger.Warning("Spoofing PID: CreateDeviceId failed (" + lastCreate +
+                                    "). Fusion 0.1.x rotated EOS DeploymentId — update LabFusion, then retry.");
+                NotifyError("PID spoof failed", "CreateDeviceId: " + lastCreate);
+                EndFingerprintSpoof();
+                _provisioning = false;
+                yield break;
+            }
+
+            SpoofDeviceModel = model;
 
             // Fingerprint spoof only needed around CreateDeviceId — release before Login/CreateUser.
             EndFingerprintSpoof();

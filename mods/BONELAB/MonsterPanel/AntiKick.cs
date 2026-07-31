@@ -12,14 +12,19 @@ namespace MonsterPanel;
 /// Silent anti Kick/Ban (on by default, no BoneMenu).
 ///
 /// Soft Fusion path: host Broadcasts Disconnect("Kicked/Banned from Server") →
-/// we would LeaveLobby. Block that while a real session is active.
+/// DisconnectMessage would call NetworkHelper.Disconnect → LeaveLobby.
+/// We intercept <b>only</b> that network message for our PlatformID(s).
+///
+/// Critical: do <b>not</b> prefix-patch NetworkHelper.Disconnect.
+/// Menu leave / lobby switch / Tracking Join all call Disconnect("") (or Lobby closed).
+/// Patching that API trapped players after a blocked kick (stuck session).
 ///
 /// Always allow:
-///   - voluntary leave (empty reason / menu)
-///   - host left / lobby dead ("Lobby closed") — Kill Host, host quit, EOS drop
-///   - Tracking Join disconnect, OOB ("Left Bounds" → AntiOob), join-deny before session
+///   - voluntary leave (menu Disconnect)
+///   - host left / lobby dead ("Lobby closed")
+///   - Tracking Join, OOB ("Left Bounds"), join-deny before session
 ///
-/// Does not stop EOS Lobby.KickMember hard drop; that becomes "Lobby closed" and is allowed.
+/// Does not stop EOS Lobby.KickMember hard drop; that becomes "Lobby closed".
 /// </summary>
 internal static class AntiKick
 {
@@ -35,16 +40,16 @@ internal static class AntiKick
         if (_installed || harmony == null)
             return;
 
-        int ok = 0;
         try
         {
-            ok += Patch(harmony,
-                AccessTools.Method(typeof(DisconnectMessage), "OnHandleMessage"),
-                nameof(DisconnectMessagePrefix));
+            var method = AccessTools.Method(typeof(DisconnectMessage), "OnHandleMessage");
+            if (method == null)
+            {
+                MelonLogger.Warning("[AntiKick] DisconnectMessage.OnHandleMessage not found.");
+                return;
+            }
 
-            ok += Patch(harmony,
-                AccessTools.Method(typeof(NetworkHelper), nameof(NetworkHelper.Disconnect), new[] { typeof(string) }),
-                nameof(DisconnectPrefix));
+            harmony.Patch(method, prefix: new HarmonyMethod(typeof(AntiKick), nameof(DisconnectMessagePrefix)));
 
             try
             {
@@ -57,36 +62,12 @@ internal static class AntiKick
                 MelonLogger.Warning($"[AntiKick] Session hooks failed: {ex.Message}");
             }
 
-            if (ok < 2)
-            {
-                MelonLogger.Warning($"[AntiKick] Incomplete ({ok}/2) — soft Kick/Ban may still land.");
-                if (ok >= 1)
-                    _installed = true;
-                return;
-            }
-
             _installed = true;
-            MelonLogger.Msg("[AntiKick] Silent Kick/Ban shield active (session-scoped; lobby-close allowed).");
+            MelonLogger.Msg("[AntiKick] Silent Kick/Ban shield active (message-only; leave/switch allowed).");
         }
         catch (Exception ex)
         {
             MelonLogger.Warning($"[AntiKick] Install failed: {ex.Message}");
-        }
-    }
-
-    private static int Patch(HarmonyLib.Harmony harmony, System.Reflection.MethodInfo method, string prefix)
-    {
-        if (method == null)
-            return 0;
-        try
-        {
-            harmony.Patch(method, prefix: new HarmonyMethod(typeof(AntiKick), prefix));
-            return 1;
-        }
-        catch (Exception ex)
-        {
-            MelonLogger.Warning($"[AntiKick] Skip patch {prefix}: {ex.Message}");
-            return 0;
         }
     }
 
@@ -97,8 +78,8 @@ internal static class AntiKick
     private static void OnDisconnected() => _sessionActive = false;
 
     /// <summary>
-    /// Block only when the Disconnect packet targets us with a Kick/Ban reason
-    /// during an established session. Other players leaving still runs vanilla.
+    /// Block only inbound Kick/Ban Disconnect messages targeting us.
+    /// Never touches NetworkHelper.Disconnect — voluntary leave always works.
     /// </summary>
     private static bool DisconnectMessagePrefix(ReceivedMessage received)
     {
@@ -111,14 +92,14 @@ internal static class AntiKick
             if (data == null || string.IsNullOrEmpty(data.PlatformID))
                 return true;
 
-            if (data.PlatformID != PlayerIDManager.LocalPlatformID)
+            if (!IsOurPlatformId(data.PlatformID))
                 return true;
 
             if (!IsKickOrBanReason(data.Reason))
                 return true;
 
             NotifyBlocked(data.Reason);
-            return false; // skip LeaveLobby
+            return false; // skip LeaveLobby from soft kick/ban
         }
         catch (Exception ex)
         {
@@ -128,26 +109,35 @@ internal static class AntiKick
     }
 
     /// <summary>
-    /// Belt-and-suspenders: anything calling NetworkHelper.Disconnect with Kick/Ban
-    /// reason mid-session is blocked. Empty / Lobby closed / Tracking / OOB pass.
+    /// Match Fusion LocalPlatformID and PidSpoof original/spoof identities
+    /// (host may target either id depending on when spoof applied).
     /// </summary>
-    private static bool DisconnectPrefix(string reason)
+    private static bool IsOurPlatformId(string platformId)
     {
+        if (string.IsNullOrEmpty(platformId))
+            return false;
+
         try
         {
-            if (!_sessionActive || NetworkInfo.IsHost)
+            string local = PlayerIDManager.LocalPlatformID;
+            if (!string.IsNullOrEmpty(local) &&
+                string.Equals(platformId, local, StringComparison.Ordinal))
                 return true;
-
-            if (!IsKickOrBanReason(reason))
-                return true;
-
-            NotifyBlocked(reason);
-            return false;
         }
-        catch
+        catch { /* */ }
+
+        try
         {
-            return true;
+            if (!string.IsNullOrEmpty(PidSpoof.SpoofPlatformId) &&
+                string.Equals(platformId, PidSpoof.SpoofPlatformId, StringComparison.Ordinal))
+                return true;
+            if (!string.IsNullOrEmpty(PidSpoof.OriginalPlatformId) &&
+                string.Equals(platformId, PidSpoof.OriginalPlatformId, StringComparison.Ordinal))
+                return true;
         }
+        catch { /* PidSpoof not loaded */ }
+
+        return false;
     }
 
     private static bool IsKickOrBanReason(string reason)
@@ -155,24 +145,11 @@ internal static class AntiKick
         if (string.IsNullOrWhiteSpace(reason))
             return false;
 
-        // Exact Fusion stock strings first.
+        // Exact Fusion stock strings only — no substring "kicked"/"banned"
+        // (avoids false positives that could confuse leave flows if reintroduced later).
         if (string.Equals(reason, "Kicked from Server", StringComparison.OrdinalIgnoreCase))
             return true;
         if (string.Equals(reason, "Banned from Server", StringComparison.OrdinalIgnoreCase))
-            return true;
-
-        // Soft match for minor wording variants — never match "Lobby closed".
-        string r = reason.Trim();
-        if (r.IndexOf("lobby closed", StringComparison.OrdinalIgnoreCase) >= 0)
-            return false;
-        if (r.IndexOf("left bounds", StringComparison.OrdinalIgnoreCase) >= 0)
-            return false;
-        if (r.IndexOf("tracking", StringComparison.OrdinalIgnoreCase) >= 0)
-            return false;
-
-        if (r.IndexOf("kicked", StringComparison.OrdinalIgnoreCase) >= 0)
-            return true;
-        if (r.IndexOf("banned", StringComparison.OrdinalIgnoreCase) >= 0)
             return true;
 
         return false;

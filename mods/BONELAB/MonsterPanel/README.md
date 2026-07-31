@@ -17,13 +17,17 @@ Silent Fusion shield against the **Whoops / far out of bounds** kick (no BoneMen
 
 Uses LabFusion from Checkerb0ard 0.0.5 (EOS), not Steam.
 
-## Anti-Kick / Ban (2.30.43+)
+## Anti-Kick / Ban (2.30.43+, leave fix 2.30.44)
 
 Silent (no BoneMenu), **on by default**:
-- Blocks soft Fusion `Disconnect("Kicked/Banned from Server")` while you are in a session
+- Intercepts **only** inbound `DisconnectMessage` with exact `Kicked/Banned from Server` targeting our PlatformID (incl. PidSpoof original/spoof ids)
 - Fusion popup: **Protection** / `Kick blocked` or `Ban blocked`
-- Does **not** block: your own leave, host leave / `Lobby closed` (Kill Host, host quit), Tracking join disconnect, OOB, join-deny before session
+- Does **not** patch `NetworkHelper.Disconnect` — menu leave, lobby switch, Tracking join always work
 - Hard EOS `KickMember` still ends as lobby-close (allowed — avoids ghost/stuck state)
+
+## Spoofing PID (Fusion 0.1.x)
+
+Fusion **0.1.0/0.1.1** rotated EOS `DeploymentId`/`ClientSecret` in the release DLL. Spoof mint uses Fusion’s Connect, so LabFusion must be updated; CreateDeviceId retries on `UnexpectedError`.
 
 ## Host tools unlock (2.30.39+)
 

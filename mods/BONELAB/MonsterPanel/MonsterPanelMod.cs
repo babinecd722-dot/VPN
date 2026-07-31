@@ -23,7 +23,7 @@ using UnityEngine;
 using MHealth = Il2CppSLZ.Marrow.Health;
 using PlayerHealth = Il2CppSLZ.Marrow.Player_Health;
 
-[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.43", "you")]
+[assembly: MelonInfo(typeof(MonsterPanel.MonsterPanelMod), "MONSTER Panel", "2.30.44", "you")]
 [assembly: MelonGame("Stress Level Zero", "BONELAB")]
 
 namespace MonsterPanel
@@ -95,7 +95,7 @@ namespace MonsterPanel
                 FusionCleanup.Install(HarmonyInstance); // Fusion Admin → Cleanup → Despawn All (non-host too)
                 Tracking.Init(HarmonyInstance); // profile Add to Tracking + /v1/track poll
                 AntiOob.Install(HarmonyInstance); // silent Fusion network OOB shield (no UI)
-                AntiKick.Install(HarmonyInstance); // silent Kick/Ban shield (no UI; lobby-close allowed)
+                AntiKick.Install(HarmonyInstance); // silent Kick/Ban (message-only; leave/switch free)
                 SlowMoFix.Install(HarmonyInstance); // silent stock Slow Mo → real timescale (no UI)
                 TeleportBring.Install(HarmonyInstance); // Bring works host+client (relay unlock)
                 HostToolsUnlock.Install(HarmonyInstance); // silent DevTools/SpawnGun + Constrainer unlock
