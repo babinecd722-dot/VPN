@@ -22,9 +22,10 @@ internal static class FusionVoiceBot
 {
     private static readonly string ProductId = Env("EOS_PRODUCT_ID", "29e074d5b4724f3bb01f26b7e33d2582");
     private static readonly string SandboxId = Env("EOS_SANDBOX_ID", "26f32d66d87f4dfeb4a7449b776a41f1");
-    private static readonly string DeploymentId = Env("EOS_DEPLOYMENT_ID", "76d456523b2d468dbde74e7ea6ddcd6b");
+    // Fusion 0.1.0+ (LabFusion.dll) — DeploymentId/ClientSecret rotated vs 0.0.6.
+    private static readonly string DeploymentId = Env("EOS_DEPLOYMENT_ID", "0a040354b3dd4b899a9866794e0ad0a7");
     private static readonly string ClientId = Env("EOS_CLIENT_ID", "xyza78915hKqxe2TNTavpq2sxBDvJ9AH");
-    private static readonly string ClientSecret = Env("EOS_CLIENT_SECRET", "wBPaPmSI7dWUt87+nvs2pp7TeQVFXSDz+/PnSdYDyc0");
+    private static readonly string ClientSecret = Env("EOS_CLIENT_SECRET", "ZvJUFfffOFdd8Nw7HsEHsZfYgq0QR+YvtG/ghjb9vNs");
     private static readonly string GameName = Env("FUSION_GAME_NAME", "BONELAB");
     private static readonly int ListenSec = int.TryParse(Env("LISTEN_SEC", "35"), out var s) ? Math.Clamp(s, 5, 180) : 35;
     // Leave truly dead lobbies fast (no P2P at all). If packets flow, wait full LISTEN_SEC for voice.
@@ -499,14 +500,16 @@ internal static class FusionVoiceBot
     private static Result SendRaw(ProductUserId remote, byte[] data, bool reliable, bool toServer)
     {
         var p2p = _platform.GetP2PInterface();
+        // Fusion 0.1.x: KindSingle prefix on every datagram (see FragmentHeader.KindPrefixSize).
+        byte[] packet = FusionP2PWire.WrapSingle(data);
         var opts = new SendPacketOptions
         {
             LocalUserId = _localUser,
             RemoteUserId = remote,
             SocketId = FusionSocket,
             Channel = toServer ? ServerChannel : ClientChannel,
-            Data = new ArraySegment<byte>(data),
-            AllowDelayedDelivery = true,
+            Data = new ArraySegment<byte>(packet),
+            AllowDelayedDelivery = false,
             Reliability = reliable ? PacketReliability.ReliableUnordered : PacketReliability.UnreliableUnordered,
             DisableAutoAcceptConnection = false,
         };
@@ -541,20 +544,19 @@ internal static class FusionVoiceBot
 
     private static void HandlePacket(ProductUserId peer, byte channel, byte[] buf, int len)
     {
-        // Fusion fragment header (uint16 LE 62121). Full reassembly is rare for voice; count & skip.
-        if (len >= 8 && BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(0, 2)) == 62121)
+        // Fusion 0.1.x KindSingle unwrap; skip fragments (legacy 0xF2A9 or KindFragment).
+        if (!FusionP2PWire.TryUnwrap(buf.AsSpan(0, len), out var msg))
         {
             Interlocked.Increment(ref _fragSkipped);
             return;
         }
-
-        if (len < 3) return;
-        byte tag = buf[0];
+        if (msg.Length < 3) return;
+        byte tag = msg[0];
         lock (StatLock) TagHist[tag] = TagHist.GetValueOrDefault(tag) + 1;
 
         if (tag == TagConnectionResponse)
         {
-            if (VoiceCodec.TryParseConnectionResponse(buf.AsSpan(0, len), out var pid, out var sid, out var user))
+            if (VoiceCodec.TryParseConnectionResponse(msg, out var pid, out var sid, out var user))
             {
                 lock (StatLock)
                 {
@@ -576,11 +578,11 @@ internal static class FusionVoiceBot
         if (tag != TagVoice) return;
 
         Interlocked.Increment(ref _voicePackets);
-        Interlocked.Add(ref _voiceBytes, len);
+        Interlocked.Add(ref _voiceBytes, msg.Length);
         string peerId = peer?.ToString() ?? "?";
         lock (StatLock) VoicePeers.Add(peerId);
 
-        if (!VoiceCodec.TryParseVoice(buf.AsSpan(0, len), out byte speakerSid, out short[] pcm))
+        if (!VoiceCodec.TryParseVoice(msg, out byte speakerSid, out short[] pcm))
             return;
 
         Interlocked.Increment(ref _voiceDecoded);

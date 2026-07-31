@@ -685,11 +685,11 @@ internal static class FusionHostBot
 
     private static void HandleHostPacket(P2PInterface p2p, ProductUserId peer, byte[] buf, int len)
     {
-        if (len < 3 || peer == null) return;
-        // skip fragments
-        if (len >= 8 && BinaryPrimitives.ReadUInt16LittleEndian(buf.AsSpan(0, 2)) == 62121)
+        if (len < 1 || peer == null) return;
+        // Fusion 0.1.x: strip KindSingle / skip fragments; still accept legacy unprefixed packets.
+        if (!FusionP2PWire.TryUnwrap(buf.AsSpan(0, len), out var msg) || msg.Length < 3)
             return;
-        byte tag = buf[0];
+        byte tag = msg[0];
         if (tag == 0)
         {
             Console.WriteLine($"[host] poke/Unknown ← {peer}");
@@ -699,12 +699,12 @@ internal static class FusionHostBot
         {
             // Pose/etc. spam is normal after a real client handshake — don't flood journal.
             if (tag is not (4 or 17 or 67))
-                Console.WriteLine($"[host] pkt tag={tag} len={len} ← {peer}");
+                Console.WriteLine($"[host] pkt tag={tag} len={msg.Length} ← {peer}");
             return;
         }
         Interlocked.Increment(ref _connRequests);
         string peerId = peer.ToString();
-        TryParseConnectionRequest(buf.AsSpan(0, len), out string reqUser, out string avatarBarcode);
+        TryParseConnectionRequest(msg, out string reqUser, out string avatarBarcode);
         if (string.IsNullOrEmpty(reqUser)) reqUser = "Player";
         if (string.IsNullOrEmpty(avatarBarcode))
             avatarBarcode = "SLZ.BONELAB.Content.Avatar.Ford";
@@ -730,14 +730,16 @@ internal static class FusionHostBot
 
     private static Result SendTo(P2PInterface p2p, ProductUserId peer, byte[] msg)
     {
+        // Fusion 0.1.x requires KindSingle prefix on every P2P datagram.
+        byte[] packet = FusionP2PWire.WrapSingle(msg);
         var send = new SendPacketOptions
         {
             LocalUserId = _localUser,
             RemoteUserId = peer,
             SocketId = FusionSocket,
-            Channel = 1,
-            Data = new ArraySegment<byte>(msg),
-            AllowDelayedDelivery = true,
+            Channel = 1, // ClientChannel — host → peer
+            Data = new ArraySegment<byte>(packet),
+            AllowDelayedDelivery = false,
             Reliability = PacketReliability.ReliableUnordered,
             DisableAutoAcceptConnection = false,
         };

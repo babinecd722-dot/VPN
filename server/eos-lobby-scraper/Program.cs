@@ -24,9 +24,10 @@ internal static class Program
     private const string ProductVersion = "0.0.1";
     private static readonly string ProductId = Env("EOS_PRODUCT_ID", "29e074d5b4724f3bb01f26b7e33d2582");
     private static readonly string SandboxId = Env("EOS_SANDBOX_ID", "26f32d66d87f4dfeb4a7449b776a41f1");
-    private static readonly string DeploymentId = Env("EOS_DEPLOYMENT_ID", "76d456523b2d468dbde74e7ea6ddcd6b");
+    // Fusion 0.1.0+ LabFusion.dll rotated DeploymentId + ClientSecret (git tags still show 0.0.6 values).
+    private static readonly string DeploymentId = Env("EOS_DEPLOYMENT_ID", "0a040354b3dd4b899a9866794e0ad0a7");
     private static readonly string ClientId = Env("EOS_CLIENT_ID", "xyza78915hKqxe2TNTavpq2sxBDvJ9AH");
-    private static readonly string ClientSecret = Env("EOS_CLIENT_SECRET", "wBPaPmSI7dWUt87+nvs2pp7TeQVFXSDz+/PnSdYDyc0");
+    private static readonly string ClientSecret = Env("EOS_CLIENT_SECRET", "ZvJUFfffOFdd8Nw7HsEHsZfYgq0QR+YvtG/ghjb9vNs");
 
     private static readonly string GameName = Env("FUSION_GAME_NAME", "BONELAB");
     private static readonly string PostgresDsn = ResolvePostgresDsn();

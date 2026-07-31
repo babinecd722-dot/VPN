@@ -59,3 +59,13 @@ Works: public Find listing, JoinLobby, P2P handshake (ConnectionResponse + Scene
 Does not: playable Unity Fusion world (needs a real BONELAB+Fusion host).
 
 Requires EOS SDK 1.15.5 ApiVersion patches: CreateLobby=8, AddAttribute=1 (`eos-join-probe/patches/`).
+
+## Fusion 0.1.0+ (2026-07-31)
+
+Checkerb0ard `BONELAB-Fusion` **0.1.0/0.1.1** release DLLs rotated EOS `DeploymentId` + `ClientSecret`
+(git source tags still list the old 0.0.6 values — trust the DLL). Defaults in
+`EosIdentity` / host / bots / scraper match the 0.1.1 binary.
+
+P2P wire: every datagram is prefixed with `KindSingle=0` / `KindFragment=1`
+(`FusionP2PWire`). Without this, 0.1.x clients mis-parse `ConnectionRequest` (tag=1)
+as a fragment and joins die.
