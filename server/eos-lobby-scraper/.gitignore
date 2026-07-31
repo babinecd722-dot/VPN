@@ -1,0 +1,8 @@
+bin/
+obj/
+*.user
+*.log
+data/
+.env
+native/*.so
+native/*.dll

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <RootNamespace>EosJoinProbe</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Patches are copied over third_party at install time; do not compile them as a second copy. -->
+    <Compile Remove="patches/**" />
+    <None Include="patches/**" />
+    <None Update="native/libEOSSDK-Linux-Shipping.so" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>
