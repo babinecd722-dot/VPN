@@ -40,9 +40,10 @@ namespace MonsterPanel
         private static bool _fingerprintActive;
         private static HarmonyLib.Harmony _harmony;
 
-        private static Type _eosInterfacesType;
-        private static PropertyInfo _connectProp;
-        private static bool _eosLookupDone;
+        /// <summary>Cached Connect getter — Fusion 0.0.x EOSInterfaces or 0.1.x EOSContext.</summary>
+        private static Func<ConnectInterface> _connectResolver;
+        private static string _connectResolverKind;
+        private static bool _loggedResolver;
 
         private static readonly MethodInfo[] _deviceGetters = new MethodInfo[4];
         private static readonly HarmonyMethod[] _devicePrefixes = new HarmonyMethod[4];
@@ -59,13 +60,13 @@ namespace MonsterPanel
         };
 
         private const string FileName = "pid_spoof.cfg";
-        private const float ConnectWaitSeconds = 60f;
+        private const float ConnectWaitSeconds = 90f;
 
         public static void Init(HarmonyLib.Harmony harmony)
         {
             _harmony = harmony;
             Load();
-            CacheEosConnect();
+            // Resolve EOS Connect lazily (Fusion 0.1.x builds EOSRuntime only after LogIn).
             InstallPidHook();
             // Device SystemInfo hooks are installed ONLY during CreateDeviceId — not at boot.
             if (Enabled)
@@ -128,11 +129,15 @@ namespace MonsterPanel
 
         private static IEnumerator EnsureRoutine()
         {
-            MelonLogger.Msg("Spoofing PID: waiting for EOS Connect…");
+            EnsureConnectResolver();
+            MelonLogger.Msg("Spoofing PID: waiting for Fusion EOS login (Connect via " +
+                            (_connectResolverKind ?? "auto") + ")…");
             float waited = 0f;
             float nextLog = 5f;
             ConnectInterface connect = GetConnect();
-            while (connect == null && waited < ConnectWaitSeconds)
+            string loggedIn = GetLoggedInProductUserId();
+            // Fusion 0.1.x: Connect exists only after NetworkLayer.LogIn → EOSRuntime.InitializeAsync.
+            while ((connect == null || string.IsNullOrEmpty(loggedIn)) && waited < ConnectWaitSeconds)
             {
                 if (_cancel || !Enabled)
                 {
@@ -143,23 +148,33 @@ namespace MonsterPanel
                 waited += Time.unscaledDeltaTime;
                 if (waited >= nextLog)
                 {
-                    MelonLogger.Msg("Spoofing PID: still waiting for EOS Connect (" + (int)waited + "s) — log into Fusion EOS.");
+                    MelonLogger.Msg(
+                        "Spoofing PID: waiting EOS (" + (int)waited + "s) connect=" +
+                        (connect != null ? "yes" : "no") +
+                        " user=" + (string.IsNullOrEmpty(loggedIn) ? "no" : Short(loggedIn)) +
+                        " — open Fusion → Epic Online Services / Log In.");
                     nextLog += 5f;
                 }
                 yield return null;
                 connect = GetConnect();
+                loggedIn = GetLoggedInProductUserId();
             }
 
-            if (connect == null)
+            if (connect == null || string.IsNullOrEmpty(loggedIn))
             {
-                MelonLogger.Warning("Spoofing PID: EOS Connect not ready — log into Fusion (Epic Online Services) and retry.");
+                MelonLogger.Warning(
+                    "Spoofing PID: EOS not ready (connect=" + (connect != null) +
+                    ", user=" + Short(loggedIn) + "). Log into Fusion EOS, then toggle Spoofing PID again.");
                 NotifyError("PID spoof failed", "Fusion EOS not logged in");
                 _ensureStarted = false;
                 yield break;
             }
 
-            MelonLogger.Msg("Spoofing PID: EOS Connect ready.");
+            MelonLogger.Msg("Spoofing PID: EOS ready (user=" + Short(loggedIn) + ", via " +
+                            (_connectResolverKind ?? "?") + ").");
             TryRememberOriginal(PlayerIDManager.LocalPlatformID);
+            if (string.IsNullOrEmpty(OriginalPlatformId))
+                TryRememberOriginal(loggedIn);
 
             if (_cancel || !Enabled)
             {
@@ -221,62 +236,106 @@ namespace MonsterPanel
             MelonLogger.Msg("Spoofing PID: provisioning zero account…");
             BeginFingerprintSpoof();
 
-            // Skip Connect.Logout — it tears down the live Fusion session and feels like a freeze.
-            // DeleteDeviceId alone is enough to force InvalidUser → CreateUser on next Login.
+            // Skip Connect.Logout — tears down the live Fusion session (freeze) and on Fusion 0.1.x
+            // trips OnAuthExpiredUnrecoverable → ForceDisconnect.
+            //
+            // CreateDeviceId first (new fingerprint). Only DeleteDeviceId if we need a clean slate
+            // after DuplicateNotAllowed + Login still returns the original account.
 
-            // 1) Delete existing EOS device credential so Login returns InvalidUser + ContinuanceToken.
-            {
-                bool done = false;
-                try
-                {
-                    var del = new DeleteDeviceIdOptions();
-                    connect.DeleteDeviceId(ref del, null, (ref DeleteDeviceIdCallbackInfo _) => { done = true; });
-                }
-                catch (Exception e)
-                {
-                    MelonLogger.Warning("Spoofing PID: DeleteDeviceId — " + e.Message);
-                    EndFingerprintSpoof();
-                    _provisioning = false;
-                    yield break;
-                }
-                float t = 0f;
-                while (!done && t < 15f) { t += Time.unscaledDeltaTime; yield return null; }
-            }
-
-            // 2) CreateDeviceId with spoofed DeviceModel (new device credential, separate from original).
+            // 1) CreateDeviceId with spoofed DeviceModel — retry on UnexpectedError (Fusion 0.1.x
+            //    EOS deployment rotation / transient Epic flaps).
             bool deviceOk = false;
+            string model = string.IsNullOrEmpty(_fakeDeviceModel) ? "Meta Quest 3" : _fakeDeviceModel;
+            Result lastCreate = Result.UnexpectedError;
+            for (int attempt = 0; attempt < 4 && !deviceOk; attempt++)
             {
+                if (attempt > 0)
+                {
+                    MelonLogger.Msg($"Spoofing PID: CreateDeviceId retry {attempt + 1}/4…");
+                    GenerateFingerprint();
+                    model = _fakeDeviceModel;
+                    float wait = 0f;
+                    while (wait < 1.2f) { wait += Time.unscaledDeltaTime; yield return null; }
+                }
+
                 bool done = false;
-                string model = string.IsNullOrEmpty(_fakeDeviceModel) ? "Meta Quest 3" : _fakeDeviceModel;
+                lastCreate = Result.UnexpectedError;
                 try
                 {
                     var create = new CreateDeviceIdOptions { DeviceModel = model };
                     connect.CreateDeviceId(ref create, null, (ref CreateDeviceIdCallbackInfo info) =>
                     {
+                        lastCreate = info.ResultCode;
                         deviceOk = info.ResultCode == Result.Success || info.ResultCode == Result.DuplicateNotAllowed;
-                        if (!deviceOk)
-                            MelonLogger.Warning("Spoofing PID: CreateDeviceId → " + info.ResultCode);
                         done = true;
                     });
                 }
                 catch (Exception e)
                 {
                     MelonLogger.Warning("Spoofing PID: CreateDeviceId — " + e.Message);
-                    EndFingerprintSpoof();
-                    _provisioning = false;
-                    yield break;
+                    break;
                 }
+
                 float t = 0f;
                 while (!done && t < 15f) { t += Time.unscaledDeltaTime; yield return null; }
                 if (!deviceOk)
-                {
-                    MelonLogger.Warning("Spoofing PID: CreateDeviceId failed.");
-                    EndFingerprintSpoof();
-                    _provisioning = false;
-                    yield break;
-                }
-                SpoofDeviceModel = model;
+                    MelonLogger.Warning("Spoofing PID: CreateDeviceId → " + lastCreate);
             }
+
+            if (!deviceOk)
+            {
+                // Last resort: delete device credential then mint once more.
+                MelonLogger.Msg("Spoofing PID: CreateDeviceId failed — DeleteDeviceId then final mint…");
+                {
+                    bool done = false;
+                    try
+                    {
+                        var del = new DeleteDeviceIdOptions();
+                        connect.DeleteDeviceId(ref del, null, (ref DeleteDeviceIdCallbackInfo _) => { done = true; });
+                    }
+                    catch (Exception e)
+                    {
+                        MelonLogger.Warning("Spoofing PID: DeleteDeviceId — " + e.Message);
+                    }
+                    float t = 0f;
+                    while (!done && t < 15f) { t += Time.unscaledDeltaTime; yield return null; }
+                }
+
+                GenerateFingerprint();
+                model = _fakeDeviceModel;
+                {
+                    bool done = false;
+                    lastCreate = Result.UnexpectedError;
+                    try
+                    {
+                        var create = new CreateDeviceIdOptions { DeviceModel = model };
+                        connect.CreateDeviceId(ref create, null, (ref CreateDeviceIdCallbackInfo info) =>
+                        {
+                            lastCreate = info.ResultCode;
+                            deviceOk = info.ResultCode == Result.Success || info.ResultCode == Result.DuplicateNotAllowed;
+                            done = true;
+                        });
+                    }
+                    catch (Exception e)
+                    {
+                        MelonLogger.Warning("Spoofing PID: CreateDeviceId (final) — " + e.Message);
+                    }
+                    float t = 0f;
+                    while (!done && t < 15f) { t += Time.unscaledDeltaTime; yield return null; }
+                }
+            }
+
+            if (!deviceOk)
+            {
+                MelonLogger.Warning("Spoofing PID: CreateDeviceId failed (" + lastCreate +
+                                    "). Fusion 0.1.x rotated EOS DeploymentId — update LabFusion, then retry.");
+                NotifyError("PID spoof failed", "CreateDeviceId: " + lastCreate);
+                EndFingerprintSpoof();
+                _provisioning = false;
+                yield break;
+            }
+
+            SpoofDeviceModel = model;
 
             // Fingerprint spoof only needed around CreateDeviceId — release before Login/CreateUser.
             EndFingerprintSpoof();
@@ -632,22 +691,162 @@ namespace MonsterPanel
             Save();
         }
 
-        private static void CacheEosConnect()
+        /// <summary>
+        /// Avoid AccessTools.TypeByName (scans all assemblies → typeref crashes on Quest).
+        /// </summary>
+        private static Type FindLabFusionType(string fullName)
         {
-            if (_eosLookupDone) return;
-            _eosLookupDone = true;
+            foreach (Assembly asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    string an = asm.GetName().Name;
+                    if (an != "LabFusion" && an != "Assembly-CSharp")
+                        continue;
+                    Type t = asm.GetType(fullName, throwOnError: false, ignoreCase: false);
+                    if (t != null)
+                        return t;
+                }
+                catch { /* bad assembly */ }
+            }
             try
             {
-                _eosInterfacesType = AccessTools.TypeByName("LabFusion.Network.EpicGames.EOSInterfaces");
-                if (_eosInterfacesType != null)
-                    _connectProp = AccessTools.Property(_eosInterfacesType, "Connect");
-                MelonLogger.Msg(_connectProp != null
-                    ? "Spoofing PID: EOSInterfaces.Connect cached."
-                    : "Spoofing PID: EOSInterfaces.Connect not found (EOS layer missing?).");
+                return Type.GetType(fullName + ", LabFusion", throwOnError: false);
             }
-            catch (Exception e)
+            catch { return null; }
+        }
+
+        private static object GetEpicNetworkLayer()
+        {
+            try
             {
-                MelonLogger.Warning("Spoofing PID: EOS cache — " + e.Message);
+                Type mgr = FindLabFusionType("LabFusion.Network.NetworkLayerManager");
+                object layer = mgr != null
+                    ? AccessTools.Property(mgr, "Layer")?.GetValue(null)
+                    : null;
+                if (layer == null)
+                {
+                    Type netInfo = FindLabFusionType("LabFusion.Network.NetworkInfo");
+                    layer = netInfo != null
+                        ? AccessTools.Property(netInfo, "Layer")?.GetValue(null)
+                        : null;
+                }
+                if (layer == null)
+                    return null;
+
+                // 0.2.0 moved type to LabFusion.Network; older builds keep EpicGames.*
+                Type epic = FindLabFusionType("LabFusion.Network.EpicGamesNetworkLayer")
+                            ?? FindLabFusionType("LabFusion.Network.EpicGames.EpicGamesNetworkLayer");
+                if (epic != null && !epic.IsInstanceOfType(layer))
+                    return null;
+                return layer;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>Fusion 0.2.0: <c>EpicGamesNetworkLayer.Runtime</c> (<c>EOSRuntime</c>).</summary>
+        private static object GetEosRuntime()
+        {
+            try
+            {
+                object layer = GetEpicNetworkLayer();
+                if (layer == null)
+                    return null;
+                Type t = layer.GetType();
+                return AccessTools.Field(t, "Runtime")?.GetValue(layer)
+                       ?? AccessTools.Field(t, "_runtime")?.GetValue(layer)
+                       ?? AccessTools.Property(t, "Runtime")?.GetValue(layer);
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// 0.2.0: <c>Runtime.Connect</c> (<see cref="EOSConnect"/> wrapper).
+        /// 0.1.x: <c>Runtime.Context</c> (has Connect + LocalUserId).
+        /// </summary>
+        private static object GetEosConnectWrapper()
+        {
+            try
+            {
+                object runtime = GetEosRuntime();
+                if (runtime == null)
+                    return null;
+                Type rt = runtime.GetType();
+
+                // 0.2.0 — EOSRuntime.Connect → EOSConnect
+                object connect = AccessTools.Property(rt, "Connect")?.GetValue(runtime)
+                                 ?? AccessTools.Field(rt, "Connect")?.GetValue(runtime);
+                if (connect != null)
+                    return connect;
+
+                // 0.1.x — EOSRuntime.Context (then .Connect on context)
+                object ctx = AccessTools.Property(rt, "Context")?.GetValue(runtime)
+                             ?? AccessTools.Field(rt, "Context")?.GetValue(runtime);
+                return ctx;
+            }
+            catch { return null; }
+        }
+
+        private static object GetEosContext() => GetEosConnectWrapper();
+
+        private static void EnsureConnectResolver()
+        {
+            if (_connectResolver != null)
+                return;
+
+            // Path A — Fusion ≤0.0.6: static EOSInterfaces.Connect
+            try
+            {
+                Type iface = FindLabFusionType("LabFusion.Network.EpicGames.EOSInterfaces");
+                PropertyInfo connect = iface != null ? AccessTools.Property(iface, "Connect") : null;
+                if (connect != null)
+                {
+                    _connectResolver = () =>
+                    {
+                        try { return connect.GetValue(null) as ConnectInterface; }
+                        catch { return null; }
+                    };
+                    _connectResolverKind = "EOSInterfaces.Connect";
+                }
+            }
+            catch { /* */ }
+
+            // Path B/C — Fusion 0.1.x Context.Connect or 0.2.0 EOSConnect.ConnectInterface
+            if (_connectResolver == null)
+            {
+                _connectResolver = () =>
+                {
+                    try
+                    {
+                        object wrap = GetEosConnectWrapper();
+                        if (wrap == null)
+                            return null;
+
+                        // Already a ConnectInterface?
+                        if (wrap is ConnectInterface direct)
+                            return direct;
+
+                        Type wt = wrap.GetType();
+                        // 0.2.0 EOSConnect.ConnectInterface
+                        object ci = AccessTools.Field(wt, "ConnectInterface")?.GetValue(wrap)
+                                    ?? AccessTools.Property(wt, "ConnectInterface")?.GetValue(wrap);
+                        if (ci is ConnectInterface c0)
+                            return c0;
+
+                        // 0.1.x Context.Connect (property may already be ConnectInterface)
+                        object nested = AccessTools.Property(wt, "Connect")?.GetValue(wrap)
+                                        ?? AccessTools.Field(wt, "Connect")?.GetValue(wrap);
+                        return nested as ConnectInterface;
+                    }
+                    catch { return null; }
+                };
+                _connectResolverKind = "EOSRuntime.Connect/ConnectInterface";
+            }
+
+            if (!_loggedResolver)
+            {
+                _loggedResolver = true;
+                MelonLogger.Msg("Spoofing PID: EOS Connect resolver = " + _connectResolverKind);
             }
         }
 
@@ -655,9 +854,8 @@ namespace MonsterPanel
         {
             try
             {
-                if (!_eosLookupDone) CacheEosConnect();
-                if (_connectProp == null) return null;
-                return _connectProp.GetValue(null) as ConnectInterface;
+                EnsureConnectResolver();
+                return _connectResolver?.Invoke();
             }
             catch { return null; }
         }
@@ -666,11 +864,32 @@ namespace MonsterPanel
         {
             try
             {
+                // 0.2.0: EpicGamesNetworkLayer.LocalUserId → Runtime.Connect.LocalUserId
+                object layer = GetEpicNetworkLayer();
+                if (layer != null)
+                {
+                    object local = AccessTools.Property(layer.GetType(), "LocalUserId")?.GetValue(layer);
+                    if (local is ProductUserId lp && lp.IsValid())
+                        return lp.ToString();
+                }
+
+                object wrap = GetEosConnectWrapper();
+                if (wrap != null)
+                {
+                    object local = AccessTools.Field(wrap.GetType(), "LocalUserId")?.GetValue(wrap)
+                                   ?? AccessTools.Property(wrap.GetType(), "LocalUserId")?.GetValue(wrap);
+                    if (local is ProductUserId puid && puid.IsValid())
+                        return puid.ToString();
+                }
+
                 ConnectInterface connect = GetConnect();
-                if (connect == null) return null;
-                if (connect.GetLoggedInUsersCount() <= 0) return null;
+                if (connect == null)
+                    return null;
+                if (connect.GetLoggedInUsersCount() <= 0)
+                    return null;
                 ProductUserId user = connect.GetLoggedInUserByIndex(0);
-                if (user == null || !user.IsValid()) return null;
+                if (user == null || !user.IsValid())
+                    return null;
                 return user.ToString();
             }
             catch { return null; }
@@ -678,22 +897,44 @@ namespace MonsterPanel
 
         private static void SyncAuthManagerLocalUserId(ProductUserId user)
         {
-            if (user == null || !user.IsValid()) return;
+            if (user == null || !user.IsValid())
+                return;
             try
             {
-                Type layerType = AccessTools.TypeByName("LabFusion.Network.EpicGames.EpicGamesNetworkLayer");
-                Type netInfo = AccessTools.TypeByName("LabFusion.Network.NetworkInfo");
-                if (layerType == null || netInfo == null) return;
+                // 0.2.0: EOSConnect.LocalUserId field
+                object wrap = GetEosConnectWrapper();
+                if (wrap != null)
+                {
+                    MethodInfo setLocal = AccessTools.Method(wrap.GetType(), "SetLocalUser", new[] { typeof(ProductUserId) });
+                    if (setLocal != null)
+                    {
+                        setLocal.Invoke(wrap, new object[] { user });
+                        return;
+                    }
+                    FieldInfo localField = AccessTools.Field(wrap.GetType(), "LocalUserId");
+                    if (localField != null)
+                    {
+                        localField.SetValue(wrap, user);
+                        return;
+                    }
+                    PropertyInfo local = AccessTools.Property(wrap.GetType(), "LocalUserId");
+                    if (local != null && local.CanWrite)
+                    {
+                        local.SetValue(wrap, user);
+                        return;
+                    }
+                }
 
-                object layer = AccessTools.Property(netInfo, "CurrentNetworkLayer")?.GetValue(null);
-                if (layer == null || !layerType.IsInstanceOfType(layer)) return;
-
-                object auth = AccessTools.Field(layerType, "_authManager")?.GetValue(layer);
-                if (auth == null) return;
-
-                PropertyInfo local = AccessTools.Property(auth.GetType(), "LocalUserId");
-                if (local != null && local.CanWrite)
-                    local.SetValue(auth, user);
+                // Legacy ≤0.0.6: EOSAuthManager.LocalUserId on the layer
+                object layer = GetEpicNetworkLayer();
+                if (layer == null)
+                    return;
+                object auth = AccessTools.Field(layer.GetType(), "_authManager")?.GetValue(layer);
+                if (auth == null)
+                    return;
+                PropertyInfo authLocal = AccessTools.Property(auth.GetType(), "LocalUserId");
+                if (authLocal != null && authLocal.CanWrite)
+                    authLocal.SetValue(auth, user);
                 else
                     AccessTools.Field(auth.GetType(), "<LocalUserId>k__BackingField")?.SetValue(auth, user);
             }

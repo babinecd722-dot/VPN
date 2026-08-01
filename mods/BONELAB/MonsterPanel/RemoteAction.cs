@@ -19,7 +19,7 @@ namespace MonsterPanel
     /// <summary>
     /// Remote Action: lobby player list → Kick / Ban (forged host PermissionCommand on EOS).
     /// Kill Host: forge ConnectionRequest with host PlatformID → host SendConnectionDeny(self)
-    /// (Disconnect + TimeoutDisconnect/KickMember). Direct Disconnect SendFromServer kept as backup.
+    /// (Disconnect + TimeoutDisconnect/KickMember). Direct Disconnect via EosDirectSend kept as backup.
     /// BoneMenu: maxElements=0 + deferred rebuild (Quest GUIPool-safe).
     /// </summary>
     internal static class RemoteAction
@@ -31,10 +31,6 @@ namespace MonsterPanel
         private static bool _hooked;
         private static bool _rebuildQueued;
         private static float _nextActionTime;
-
-        // Cached EOSMessenger.SendPacket(ProductUserId, NetMessage, NetworkChannel, bool)
-        private static MethodInfo _eosSendPacket;
-        private static bool _eosSendLookupDone;
 
         public static void Install(Page root)
         {
@@ -269,7 +265,7 @@ namespace MonsterPanel
                 if (ForgeHostSelfDeny(hostPid))
                     ok++;
 
-                // Backup: direct ClientsOnly Disconnect via SendFromServer (+ raw EOS delayed).
+                // Backup: direct ClientsOnly Disconnect via EosDirectSend (+ raw EOS delayed).
                 if (ForgeDisconnectBurst(hostPid, "Kicked from Server"))
                     ok++;
 
@@ -443,11 +439,11 @@ namespace MonsterPanel
                         NativeMessageTag.Disconnect,
                         writer,
                         CommonMessageRoutes.None);
-                    MessageSender.SendFromServer(target, NetworkChannel.Reliable, message);
-                    TryEosSendPacket(target, message, isServerHandled: false);
+                    // 0.2.0: MessageSender.SendFromServer is host-only — EosDirectSend bypasses.
+                    EosDirectSend.SendToPeer(target, message, isServerHandled: false);
                 }
 
-                // Host SmallID overload when delivering to host.
+                // Host SmallID overload when delivering to host (works only if we are host).
                 if (deliverTo == null)
                 {
                     using NetWriter writer = NetWriter.Create();
@@ -457,7 +453,8 @@ namespace MonsterPanel
                         NativeMessageTag.Disconnect,
                         writer,
                         CommonMessageRoutes.None);
-                    MessageSender.SendFromServer(HostSenderId, NetworkChannel.Reliable, message);
+                    try { MessageSender.SendFromServer(HostSenderId, NetworkChannel.Reliable, message); }
+                    catch { /* */ }
                 }
 
                 return true;
@@ -466,64 +463,6 @@ namespace MonsterPanel
             {
                 MelonLogger.Warning("Kill Host Disconnect forge: " + e.Message);
                 return false;
-            }
-        }
-
-        private static void TryEosSendPacket(string platformId, NetMessage message, bool isServerHandled)
-        {
-            try
-            {
-                EnsureEosSendPacket();
-                if (_eosSendPacket == null || message == null) return;
-
-                Type puidType = AccessTools.TypeByName("Epic.OnlineServices.ProductUserId");
-                if (puidType == null) return;
-
-                MethodInfo fromString = AccessTools.Method(puidType, "FromString", new[] { typeof(string) });
-                if (fromString == null) return;
-
-                object userId = fromString.Invoke(null, new object[] { platformId });
-                if (userId == null) return;
-
-                // EOSMessenger.SendPacket(ProductUserId, NetMessage, NetworkChannel, bool)
-                _eosSendPacket.Invoke(null, new object[] { userId, message, NetworkChannel.Reliable, isServerHandled });
-            }
-            catch (Exception e)
-            {
-                MelonLogger.Warning("Kill Host EOS SendPacket: " + e.Message);
-            }
-        }
-
-        private static void EnsureEosSendPacket()
-        {
-            if (_eosSendLookupDone) return;
-            _eosSendLookupDone = true;
-            try
-            {
-                Type messenger = AccessTools.TypeByName("LabFusion.Network.EpicGames.EOSMessenger");
-                if (messenger == null)
-                {
-                    MelonLogger.Warning("Kill Host: EOSMessenger not found.");
-                    return;
-                }
-
-                foreach (MethodInfo m in messenger.GetMethods(BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public))
-                {
-                    if (m.Name != "SendPacket") continue;
-                    ParameterInfo[] p = m.GetParameters();
-                    if (p.Length == 4 && p[1].ParameterType == typeof(NetMessage) && p[3].ParameterType == typeof(bool))
-                    {
-                        _eosSendPacket = m;
-                        break;
-                    }
-                }
-
-                if (_eosSendPacket == null)
-                    MelonLogger.Warning("Kill Host: EOSMessenger.SendPacket not found.");
-            }
-            catch (Exception e)
-            {
-                MelonLogger.Warning("Kill Host EOS lookup: " + e.Message);
             }
         }
 

@@ -19,10 +19,10 @@ namespace MonsterPanel;
 /// server throws MessageExpectedClientException before relay. PermissionCommand
 /// TELEPORT_* also needs lobby Teleportation rights (often OWNER-only).
 ///
-/// Fix — same EOS hole as Kill Host / Remote Action:
-///   MessageSender.SendFromServer(victimPlatformId, PlayerRepTeleport)
-///   has no IsHost check on EpicGamesNetworkLayer. Victim receives ClientsOnly
-///   teleport and runs LocalPlayer.TeleportToPosition.
+/// Fix — client Bring uses <see cref="EosDirectSend"/> because Fusion 0.2.0
+/// gated <c>EpicGamesNetworkLayer.SendFromServer</c> with <c>IsHost</c>.
+/// Direct <c>EOSP2PSender.Send</c> still has no host check; victim receives
+/// ClientsOnly teleport and runs LocalPlayer.TeleportToPosition.
 ///
 /// Host path stays stock PlayerSender.SendPlayerTeleport.
 /// Host-side Harmony patches still help when <b>we</b> are host (relay + no perm gate).
@@ -32,10 +32,6 @@ internal static class TeleportBring
     private const int ClientSendBurst = 3;
 
     private static bool _installed;
-
-    // Cached EOSMessenger.SendPacket(ProductUserId, NetMessage, NetworkChannel, bool)
-    private static MethodInfo _eosSendPacket;
-    private static bool _eosSendLookupDone;
 
     internal static void Install(HarmonyLib.Harmony harmony)
     {
@@ -171,7 +167,7 @@ internal static class TeleportBring
 
     /// <summary>
     /// Bring remote player to <paramref name="land"/>.
-    /// Host: stock SendPlayerTeleport. Client: SendFromServer PlayerRepTeleport (EOS hole).
+    /// Host: stock SendPlayerTeleport. Client: EosDirectSend PlayerRepTeleport (EOS hole).
     /// </summary>
     internal static void BringPlayer(byte targetSid, Vector3 land)
     {
@@ -191,7 +187,7 @@ internal static class TeleportBring
 
         int sent = ForceTeleportRemote(target.PlatformID, land, bursts: ClientSendBurst);
         MelonLogger.Msg(
-            $"[TeleportBring] Client Bring sid={targetSid} → {land} sends={sent} (SendFromServer PlayerRepTeleport)");
+            $"[TeleportBring] Client Bring sid={targetSid} → {land} sends={sent} (EosDirectSend PlayerRepTeleport)");
 
         // Extra assists (MonsterPanel host / lobbies that grant Teleportation).
         try
@@ -218,7 +214,7 @@ internal static class TeleportBring
 
     /// <summary>
     /// Move local player to <paramref name="land"/> facing <paramref name="forward"/>.
-    /// Local Fusion teleport immediately; also SendFromServer to self (same ClientsOnly path
+    /// Local Fusion teleport immediately; also EosDirectSend to self (same ClientsOnly path
     /// a host uses) so pose authority matches server-forced teleports.
     /// </summary>
     internal static void TeleportLocalTo(Vector3 land, Vector3 forward)
@@ -259,7 +255,8 @@ internal static class TeleportBring
     }
 
     /// <summary>
-    /// Deliver PlayerRepTeleport to a specific PlatformID via SendFromServer (no IsHost on EOS).
+    /// Deliver PlayerRepTeleport to a specific PlatformID via EosDirectSend
+    /// (bypasses Fusion 0.2.0 IsHost on SendFromServer).
     /// Victim's PlayerRepTeleportMessage → LocalPlayer.TeleportToPosition.
     /// </summary>
     private static int ForceTeleportRemote(string platformId, Vector3 land, int bursts)
@@ -289,11 +286,10 @@ internal static class TeleportBring
                     NativeMessageTag.PlayerRepTeleport,
                     writer,
                     CommonMessageRoutes.None);
-                MessageSender.SendFromServer(platformId, NetworkChannel.Reliable, message);
-                TryEosSendPacket(platformId, message, isServerHandled: false);
+                EosDirectSend.SendToPeer(platformId, message, isServerHandled: false);
             }
 
-            // SmallID path when target is still in PlayerID map.
+            // SmallID path when target is still in PlayerID map (host MessageSender overload).
             try
             {
                 PlayerID id = PlayerIDManager.GetPlayerID(platformId);
@@ -317,57 +313,6 @@ internal static class TeleportBring
         {
             MelonLogger.Warning($"[TeleportBring] SendTeleportOnce: {ex.Message}");
             return false;
-        }
-    }
-
-    private static void TryEosSendPacket(string platformId, NetMessage message, bool isServerHandled)
-    {
-        try
-        {
-            EnsureEosSendPacket();
-            if (_eosSendPacket == null || message == null) return;
-
-            Type puidType = AccessTools.TypeByName("Epic.OnlineServices.ProductUserId");
-            if (puidType == null) return;
-
-            MethodInfo fromString = AccessTools.Method(puidType, "FromString", new[] { typeof(string) });
-            if (fromString == null) return;
-
-            object userId = fromString.Invoke(null, new object[] { platformId });
-            if (userId == null) return;
-
-            _eosSendPacket.Invoke(null, new object[] { userId, message, NetworkChannel.Reliable, isServerHandled });
-        }
-        catch (Exception ex)
-        {
-            MelonLogger.Warning($"[TeleportBring] EOS SendPacket: {ex.Message}");
-        }
-    }
-
-    private static void EnsureEosSendPacket()
-    {
-        if (_eosSendLookupDone) return;
-        _eosSendLookupDone = true;
-        try
-        {
-            Type messenger = AccessTools.TypeByName("LabFusion.Network.EpicGames.EOSMessenger");
-            if (messenger == null) return;
-
-            foreach (MethodInfo m in messenger.GetMethods(
-                         BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public))
-            {
-                if (m.Name != "SendPacket") continue;
-                ParameterInfo[] p = m.GetParameters();
-                if (p.Length == 4 && p[1].ParameterType == typeof(NetMessage) && p[3].ParameterType == typeof(bool))
-                {
-                    _eosSendPacket = m;
-                    break;
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            MelonLogger.Warning($"[TeleportBring] EOS lookup: {ex.Message}");
         }
     }
 }

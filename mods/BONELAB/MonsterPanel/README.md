@@ -17,13 +17,22 @@ Silent Fusion shield against the **Whoops / far out of bounds** kick (no BoneMen
 
 Uses LabFusion from Checkerb0ard 0.0.5 (EOS), not Steam.
 
-## Anti-Kick / Ban (2.30.43+)
+## Anti-Kick / Ban
 
-Silent (no BoneMenu), **on by default**:
-- Blocks soft Fusion `Disconnect("Kicked/Banned from Server")` while you are in a session
-- Fusion popup: **Protection** / `Kick blocked` or `Ban blocked`
-- Does **not** block: your own leave, host leave / `Lobby closed` (Kill Host, host quit), Tracking join disconnect, OOB, join-deny before session
-- Hard EOS `KickMember` still ends as lobby-close (allowed — avoids ghost/stuck state)
+Shipped in **2.30.43–2.30.44**, **removed in 2.30.46** (OWNER forge + leave reliability preferred over soft Disconnect shields).
+
+## Spoofing PID (Fusion 0.1.x / 0.2.0)
+
+Fusion **0.1.0/0.1.1** release DLL refactored EOS:
+- `EOSInterfaces` removed → `EOSRuntime.Context.Connect` (built only after Fusion LogIn)
+- EOS `DeploymentId`/`ClientSecret` rotated in the binary
+
+Fusion **0.2.0** rewrote the EOS stack again:
+- `EOSRuntime.Context` → `EOSRuntime.Connect` / `EOSConnect` (`ConnectInterface`, `LocalUserId`)
+- Network layer type often `LabFusion.Network.EpicGamesNetworkLayer` with `Runtime`
+
+MonsterPanel **2.30.45+** resolves Connect via `EOSRuntime.Context` (legacy `EOSInterfaces` fallback).
+**2.30.47+** also resolves `Runtime.Connect` / `ConnectInterface` for 0.2.0, waits for a logged-in `LocalUserId`, and retries `CreateDeviceId` on `UnexpectedError`.
 
 ## Host tools unlock (2.30.39+)
 
@@ -42,16 +51,17 @@ After **Kill Aura** in BoneMenu (Fusion only):
   - If you are client (EOS): forged `PermissionCommandRequest` with **Sender = 0** (host SmallID) → host treats it as OWNER and applies Kick/Ban.
 - **Kill Host** (2.30.41+) — button right after Remote Action.
   - **Primary:** forged `ConnectionRequest` with `BackupPlatformID = host` (same ToServer path as Kick). Host hits “already in server” → `SendConnectionDeny(host)` → Disconnect to self + `TimeoutDisconnect`/`KickMember` → lobby collapses.
-  - **Backup:** direct `Disconnect` via `SendFromServer` / EOS `SendPacket` burst.
+  - **Backup:** direct `Disconnect` via `EosDirectSend` (0.2.0) / legacy `SendFromServer` / EOS `SendPacket` burst.
   - No-op if you are already host.
 
 Cooldown ~0.85s between actions to avoid spam / menu thrash.
 
-## Teleport / Bring (2.30.42+)
+## Teleport / Bring (2.30.42+, Fusion 0.2.0 fix in 2.30.47)
 
-Same EOS hole as Kill Host — `SendFromServer` has no IsHost check:
+Fusion **≤0.1.x**: client Bring used `MessageSender.SendFromServer` (no IsHost gate).
+Fusion **0.2.0**: `SendFromServer` is host-only — MonsterPanel uses **`EosDirectSend`** (`Runtime.P2P.Sender`) instead:
 
-- **Bring player to me** (client): `PlayerRepTeleport` delivered to the victim’s PlatformID → they run `LocalPlayer.TeleportToPosition`. No lobby Teleportation permission needed. Host path stays stock `SendPlayerTeleport`.
+- **Bring player to me** (client): `PlayerRepTeleport` to the victim’s PlatformID → they run `LocalPlayer.TeleportToPosition`. No lobby Teleportation permission needed. Host path stays stock `SendPlayerTeleport`.
 - **Teleport to player**: local Fusion teleport + force `PlayerRepTeleport` to self so pose matches server-forced teleports.
 - Assists kept: PermissionCommand + ToTarget relay (help when the host also runs MonsterPanel).
 
