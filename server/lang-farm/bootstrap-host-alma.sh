@@ -7,8 +7,8 @@
 #     | sudo bash
 #
 # Optional overrides:
-#   HOST_LOBBY_NAME='www.​bonelab.​fun' BOT_NICK=coolguy HOST_P2P_PORT=17877
-#   (ASCII '.' + U+200B ZWSP bypass LinkFilter; displays as www.bonelab.fun)
+#   HOST_LOBBY_NAME=$'www\u00b7bonelab\u00b7fun' BOT_NICK=coolguy HOST_P2P_PORT=17877
+#   (U+00B7 middle-dot bypass LinkFilter; reads as www·bonelab·fun)
 set -euo pipefail
 
 if [[ "$(id -u)" -ne 0 ]]; then
@@ -71,9 +71,10 @@ if [[ -d "$BUILD_ROOT/patches" ]]; then
 fi
 
 echo "[bootstrap-host] building + installing from $BUILD_ROOT ..."
+DEFAULT_LOBBY_NAME=$'www\u00b7bonelab\u00b7fun'
 exec env \
-  HOST_LOBBY_NAME="${HOST_LOBBY_NAME:-www.​bonelab.​fun}" \
-  HOST_LOBBY_DESC="${HOST_LOBBY_DESC:-www.​bonelab.​fun}" \
+  HOST_LOBBY_NAME="${HOST_LOBBY_NAME:-$DEFAULT_LOBBY_NAME}" \
+  HOST_LOBBY_DESC="${HOST_LOBBY_DESC:-$DEFAULT_LOBBY_NAME}" \
   HOST_LEVEL_TITLE="${HOST_LEVEL_TITLE:-Halfway Park}" \
   BOT_NICK="${BOT_NICK:-coolguy}" \
   HOST_HOLD_SEC="${HOST_HOLD_SEC:-0}" \

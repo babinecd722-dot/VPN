@@ -870,13 +870,15 @@ internal static class FusionVoiceBot
     {
         string json = ReadLobbyInfoJson(details);
         if (string.IsNullOrEmpty(json) || string.IsNullOrEmpty(nick)) return 0;
-        // Count ZWSP nick + plain "bonelab.fun" (legacy / mixed lobbies).
+        // Count current nick + legacy ZWSP / plain "bonelab.fun" variants.
         int n = CountOccurrences(json, nick);
-        string plain = nick.Replace("\u200b", "", StringComparison.Ordinal);
+        string plain = NormalizeFarmNick(nick);
         if (!string.Equals(plain, nick, StringComparison.Ordinal))
             n += CountOccurrences(json, plain);
         if (!string.Equals(plain, "bonelab.fun", StringComparison.OrdinalIgnoreCase))
             n += CountOccurrences(json, "bonelab.fun");
+        // Legacy ZWSP form still present in some lobbies.
+        n += CountOccurrences(json, "bonelab.\u200bfun");
         return n;
     }
 
@@ -888,13 +890,23 @@ internal static class FusionVoiceBot
             System.Text.RegularExpressions.RegexOptions.IgnoreCase).Count;
     }
 
-    /// <summary>Farm nick match ignoring U+200B LinkFilter bypass chars.</summary>
+    /// <summary>Map LinkFilter-bypass nick forms back to plain bonelab.fun.</summary>
+    private static string NormalizeFarmNick(string user)
+    {
+        if (string.IsNullOrEmpty(user)) return user;
+        return user
+            .Replace("\u200b", "", StringComparison.Ordinal)   // legacy ZWSP
+            .Replace("\u00b7", ".", StringComparison.Ordinal) // middle dot
+            .Replace("\u2024", ".", StringComparison.Ordinal); // one-dot leader
+    }
+
+    /// <summary>Farm nick match ignoring LinkFilter bypass chars (ZWSP / middle-dot).</summary>
     private static bool IsFarmNick(string user)
     {
         if (string.IsNullOrEmpty(user)) return false;
         if (string.Equals(user, BotNick, StringComparison.OrdinalIgnoreCase)) return true;
-        string u = user.Replace("\u200b", "", StringComparison.Ordinal);
-        string mine = BotNick.Replace("\u200b", "", StringComparison.Ordinal);
+        string u = NormalizeFarmNick(user);
+        string mine = NormalizeFarmNick(BotNick);
         return string.Equals(u, mine, StringComparison.OrdinalIgnoreCase)
             || string.Equals(u, "bonelab.fun", StringComparison.OrdinalIgnoreCase);
     }
