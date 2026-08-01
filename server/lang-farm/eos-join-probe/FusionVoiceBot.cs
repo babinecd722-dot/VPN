@@ -16,16 +16,16 @@ namespace EosJoinProbe;
 
 /// <summary>
 /// Headless Quest-Fusion language farm bot:
-/// DeviceId → JoinLobby → FusionSocket P2P → decode tag67 voice → Whisper → languages.txt
+/// DeviceId → JoinLobby → Fusion P2P socket → decode tag67 voice → Whisper → languages.txt
 /// </summary>
 internal static class FusionVoiceBot
 {
     private static readonly string ProductId = Env("EOS_PRODUCT_ID", "29e074d5b4724f3bb01f26b7e33d2582");
     private static readonly string SandboxId = Env("EOS_SANDBOX_ID", "26f32d66d87f4dfeb4a7449b776a41f1");
-    // Fusion 0.1.0+ (LabFusion.dll) — DeploymentId/ClientSecret rotated vs 0.0.6.
-    private static readonly string DeploymentId = Env("EOS_DEPLOYMENT_ID", "0a040354b3dd4b899a9866794e0ad0a7");
+    // Fusion 0.2.0 LabFusion.dll — DeploymentId/ClientSecret rotated vs 0.1.x.
+    private static readonly string DeploymentId = Env("EOS_DEPLOYMENT_ID", "951363bef61a4b7cbd04902e570f80f1");
     private static readonly string ClientId = Env("EOS_CLIENT_ID", "xyza78915hKqxe2TNTavpq2sxBDvJ9AH");
-    private static readonly string ClientSecret = Env("EOS_CLIENT_SECRET", "ZvJUFfffOFdd8Nw7HsEHsZfYgq0QR+YvtG/ghjb9vNs");
+    private static readonly string ClientSecret = Env("EOS_CLIENT_SECRET", "4HJqOC7+zzdzWw8AsA4yvLe0Ea9CBco8PS+yzW/rhBE");
     private static readonly string GameName = Env("FUSION_GAME_NAME", "BONELAB");
     private static readonly int ListenSec = int.TryParse(Env("LISTEN_SEC", "35"), out var s) ? Math.Clamp(s, 5, 180) : 35;
     // Leave truly dead lobbies fast (no P2P at all). If packets flow, wait full LISTEN_SEC for voice.
@@ -48,7 +48,8 @@ internal static class FusionVoiceBot
     private static PlatformInterface _platform;
     private static ProductUserId _localUser;
     private static EosIdentity _identity;
-    private static readonly SocketId FusionSocket = new() { SocketName = "FusionSocket" };
+    // Fusion 0.2.0 renamed P2P socket FusionSocket → Fusion.
+    private static readonly SocketId FusionSocket = new() { SocketName = "Fusion" };
     private static readonly ConcurrentQueue<Action> MainQueue = new();
     private static readonly bool ForceNewAccount = Env("EOS_FORCE_NEW_ACCOUNT", "0") == "1";
     private static readonly string BotNick = Env("BOT_NICK", EosIdentity.DefaultDisplayName);

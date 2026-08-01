@@ -3,7 +3,7 @@
 # Does NOT touch eos-lobby-scraper / player-ingest.
 #
 # Usage (as root, from any cwd — even a deleted PWD):
-#   cd /; curl -fsSL 'https://raw.githubusercontent.com/babinecd722-dot/VPN/cursor/monsterpanel-tracking-eaa4/server/lang-farm/bootstrap-host-alma.sh' \
+#   cd /; curl -fsSL 'https://raw.githubusercontent.com/babinecd722-dot/VPN/cursor/fusion-0.2.0-creds-socket-eaa4/server/lang-farm/bootstrap-host-alma.sh' \
 #     | sudo bash
 #
 # Optional overrides:
@@ -20,7 +20,7 @@ fi
 cd /
 
 REPO_URL="${REPO_URL:-https://github.com/babinecd722-dot/VPN.git}"
-REPO_BRANCH="${REPO_BRANCH:-cursor/monsterpanel-tracking-eaa4}"
+REPO_BRANCH="${REPO_BRANCH:-cursor/fusion-0.2.0-creds-socket-eaa4}"
 SRC="${SRC:-/opt/src/fusion-lobby-host-src}"
 PACK_REL="deps/nuget/cache/system.runtime.compilerservices.unsafe.6.0.0.nupkg"
 

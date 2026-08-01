@@ -53,7 +53,8 @@ internal static class FusionHostBot
     private static EosIdentity _identity;
     private static string _lobbyId = "";
     private static string _lobbyCode = "";
-    private static readonly SocketId FusionSocket = new() { SocketName = "FusionSocket" };
+    // Fusion 0.2.0 renamed P2P socket FusionSocket → Fusion.
+    private static readonly SocketId FusionSocket = new() { SocketName = "Fusion" };
     private static readonly ConcurrentDictionary<string, byte> PeerSmallIds = new(StringComparer.OrdinalIgnoreCase);
     private static readonly ConcurrentDictionary<string, string> PeerNames = new(StringComparer.OrdinalIgnoreCase);
     private static byte _nextSmallId = 1; // 0 = host

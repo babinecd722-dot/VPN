@@ -85,6 +85,9 @@ LEASE_HEARTBEAT_SEC=${LEASE_HEARTBEAT_SEC:-35}
 ADVISORY_LOCK=${ADVISORY_LOCK:-1}
 # 1 = wipe DeviceId and mint a brand-new EOS ProductUserId on next start
 EOS_FORCE_NEW_ACCOUNT=${EOS_FORCE_NEW_ACCOUNT:-0}
+# Fusion 0.2.0 LabFusion.dll credentials (override any stale 0.1.x values)
+EOS_DEPLOYMENT_ID=${EOS_DEPLOYMENT_ID:-951363bef61a4b7cbd04902e570f80f1}
+EOS_CLIENT_SECRET=${EOS_CLIENT_SECRET:-4HJqOC7+zzdzWw8AsA4yvLe0Ea9CBco8PS+yzW/rhBE}
 EOF
   chmod 600 "$DEST/.env"
 elif [[ -f "$ROOT/.env" ]]; then
