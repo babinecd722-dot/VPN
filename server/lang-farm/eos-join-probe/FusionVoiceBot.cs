@@ -22,10 +22,10 @@ internal static class FusionVoiceBot
 {
     private static readonly string ProductId = Env("EOS_PRODUCT_ID", "29e074d5b4724f3bb01f26b7e33d2582");
     private static readonly string SandboxId = Env("EOS_SANDBOX_ID", "26f32d66d87f4dfeb4a7449b776a41f1");
-    // Fusion 0.2.0 LabFusion.dll — DeploymentId/ClientSecret rotated vs 0.1.x.
-    private static readonly string DeploymentId = Env("EOS_DEPLOYMENT_ID", "951363bef61a4b7cbd04902e570f80f1");
+    // Fusion 0.2.1 LabFusion.dll — DeploymentId/ClientSecret rotated vs 0.2.0.
+    private static readonly string DeploymentId = Env("EOS_DEPLOYMENT_ID", "f3fdf691aa6c4004abdb1e19665c1429");
     private static readonly string ClientId = Env("EOS_CLIENT_ID", "xyza78915hKqxe2TNTavpq2sxBDvJ9AH");
-    private static readonly string ClientSecret = Env("EOS_CLIENT_SECRET", "4HJqOC7+zzdzWw8AsA4yvLe0Ea9CBco8PS+yzW/rhBE");
+    private static readonly string ClientSecret = Env("EOS_CLIENT_SECRET", "SWDxYlWWsEgvmD0o3qAm2RMZoSZzOfYo5yvX/uikH94");
     private static readonly string GameName = Env("FUSION_GAME_NAME", "BONELAB");
     private static readonly int ListenSec = int.TryParse(Env("LISTEN_SEC", "35"), out var s) ? Math.Clamp(s, 5, 180) : 35;
     // Leave truly dead lobbies fast (no P2P at all). If packets flow, wait full LISTEN_SEC for voice.

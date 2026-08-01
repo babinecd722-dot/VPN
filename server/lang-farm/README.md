@@ -60,12 +60,12 @@ Does not: playable Unity Fusion world (needs a real BONELAB+Fusion host).
 
 Requires EOS SDK 1.15.5 ApiVersion patches: CreateLobby=8, AddAttribute=1 (`eos-join-probe/patches/`).
 
-## Fusion 0.1.0+ / 0.2.0 credentials
+## Fusion 0.1.0+ / 0.2.x credentials
 
 Checkerb0ard release DLLs rotate EOS `DeploymentId` + `ClientSecret` (trust the DLL,
-not older git tags). Defaults in `EosIdentity` / host / bots / scraper track **0.2.0**.
+not older git tags). Defaults in `EosIdentity` / host / bots / scraper track **0.2.1**.
 
-- **0.2.0** also renames P2P socket `FusionSocket` → `Fusion` (host + bots must match).
+- **0.2.0+** P2P socket is `Fusion` (not `FusionSocket`). **0.2.1** rotates DeploymentId/ClientSecret again.
 - P2P wire still prefixes every datagram with `KindSingle=0` / `KindFragment=1`
   (`FusionP2PWire`). Without this, clients mis-parse `ConnectionRequest` (tag=1)
   as a fragment and joins die.

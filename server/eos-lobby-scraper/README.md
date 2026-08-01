@@ -49,7 +49,7 @@ sudo ./install-vps.sh
 | `SCRAPE_INTERVAL_SEC` | `60` |
 | `SCRAPE_ONCE` | `0` (`1` = single pass) |
 | `FUSION_GAME_NAME` | `BONELAB` |
-| `EOS_*` | Fusion Quest credentials (defaults match LabFusion **0.2.0** DLL — DeploymentId/ClientSecret rotated vs 0.1.x) |
+| `EOS_*` | Fusion Quest credentials (defaults match LabFusion **0.2.1** DLL — DeploymentId/ClientSecret rotated vs 0.2.0) |
 
 ## Notes
 

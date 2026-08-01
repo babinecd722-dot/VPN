@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-shot Alma/VPS bootstrap: clone branch → unpack EOS pack → overlay latest sources → systemd.
 # Usage (as root):
-#   curl -fsSL 'https://cdn.jsdelivr.net/gh/babinecd722-dot/VPN@cursor/fusion-0.2.0-creds-socket-eaa4/server/eos-lobby-scraper/bootstrap-alma.sh' \
+#   curl -fsSL 'https://cdn.jsdelivr.net/gh/babinecd722-dot/VPN@cursor/fusion-0.2.1-creds-eaa4/server/eos-lobby-scraper/bootstrap-alma.sh' \
 #     | sudo env POSTGRES_DSN='postgresql://...' SCRAPE_INTERVAL_SEC=10 GHOST_TTL_SEC=90 LEASE_HEARTBEAT_SEC=35 OFFLINE_MISS_STREAK=1 bash
 # Or keep existing DSN:
 #   set -a; source /opt/eos-lobby-scraper/.env; set +a
@@ -19,7 +19,7 @@ cd /
 : "${POSTGRES_DSN:?Set POSTGRES_DSN before running}"
 
 REPO_URL="${REPO_URL:-https://github.com/babinecd722-dot/VPN.git}"
-REPO_BRANCH="${REPO_BRANCH:-cursor/fusion-0.2.0-creds-socket-eaa4}"
+REPO_BRANCH="${REPO_BRANCH:-cursor/fusion-0.2.1-creds-eaa4}"
 SRC="${SRC:-/opt/src/eos-lobby-scraper-src}"
 PACK_REL="deps/nuget/cache/system.runtime.compilerservices.unsafe.6.0.0.nupkg"
 

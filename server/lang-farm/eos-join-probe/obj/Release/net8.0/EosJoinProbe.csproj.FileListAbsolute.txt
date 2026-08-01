@@ -1,0 +1,5 @@
+/workspace/server/lang-farm/eos-join-probe/obj/Release/net8.0/EosJoinProbe.GeneratedMSBuildEditorConfig.editorconfig
+/workspace/server/lang-farm/eos-join-probe/obj/Release/net8.0/EosJoinProbe.AssemblyInfoInputs.cache
+/workspace/server/lang-farm/eos-join-probe/obj/Release/net8.0/EosJoinProbe.AssemblyInfo.cs
+/workspace/server/lang-farm/eos-join-probe/obj/Release/net8.0/EosJoinProbe.csproj.CoreCompileInputs.cache
+/workspace/server/lang-farm/eos-join-probe/obj/Release/net8.0/EosJoinProbe.sourcelink.json

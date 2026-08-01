@@ -106,11 +106,11 @@ internal sealed class EosIdentity
             ProductId = Env("EOS_PRODUCT_ID", "29e074d5b4724f3bb01f26b7e33d2582"),
             SandboxId = Env("EOS_SANDBOX_ID", "26f32d66d87f4dfeb4a7449b776a41f1"),
             // Fusion 0.1.0+ release DLL credentials (git tag still ships old values).
-            DeploymentId = Env("EOS_DEPLOYMENT_ID", "951363bef61a4b7cbd04902e570f80f1"),
+            DeploymentId = Env("EOS_DEPLOYMENT_ID", "f3fdf691aa6c4004abdb1e19665c1429"),
             ClientCredentials = new ClientCredentials
             {
                 ClientId = Env("EOS_CLIENT_ID", "xyza78915hKqxe2TNTavpq2sxBDvJ9AH"),
-                ClientSecret = Env("EOS_CLIENT_SECRET", "4HJqOC7+zzdzWw8AsA4yvLe0Ea9CBco8PS+yzW/rhBE"),
+                ClientSecret = Env("EOS_CLIENT_SECRET", "SWDxYlWWsEgvmD0o3qAm2RMZoSZzOfYo5yvX/uikH94"),
             },
             Flags = PlatformFlags.DisableOverlay | PlatformFlags.DisableSocialOverlay,
             TickBudgetInMilliseconds = 0,
