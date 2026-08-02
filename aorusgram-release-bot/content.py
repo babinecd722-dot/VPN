@@ -88,16 +88,13 @@ EN_QUOTE = """🌍 Works where Telegram doesn't
 — Download accelerator, account backup and login by backup"""
 
 
-SOURCES_LABEL = "Источники / Sources"
-
-
 def _bi(text: str) -> str:
     """Wrap text in bold+italic entities."""
     return f"<b><i>{text}</i></b>"
 
 
-def _build(quote: str, header: str, intro: str, support_label: str) -> str:
-    download_line = f'📥 {SOURCES_LABEL}: <a href="{DOWNLOAD_JSON_URL}">{DOWNLOAD_JSON_URL}</a>'
+def _build(quote: str, header: str, intro: str, sources_label: str, support_label: str) -> str:
+    download_line = f'📥 {sources_label}: <a href="{DOWNLOAD_JSON_URL}">{DOWNLOAD_JSON_URL}</a>'
     support_line = f'💬 {support_label}: <a href="{SUPPORT_URL}">{SUPPORT_HANDLE}</a>'
     return (
         f"{_bi(header)}\n\n"
@@ -112,6 +109,7 @@ RU_MESSAGE = _build(
     RU_QUOTE,
     "🎉 ДОЛГОЖДАННЫЙ РЕЛИЗ AORUSGRAM!",
     "👨‍💻 Мы долго к этому шли — и наконец готовы представить наш лучший форк Telegram.",
+    "Источники",
     "Чат поддержки",
 )
 
@@ -119,6 +117,7 @@ EN_MESSAGE = _build(
     EN_QUOTE,
     "🇺🇸 AORUSGRAM IS OUT!",
     "👨‍💻 We've been building this for a long time — here is our best Telegram fork.",
+    "Sources",
     "Support chat",
 )
 
