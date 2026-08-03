@@ -1,0 +1,1772 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Net.Http;
+using System.Text;
+using System.Threading.Tasks;
+using BoneLib.BoneMenu;
+using HarmonyLib;
+using LabFusion.Entities;
+using LabFusion.Menu;
+using LabFusion.Marrow.Proxies;
+using LabFusion.Network;
+using LabFusion.Player;
+using LabFusion.UI.Popups;
+using LabFusion.Utilities;
+using MelonLoader;
+using UnityEngine;
+
+namespace MonsterPanel
+{
+    /// <summary>
+    /// Friend-style presence tracking for Fusion players.
+    /// One-shot /v1/track when opening Tracking (no live session ticking / menu thrash).
+    /// On Fusion enter: one background check → "nick is online" popups (no BoneMenu work).
+    /// </summary>
+    internal static class Tracking
+    {
+        private const string ListName = "tracking.json";
+        private const string ApiUrl = "http://62.109.21.131:8787";
+        private const string ApiKey = "e63d7b2ae9d5006d109712e6c3ea2592611f563e380724de";
+        private const float IdlePollIntervalSec = 15f; // presence watch (/v1/track cooldown is 10s)
+        private const float RebuildMinIntervalSec = 2.5f;
+        private const float OpenPollDelaySec = 1.5f;
+        private const float JoinNotifyDelayWithSpoofSec = 4.0f;
+        private const float JoinNotifyDelayNoSpoofSec = 0.8f;
+        private const int JoinNotifyMaxNamesInDigest = 8;
+        private const int HttpTimeoutSeconds = 8;
+        private const int MaxTracked = 32;
+        // BoneLib GUIPool Function prefab starts at _size=8; Grow only when inactive==0.
+        // Header uses 3 Function rows → keep friend buttons ≤4 so draw never exceeds pool.
+        private const int MaxVisibleFriends = 4;
+        private const string NotifyTag = "Tracking";
+
+        private static bool _enabled = true;
+        private static bool _hooked;
+        private static bool _menuHooked;
+        private static bool _joinHooked;
+        private static bool _polling;
+        private static bool _rebuildQueued;
+        private static bool _detailQueued;
+        private static bool _openPollQueued;
+        private static bool _joinNotifyRunning;
+        private static bool _fusionAlertDone;
+        private static bool _onlineWatchSeeded;
+        private static float _idlePollCd;
+        private static float _lastRebuildAt = -999f;
+        private static string _lastError = "";
+        private static readonly HashSet<string> _alertedOnline = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private static string _detailQueuedPid = "";
+        private static string _snapFingerprint = "";
+
+        private static readonly object Gate = new object();
+        private static readonly List<TrackedEntry> Entries = new List<TrackedEntry>();
+        private static readonly Dictionary<string, TrackSnapshot> Snapshots =
+            new Dictionary<string, TrackSnapshot>(StringComparer.OrdinalIgnoreCase);
+        private static readonly HttpClient Http = CreateHttp();
+
+        private static Page _rootPage;
+        private static Page _detailPage;
+        private static string _detailPid = "";
+        private static int _lastHttpStatus;
+        private static float _apiReadyAt;
+        private static float _retryAfterSec;
+
+        private struct TrackedEntry
+        {
+            public string Pid;
+            public string Name;
+            public string AddedAt;
+        }
+
+        private sealed class TrackSnapshot
+        {
+            public bool Found;
+            public bool Online;
+            public string Name = "";
+            public string Status = "UNKNOWN";
+            public string Server = "";
+            public string Map = "";
+            public string Language = "";
+            public string LobbyCode = "";
+            public string LastSeenAt = "";
+            public int? SessionSec;
+            public int? OfflineSec;
+            public DateTime FetchedUtc;
+        }
+
+        public static void Init(HarmonyLib.Harmony harmony)
+        {
+            LoadList();
+            InstallFusionProfileHook(harmony);
+            InstallJoinHooks();
+            MelonLogger.Msg($"Tracking: enabled={_enabled} tracked={Entries.Count} api={ApiUrl} (one-shot + join alerts)");
+        }
+
+        public static void InstallMenu(Page root)
+        {
+            _rootPage = root.CreatePage("Tracking", new Color(0.2f, 0.85f, 0.95f), 0, true);
+            _detailPage = _rootPage.CreatePage("Friend", new Color(0.3f, 0.9f, 0.55f), 0, false);
+            if (!_menuHooked)
+            {
+                Menu.OnPageOpened += (Action<Page>)OnPageOpened;
+                _menuHooked = true;
+            }
+            RebuildMenu();
+        }
+
+        /// <summary>
+        /// Slow presence watch (also inside Fusion lobbies) — popups only, no menu thrash.
+        /// </summary>
+        public static void Tick()
+        {
+            if (!_enabled || Entries.Count == 0) return;
+            if (_polling || Time.unscaledTime < _apiReadyAt) return;
+            if (IsTrackingMenuOpen()) return; // menu uses one-shot open poll / Refresh only
+            _idlePollCd -= Time.unscaledDeltaTime;
+            if (_idlePollCd > 0f) return;
+            _idlePollCd = IdlePollIntervalSec;
+            MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: false));
+        }
+
+        private static bool IsInFusionLobby()
+        {
+            try { return NetworkInfo.HasServer; }
+            catch { return false; }
+        }
+
+        private static bool IsTrackingMenuOpen()
+        {
+            if (_rootPage == null) return false;
+            try
+            {
+                Page cur = Menu.CurrentPage;
+                return cur == _rootPage || cur == _detailPage;
+            }
+            catch { return false; }
+        }
+
+        private static void InstallJoinHooks()
+        {
+            if (_joinHooked) return;
+            try
+            {
+                if (AccessTools.TypeByName("LabFusion.Utilities.MultiplayerHooking") == null)
+                    return;
+                MultiplayerHooking.OnJoinedServer += OnEnteredFusion;
+                MultiplayerHooking.OnStartedServer += OnEnteredFusion;
+                MultiplayerHooking.OnDisconnected += OnLeftFusion;
+                _joinHooked = true;
+                MelonLogger.Msg("Tracking: hooked Fusion join/start/disconnect for online alerts");
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Tracking join hook: " + e.Message);
+            }
+        }
+
+        private static void OnLeftFusion()
+        {
+            _fusionAlertDone = false;
+            _joinNotifyRunning = false;
+            MelonLogger.Msg("Tracking: Fusion left — online alert armed for next join");
+        }
+
+        private static void OnEnteredFusion()
+        {
+            if (!_enabled) return;
+            if (_fusionAlertDone || _joinNotifyRunning) return;
+            int count;
+            lock (Gate) { count = Entries.Count; }
+            if (count == 0) return;
+            // Lock BEFORE Start — Joined+Started can fire same frame.
+            _fusionAlertDone = true;
+            MelonLogger.Msg("Tracking: Fusion enter — scheduling online alerts (once)");
+            MelonCoroutines.Start(OnlineAlertRoutine());
+        }
+
+        /// <summary>
+        /// Background DB check on enter — popups only, never touches BoneMenu (avoids OOB).
+        /// </summary>
+        private static IEnumerator OnlineAlertRoutine()
+        {
+            if (_joinNotifyRunning) yield break;
+            _joinNotifyRunning = true;
+            // _fusionAlertDone already set in OnEnteredFusion
+
+            try
+            {
+                bool spoofOn = false;
+                try { spoofOn = PidSpoof.Enabled; } catch { /* */ }
+                float wait = spoofOn ? JoinNotifyDelayWithSpoofSec : JoinNotifyDelayNoSpoofSec;
+                MelonLogger.Msg("Tracking: join alert wait " + wait.ToString("0.0", CultureInfo.InvariantCulture) + "s");
+                float t = 0f;
+                while (t < wait)
+                {
+                    t += Time.unscaledDeltaTime;
+                    yield return null;
+                }
+
+                float busy = 0f;
+                while ((_polling || Time.unscaledTime < _apiReadyAt) && busy < 25f)
+                {
+                    busy += Time.unscaledDeltaTime;
+                    yield return null;
+                }
+
+                // Inline fetch — no nested coroutine, no menu refresh.
+                List<string> pids;
+                lock (Gate)
+                {
+                    pids = new List<string>(Entries.Count);
+                    for (int i = 0; i < Entries.Count; i++)
+                        pids.Add(Entries[i].Pid);
+                }
+
+                if (pids.Count > 0)
+                {
+                    _polling = true;
+                    try
+                    {
+                        for (int attempt = 0; attempt < 5; attempt++)
+                        {
+                            while (Time.unscaledTime < _apiReadyAt)
+                                yield return null;
+                            Task<string> task = Task.Run(() => FetchTrackJson(pids));
+                            while (!task.IsCompleted) yield return null;
+                            try
+                            {
+                                string json = task.Result;
+                                if (json != null)
+                                {
+                                    ApplyTrackJson(json);
+                                    _lastError = "";
+                                    _apiReadyAt = Time.unscaledTime + 10f;
+                                    break;
+                                }
+                            }
+                            catch (Exception e)
+                            {
+                                MelonLogger.Warning("Tracking alert poll: " + e.Message);
+                            }
+                            if (_lastHttpStatus == 429)
+                            {
+                                float delay = _retryAfterSec > 0.1f ? _retryAfterSec : 2.5f;
+                                _apiReadyAt = Time.unscaledTime + delay;
+                                continue;
+                            }
+                            break;
+                        }
+                    }
+                    finally { _polling = false; }
+                }
+
+                var online = new List<string>();
+                lock (Gate)
+                {
+                    foreach (var e in Entries)
+                    {
+                        if (!Snapshots.TryGetValue(e.Pid, out var snap) || snap == null) continue;
+                        if (!snap.Found || !snap.Online) continue;
+                        string nick = !string.IsNullOrWhiteSpace(snap.Name) ? snap.Name : e.Name;
+                        if (string.IsNullOrWhiteSpace(nick)) nick = ShortPid(e.Pid);
+                        online.Add(nick);
+                    }
+                }
+
+                if (online.Count == 0)
+                {
+                    MelonLogger.Msg("Tracking: join alert — nobody online (http=" + _lastHttpStatus + ")");
+                    yield break;
+                }
+
+                MelonLogger.Msg("Tracking: join alert — " + online.Count + " online");
+                // Fusion-style popups (same as NetworkNotifications); mark so watch won't re-spam.
+                NotifyOnlineDigest(online);
+                MarkAlertedOnlineFromEntries();
+            }
+            finally
+            {
+                _joinNotifyRunning = false;
+            }
+        }
+
+        private static void MarkAlertedOnlineFromEntries()
+        {
+            lock (Gate)
+            {
+                foreach (var e in Entries)
+                {
+                    if (!Snapshots.TryGetValue(e.Pid, out var snap) || snap == null) continue;
+                    if (snap.Found && snap.Online)
+                        _alertedOnline.Add(e.Pid);
+                }
+                _onlineWatchSeeded = true;
+            }
+        }
+
+        private static void NotifyOnlineDigest(List<string> online)
+        {
+            if (online == null || online.Count == 0) return;
+
+            // Official Fusion style: one short SUCCESS popup, Tag + SaveToMenu=false.
+            if (online.Count == 1)
+            {
+                NotifyFriendOnline(online[0]);
+                return;
+            }
+
+            var sb = new StringBuilder();
+            int n = Math.Min(online.Count, JoinNotifyMaxNamesInDigest);
+            for (int i = 0; i < n; i++)
+            {
+                if (i > 0) sb.Append(", ");
+                sb.Append(SafeMenu(online[i], 18));
+            }
+            if (online.Count > n)
+                sb.Append(" +").Append(online.Count - n).Append(" more");
+
+            string title = online.Count + " Friends Online";
+            string msg = sb.ToString() + " are online.";
+            MelonLogger.Msg("Tracking: " + title + " — " + msg);
+            try
+            {
+                Notifier.Send(new Notification
+                {
+                    Title = title,
+                    Message = msg,
+                    Tag = NotifyTag,
+                    SaveToMenu = false,
+                    ShowPopup = true,
+                });
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Tracking notify failed: " + e.Message);
+            }
+        }
+
+        private static void NotifyFriendOnline(string name)
+        {
+            string nick = SafeMenu(name, 22);
+            // Exact LabFusion SendPlayerJoinedNotification shape (Title/Message/Tag/SaveToMenu).
+            try
+            {
+                Notifier.Send(new Notification
+                {
+                    Title = nick + " Online",
+                    Message = nick + " is online.",
+                    Tag = NotifyTag,
+                    SaveToMenu = false,
+                    ShowPopup = true,
+                });
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Tracking notify failed: " + e.Message);
+            }
+        }
+
+        /// <summary>
+        /// After a successful /v1/track apply: notify only offline→online transitions
+        /// (seed silently on first poll so we don't spam everyone already online).
+        /// </summary>
+        private static void ProcessOnlineWatchAlerts()
+        {
+            var newlyOnline = new List<string>();
+            lock (Gate)
+            {
+                for (int i = 0; i < Entries.Count; i++)
+                {
+                    var e = Entries[i];
+                    bool online = Snapshots.TryGetValue(e.Pid, out var snap) && snap != null && snap.Found && snap.Online;
+                    if (!online)
+                    {
+                        _alertedOnline.Remove(e.Pid);
+                        continue;
+                    }
+                    if (!_onlineWatchSeeded)
+                    {
+                        _alertedOnline.Add(e.Pid);
+                        continue;
+                    }
+                    if (_alertedOnline.Add(e.Pid))
+                    {
+                        string nick = !string.IsNullOrWhiteSpace(snap.Name) ? snap.Name : e.Name;
+                        if (string.IsNullOrWhiteSpace(nick)) nick = ShortPid(e.Pid);
+                        newlyOnline.Add(nick);
+                    }
+                }
+                // Drop alerts for friends no longer tracked.
+                if (_alertedOnline.Count > 0)
+                {
+                    var drop = new List<string>();
+                    foreach (var pid in _alertedOnline)
+                    {
+                        bool tracked = false;
+                        for (int i = 0; i < Entries.Count; i++)
+                        {
+                            if (string.Equals(Entries[i].Pid, pid, StringComparison.OrdinalIgnoreCase))
+                            { tracked = true; break; }
+                        }
+                        if (!tracked) drop.Add(pid);
+                    }
+                    for (int i = 0; i < drop.Count; i++)
+                        _alertedOnline.Remove(drop[i]);
+                }
+                _onlineWatchSeeded = true;
+            }
+
+            for (int i = 0; i < newlyOnline.Count; i++)
+                NotifyFriendOnline(newlyOnline[i]);
+        }
+
+        public static bool IsTracked(string pid)
+        {
+            if (string.IsNullOrWhiteSpace(pid)) return false;
+            lock (Gate)
+            {
+                for (int i = 0; i < Entries.Count; i++)
+                    if (string.Equals(Entries[i].Pid, pid, StringComparison.OrdinalIgnoreCase))
+                        return true;
+            }
+            return false;
+        }
+
+        public static void Add(string pid, string name)
+        {
+            pid = (pid ?? "").Trim();
+            if (pid.Length == 0) return;
+            name = string.IsNullOrWhiteSpace(name) ? pid : name.Trim();
+
+            lock (Gate)
+            {
+                for (int i = 0; i < Entries.Count; i++)
+                {
+                    if (!string.Equals(Entries[i].Pid, pid, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    var e = Entries[i];
+                    e.Name = name;
+                    Entries[i] = e;
+                    SaveList_NoLock();
+                    Notify("Tracking", SafeMenu(name) + " already tracked");
+                    RequestMenuRefresh();
+                    return;
+                }
+
+                if (Entries.Count >= MaxTracked)
+                {
+                    NotifyError("Tracking full", "Max " + MaxTracked + " players");
+                    return;
+                }
+
+                Entries.Add(new TrackedEntry
+                {
+                    Pid = pid,
+                    Name = name,
+                    AddedAt = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
+                });
+                SaveList_NoLock();
+            }
+
+            Notify("Added to Tracking", SafeMenu(name));
+            MelonLogger.Msg("Tracking: add " + pid + " (" + name + ")");
+            // Don't force an immediate full poll+rebuild (bounds crash in live lobbies).
+            // Cache row appears on next safe rebuild; presence fills on the next gentle Tick poll.
+            if (IsTrackingMenuOpen())
+                ScheduleRebuild(poll: false, force: false);
+            else
+                _idlePollCd = Math.Min(_idlePollCd, 3f);
+        }
+
+        public static void Remove(string pid)
+        {
+            if (string.IsNullOrWhiteSpace(pid)) return;
+            string removed = pid;
+            lock (Gate)
+            {
+                for (int i = Entries.Count - 1; i >= 0; i--)
+                {
+                    if (!string.Equals(Entries[i].Pid, pid, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    removed = Entries[i].Name;
+                    Entries.RemoveAt(i);
+                }
+                Snapshots.Remove(pid);
+                SaveList_NoLock();
+            }
+            Notify("Removed from Tracking", SafeMenu(removed));
+            if (!string.IsNullOrEmpty(_detailPid) &&
+                string.Equals(_detailPid, pid, StringComparison.OrdinalIgnoreCase))
+            {
+                _detailPid = "";
+                try { if (_rootPage != null) Menu.OpenPage(_rootPage); } catch { /* */ }
+            }
+            RequestMenuRefresh();
+        }
+
+        private static IEnumerator PollRoutine(bool force, bool refreshMenu = true)
+        {
+            float waitOther = 0f;
+            while (_polling && waitOther < 15f)
+            {
+                waitOther += Time.unscaledDeltaTime;
+                yield return null;
+            }
+            if (_polling) yield break;
+
+            if (!force && Time.unscaledTime < _apiReadyAt)
+                yield break;
+
+            List<string> pids;
+            lock (Gate)
+            {
+                if (Entries.Count == 0) yield break;
+                pids = new List<string>(Entries.Count);
+                for (int i = 0; i < Entries.Count; i++)
+                    pids.Add(Entries[i].Pid);
+            }
+
+            _polling = true;
+            try
+            {
+                int attempts = force ? 4 : 1;
+                for (int attempt = 0; attempt < attempts; attempt++)
+                {
+                    while (Time.unscaledTime < _apiReadyAt)
+                        yield return null;
+
+                    Task<string> task = Task.Run(() => FetchTrackJson(pids));
+                    while (!task.IsCompleted) yield return null;
+
+                    try
+                    {
+                        string json = task.Result;
+                        if (json != null)
+                        {
+                            ApplyTrackJson(json);
+                            _lastError = "";
+                            _apiReadyAt = Time.unscaledTime + 10f;
+                            try { ProcessOnlineWatchAlerts(); } catch (Exception ex)
+                            {
+                                MelonLogger.Warning("Tracking online watch: " + ex.Message);
+                            }
+                            break;
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        _lastError = e.Message;
+                        MelonLogger.Warning("Tracking poll: " + e.Message);
+                    }
+
+                    if (_lastHttpStatus == 429 && attempt + 1 < attempts)
+                    {
+                        float delay = _retryAfterSec > 0.1f ? _retryAfterSec : 2.5f;
+                        _apiReadyAt = Time.unscaledTime + delay;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            finally
+            {
+                _polling = false;
+                // Never thrash friend-detail RemoveAll on poll (session_sec live updates → Quest bounds).
+                // Root list rebuild only if presence fingerprint changed while list page is open.
+                if (refreshMenu)
+                {
+                    string fp = ComputeSnapFingerprint();
+                    bool changed = !string.Equals(fp, _snapFingerprint, StringComparison.Ordinal);
+                    _snapFingerprint = fp;
+                    if (changed)
+                    {
+                        Page cur = null;
+                        try { cur = Menu.CurrentPage; } catch { /* */ }
+                        if (cur == _rootPage)
+                            ScheduleRebuild(poll: false, force: false);
+                        // detail page stays frozen on the snapshot from OpenFriend / last Refresh
+                    }
+                }
+            }
+        }
+
+        private static string ComputeSnapFingerprint()
+        {
+            lock (Gate)
+            {
+                var sb = new StringBuilder(Entries.Count * 48);
+                for (int i = 0; i < Entries.Count; i++)
+                {
+                    var e = Entries[i];
+                    sb.Append(e.Pid).Append('|');
+                    if (Snapshots.TryGetValue(e.Pid, out var s) && s != null)
+                    {
+                        sb.Append(s.Online ? '1' : '0').Append('|')
+                          .Append(s.Status ?? "").Append('|')
+                          .Append(s.LobbyCode ?? "").Append('|')
+                          .Append(s.Server ?? "").Append(';');
+                    }
+                    else sb.Append("?;");
+                }
+                return sb.ToString();
+            }
+        }
+
+        private static string FetchTrackJson(List<string> pids)
+        {
+            var sb = new StringBuilder(128 + pids.Count * 40);
+            sb.Append("{\"pids\":[");
+            for (int i = 0; i < pids.Count; i++)
+            {
+                if (i > 0) sb.Append(',');
+                sb.Append('"').Append(JsonEscape(pids[i])).Append('"');
+            }
+            sb.Append("]}");
+
+            using var req = new HttpRequestMessage(HttpMethod.Post, Combine(ApiUrl, "/v1/track"));
+            req.Headers.TryAddWithoutValidation("Authorization", "Bearer " + ApiKey);
+            req.Content = new StringContent(sb.ToString(), Encoding.UTF8, "application/json");
+            using HttpResponseMessage resp = Http.Send(req);
+            string body = resp.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            _lastHttpStatus = (int)resp.StatusCode;
+            _retryAfterSec = 0f;
+            if (!resp.IsSuccessStatusCode)
+            {
+                if (_lastHttpStatus == 429)
+                    _retryAfterSec = ParseRetryAfter(body, resp);
+                _lastError = "HTTP " + _lastHttpStatus + " " + TrimOneLine(body, 120);
+                MelonLogger.Warning("Tracking: " + _lastError);
+                return null;
+            }
+            return body;
+        }
+
+        private static float ParseRetryAfter(string body, HttpResponseMessage resp)
+        {
+            try
+            {
+                if (resp.Headers.RetryAfter?.Delta != null)
+                    return (float)resp.Headers.RetryAfter.Delta.Value.TotalSeconds + 0.2f;
+            }
+            catch { /* */ }
+            // detail: "track cooldown 7.4s"
+            if (!string.IsNullOrEmpty(body))
+            {
+                int i = body.IndexOf("cooldown ", StringComparison.OrdinalIgnoreCase);
+                if (i >= 0)
+                {
+                    i += "cooldown ".Length;
+                    int j = i;
+                    while (j < body.Length && (char.IsDigit(body[j]) || body[j] == '.')) j++;
+                    if (j > i && float.TryParse(body.Substring(i, j - i), NumberStyles.Float, CultureInfo.InvariantCulture, out float sec))
+                        return sec + 0.3f;
+                }
+            }
+            return 2.5f;
+        }
+
+        private static void ApplyTrackJson(string json)
+        {
+            // Minimal JSON walk — avoid Newtonsoft dependency in MelonLoader.
+            int playersIdx = json.IndexOf("\"players\"", StringComparison.Ordinal);
+            if (playersIdx < 0) return;
+            int arr = json.IndexOf('[', playersIdx);
+            if (arr < 0) return;
+
+            int i = arr + 1;
+            var now = DateTime.UtcNow;
+            lock (Gate)
+            {
+                while (i < json.Length)
+                {
+                    while (i < json.Length && (json[i] == ',' || char.IsWhiteSpace(json[i]))) i++;
+                    if (i >= json.Length || json[i] == ']') break;
+                    if (json[i] != '{') { i++; continue; }
+                    int start = i;
+                    int depth = 0;
+                    for (; i < json.Length; i++)
+                    {
+                        if (json[i] == '{') depth++;
+                        else if (json[i] == '}')
+                        {
+                            depth--;
+                            if (depth == 0) { i++; break; }
+                        }
+                    }
+                    string obj = json.Substring(start, i - start);
+                    string pid = JsonString(obj, "pid");
+                    if (string.IsNullOrEmpty(pid)) continue;
+
+                    var snap = new TrackSnapshot
+                    {
+                        Found = JsonBool(obj, "found", false),
+                        Online = JsonBool(obj, "online", false),
+                        Name = JsonString(obj, "name") ?? "",
+                        Status = JsonString(obj, "status") ?? "UNKNOWN",
+                        Server = JsonString(obj, "server") ?? "",
+                        Map = JsonString(obj, "server_map") ?? "",
+                        Language = JsonString(obj, "language") ?? "",
+                        LobbyCode = JsonString(obj, "lobby_code") ?? "",
+                        LastSeenAt = JsonString(obj, "last_seen_at") ?? "",
+                        SessionSec = JsonInt(obj, "session_sec"),
+                        OfflineSec = JsonInt(obj, "offline_sec"),
+                        FetchedUtc = now,
+                    };
+
+                    // Keep local nickname if API name empty
+                    if (string.IsNullOrWhiteSpace(snap.Name))
+                    {
+                        for (int e = 0; e < Entries.Count; e++)
+                            if (string.Equals(Entries[e].Pid, pid, StringComparison.OrdinalIgnoreCase))
+                            {
+                                snap.Name = Entries[e].Name;
+                                break;
+                            }
+                    }
+                    else
+                    {
+                        for (int e = 0; e < Entries.Count; e++)
+                        {
+                            if (!string.Equals(Entries[e].Pid, pid, StringComparison.OrdinalIgnoreCase))
+                                continue;
+                            var ent = Entries[e];
+                            ent.Name = snap.Name;
+                            Entries[e] = ent;
+                        }
+                    }
+
+                    Snapshots[pid] = snap;
+                }
+                SaveList_NoLock();
+            }
+        }
+
+        private static void OnPageOpened(Page opened)
+        {
+            if (opened != _rootPage) return;
+            // Cache-only first paint. Never poll+RemoveAll in the same frame as open (Quest bounds/GUIPool).
+            ScheduleRebuild(poll: false, force: true);
+            QueueDelayedOpenPoll();
+        }
+
+        private static void QueueDelayedOpenPoll()
+        {
+            if (_openPollQueued || !_enabled || Entries.Count == 0) return;
+            _openPollQueued = true;
+            MelonCoroutines.Start(DelayedOpenPollRoutine());
+        }
+
+        private static IEnumerator DelayedOpenPollRoutine()
+        {
+            float t = 0f;
+            while (t < OpenPollDelaySec)
+            {
+                t += Time.unscaledDeltaTime;
+                yield return null;
+            }
+            _openPollQueued = false;
+            if (!IsTrackingMenuOpen()) yield break;
+            if (_polling || Time.unscaledTime < _apiReadyAt) yield break;
+            // Fetch in background; rebuild only if presence fingerprint changes.
+            MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: true));
+        }
+
+        private static void RequestMenuRefresh()
+        {
+            if (_rootPage == null) return;
+            Page cur = null;
+            try { cur = Menu.CurrentPage; } catch { /* */ }
+            if (cur == _detailPage && !string.IsNullOrEmpty(_detailPid))
+            {
+                ScheduleDetailFill(_detailPid, open: false);
+                return;
+            }
+            if (cur == _rootPage)
+                ScheduleRebuild(poll: false, force: false);
+        }
+
+        private static void ScheduleRebuild(bool poll, bool force)
+        {
+            if (!force && Time.unscaledTime - _lastRebuildAt < RebuildMinIntervalSec)
+                return;
+            if (_rebuildQueued) return;
+            _rebuildQueued = true;
+            MelonCoroutines.Start(DeferredRebuildRoutine(poll, force));
+        }
+
+        private static IEnumerator DeferredRebuildRoutine(bool poll, bool force)
+        {
+            // Extra frames so BoneMenu finishes OnPageOpened / DrawElements (avoids GUIPool bounds).
+            yield return null;
+            yield return null;
+            yield return null;
+            if (IsInFusionLobby())
+            {
+                yield return null;
+                yield return null;
+            }
+            _rebuildQueued = false;
+            try
+            {
+                Page cur = null;
+                try { cur = Menu.CurrentPage; } catch { /* */ }
+                if (cur == _detailPage) yield break;
+                if (cur != null && cur != _rootPage) yield break;
+                if (!force && Time.unscaledTime - _lastRebuildAt < RebuildMinIntervalSec)
+                    yield break;
+                RebuildMenu();
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning("Tracking deferred rebuild: " + ex.Message);
+            }
+
+            // Open path never passes poll:true anymore; keep hook inert if called.
+            if (poll && _enabled && Entries.Count > 0 && !_polling && Time.unscaledTime >= _apiReadyAt)
+                MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: true));
+        }
+
+        private static void ScheduleDetailFill(string pid, bool open)
+        {
+            _detailQueuedPid = pid ?? "";
+            if (_detailQueued) return;
+            _detailQueued = true;
+            MelonCoroutines.Start(DeferredDetailRoutine(open));
+        }
+
+        private static IEnumerator DeferredDetailRoutine(bool open)
+        {
+            yield return null;
+            yield return null;
+            _detailQueued = false;
+            string pid = _detailQueuedPid;
+            if (string.IsNullOrEmpty(pid)) yield break;
+            try
+            {
+                Page cur = null;
+                try { cur = Menu.CurrentPage; } catch { /* */ }
+                if (!open && cur != _detailPage) yield break;
+                FillDetailPage(pid, open);
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning("Tracking deferred detail: " + ex.Message);
+            }
+        }
+
+        private static void RebuildMenu()
+        {
+            if (_rootPage == null) return;
+            try
+            {
+                Page cur = null;
+                try { cur = Menu.CurrentPage; } catch { /* */ }
+                // Never RemoveAll the list while viewing the friend card.
+                if (cur == _detailPage) return;
+
+                _rootPage.RemoveAll();
+                _rootPage.Color = new Color(0.2f, 0.85f, 0.95f);
+                _lastRebuildAt = Time.unscaledTime;
+
+                _rootPage.CreateFunction("Refresh now", new Color(0.45f, 0.85f, 1f), (Action)(() =>
+                {
+                    if (_polling)
+                    {
+                        Notify("Tracking", "Already refreshing…");
+                        return;
+                    }
+                    if (Time.unscaledTime < _apiReadyAt)
+                    {
+                        float left = Mathf.Max(0f, _apiReadyAt - Time.unscaledTime);
+                        Notify("Tracking", "Wait " + Mathf.CeilToInt(left) + "s");
+                        return;
+                    }
+                    MelonCoroutines.Start(PollRoutine(force: false, refreshMenu: true));
+                }));
+
+                _rootPage.CreateFunction("Clear all friends", new Color(1f, 0.45f, 0.35f), (Action)ClearAllFriends);
+
+                lock (Gate)
+                {
+                    if (Entries.Count == 0)
+                    {
+                        _rootPage.CreateFunction("Empty list", new Color(0.55f, 0.55f, 0.6f), (Action)(() => { }));
+                        _rootPage.CreateFunction("Add via Fusion profile", new Color(0.55f, 0.75f, 0.95f), (Action)(() => { }));
+                        return;
+                    }
+
+                    int onlineN = 0;
+                    for (int i = 0; i < Entries.Count; i++)
+                    {
+                        if (Snapshots.TryGetValue(Entries[i].Pid, out var s) && s != null && s.Online)
+                            onlineN++;
+                    }
+                    _rootPage.CreateFunction(
+                        "Live  " + onlineN + " / " + Entries.Count,
+                        new Color(0.4f, 1f, 0.55f),
+                        (Action)(() => { }));
+
+                    var order = new List<TrackedEntry>(Entries);
+                    order.Sort((a, b) =>
+                    {
+                        bool ao = Snapshots.TryGetValue(a.Pid, out var sa) && sa != null && sa.Online;
+                        bool bo = Snapshots.TryGetValue(b.Pid, out var sb) && sb != null && sb.Online;
+                        if (ao != bo) return ao ? -1 : 1;
+                        return string.Compare(a.Name, b.Name, StringComparison.OrdinalIgnoreCase);
+                    });
+
+                    int shown = 0;
+                    foreach (var e in order)
+                    {
+                        if (shown >= MaxVisibleFriends)
+                        {
+                            int more = order.Count - shown;
+                            _rootPage.CreateFunction(
+                                "+" + more + " more (remove some)",
+                                new Color(0.7f, 0.55f, 0.35f),
+                                (Action)(() => { }));
+                            break;
+                        }
+                        Snapshots.TryGetValue(e.Pid, out var snap);
+                        string pid = e.Pid;
+                        _rootPage.CreateFunction(
+                            FormatListTitle(e, snap),
+                            ListColor(snap),
+                            (Action)(() => OpenFriend(pid)));
+                        shown++;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning("Tracking menu: " + ex.Message);
+            }
+        }
+
+        private static void ClearAllFriends()
+        {
+            lock (Gate)
+            {
+                Entries.Clear();
+                Snapshots.Clear();
+                _alertedOnline.Clear();
+                _onlineWatchSeeded = false;
+                SaveList_NoLock();
+            }
+            _detailPid = "";
+            Notify("Tracking", "List cleared");
+            MelonLogger.Msg("Tracking: clear all friends");
+            ScheduleRebuild(poll: false, force: true);
+        }
+
+        /// <summary>
+        /// Open friend card from cache immediately; do NOT fire a full /v1/track burst on click.
+        /// Presence updates arrive from the gentle Tick / delayed-open poll.
+        /// </summary>
+        private static void OpenFriend(string pid)
+        {
+            if (string.IsNullOrWhiteSpace(pid) || _detailPage == null) return;
+            _detailPid = pid;
+            ScheduleDetailFill(pid, open: true);
+        }
+
+        private static void FillDetailPage(string pid, bool open)
+        {
+            if (_detailPage == null) return;
+
+            TrackedEntry entry = default;
+            bool found = false;
+            TrackSnapshot snap = null;
+            lock (Gate)
+            {
+                for (int i = 0; i < Entries.Count; i++)
+                {
+                    if (!string.Equals(Entries[i].Pid, pid, StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    entry = Entries[i];
+                    found = true;
+                    break;
+                }
+                if (found)
+                    Snapshots.TryGetValue(pid, out snap);
+            }
+            if (!found)
+            {
+                _detailPid = "";
+                try { Menu.OpenPage(_rootPage); } catch { /* */ }
+                return;
+            }
+
+            try
+            {
+                string name = DisplayName(entry, snap);
+                _detailPage.Name = SafeMenu(name, 22);
+                _detailPage.Color = ListColor(snap);
+                _detailPage.RemoveAll();
+
+                Color info = new Color(0.78f, 0.82f, 0.88f);
+                // Keep ≤7 FunctionElement rows — BoneLib GUIPool Function size starts at 8.
+                _detailPage.CreateFunction("ID  " + ShortPid(pid), info, (Action)(() => { }));
+
+                if (snap == null)
+                {
+                    _detailPage.CreateFunction("Status  loading…", new Color(0.9f, 0.8f, 0.4f), (Action)(() => { }));
+                }
+                else if (!snap.Found)
+                {
+                    _detailPage.CreateFunction("Status  not in DB", new Color(1f, 0.55f, 0.35f), (Action)(() => { }));
+                }
+                else if (snap.Online)
+                {
+                    string st = string.IsNullOrWhiteSpace(snap.Status) ? "IN GAME" : snap.Status;
+                    _detailPage.CreateFunction(
+                        "Status  " + SafeMenu(st, 14) + " · " + SafeMenu(NullDash(snap.Language), 10),
+                        new Color(0.35f, 1f, 0.5f),
+                        (Action)(() => { }));
+                    _detailPage.CreateFunction(
+                        "Server  " + SafeMenu(NullDash(snap.Server), 26),
+                        info,
+                        (Action)(() => { }));
+                    _detailPage.CreateFunction(
+                        "Online  " + FormatDuration(snap.SessionSec),
+                        info,
+                        (Action)(() => { }));
+                    _detailPage.CreateFunction(
+                        "Map  " + SafeMenu(NullDash(snap.Map), 22) + " · lobby " + SafeMenu(NullDash(snap.LobbyCode), 10),
+                        info,
+                        (Action)(() => { }));
+                }
+                else
+                {
+                    _detailPage.CreateFunction("Status  OFFLINE", new Color(0.7f, 0.7f, 0.75f), (Action)(() => { }));
+                    _detailPage.CreateFunction(
+                        "Offline  " + FormatDuration(snap.OfflineSec),
+                        info,
+                        (Action)(() => { }));
+                    _detailPage.CreateFunction(
+                        "Lang  " + SafeMenu(NullDash(snap.Language), 22),
+                        info,
+                        (Action)(() => { }));
+                }
+
+                // Join only when online+code and not already together in this Fusion lobby.
+                // Offline → no Join row. Same lobby → "In lobby".
+                bool inLobbyWith = IsPlayerInCurrentLobby(pid);
+                bool canJoin = snap != null && snap.Online && !string.IsNullOrWhiteSpace(snap.LobbyCode) && !inLobbyWith;
+                string joinName = name;
+                if (inLobbyWith)
+                {
+                    _detailPage.CreateFunction("In lobby", new Color(0.55f, 0.75f, 0.95f), (Action)(() => { }));
+                }
+                else if (canJoin)
+                {
+                    string codeCopy = snap.LobbyCode;
+                    string pidCopy = pid;
+                    _detailPage.CreateFunction("JOIN LOBBY", new Color(0.2f, 1f, 0.45f), (Action)(() =>
+                    {
+                        MelonCoroutines.Start(JoinAndWatchRoutine(joinName, codeCopy, pidCopy));
+                    }));
+                }
+
+                string removePid = pid;
+                _detailPage.CreateFunction("REMOVE FRIEND", new Color(1f, 0.35f, 0.35f), (Action)(() =>
+                {
+                    Remove(removePid);
+                }));
+
+                if (open)
+                    Menu.OpenPage(_detailPage);
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Warning("Tracking friend page: " + ex.Message);
+            }
+        }
+
+        private static bool IsPlayerInCurrentLobby(string pid)
+        {
+            if (string.IsNullOrWhiteSpace(pid)) return false;
+            try
+            {
+                if (!NetworkInfo.HasServer) return false;
+                return PlayerIDManager.HasPlayerID(pid.Trim());
+            }
+            catch { return false; }
+        }
+
+        private static Color ListColor(TrackSnapshot snap)
+        {
+            if (snap == null) return new Color(0.85f, 0.75f, 0.35f);
+            if (!snap.Found) return new Color(1f, 0.55f, 0.35f);
+            if (snap.Online) return new Color(0.3f, 0.95f, 0.5f);
+            return new Color(0.58f, 0.6f, 0.66f);
+        }
+
+        private static string DisplayName(TrackedEntry e, TrackSnapshot snap)
+        {
+            if (snap != null && !string.IsNullOrEmpty(snap.Name))
+                return SafeMenu(snap.Name, 28);
+            return SafeMenu(e.Name, 28);
+        }
+
+        private static IEnumerator JoinAndWatchRoutine(string name, string code, string pid)
+        {
+            // Fusion menu path (Checkerb0ard EOS): NetworkHelper.JoinServerByCode(code).
+            // JoinServerByCode → EOSMatchmaker.RequestLobbiesByCode(upper) → JoinServer(details).
+            // JoinServer Disconnect()s if already connected (async LeaveLobby). We wait for a
+            // clean Disconnected state first so CanJoinServer() succeeds (not mid-Disconnecting race).
+
+            yield return null;
+
+            // Soft-refresh lobby_code from DB (no BoneMenu rebuild).
+            if (!string.IsNullOrEmpty(pid) && !_polling && Time.unscaledTime >= _apiReadyAt)
+            {
+                var one = new List<string> { pid };
+                _polling = true;
+                Task<string> task = null;
+                try { task = Task.Run(() => FetchTrackJson(one)); }
+                catch { _polling = false; }
+                if (task != null)
+                {
+                    float httpT = 0f;
+                    while (!task.IsCompleted && httpT < 8f)
+                    {
+                        httpT += Time.unscaledDeltaTime;
+                        yield return null;
+                    }
+                    try
+                    {
+                        if (task.IsCompleted)
+                        {
+                            string json = task.Result;
+                            if (json != null)
+                            {
+                                ApplyTrackJson(json);
+                                _apiReadyAt = Time.unscaledTime + 10f;
+                                lock (Gate)
+                                {
+                                    if (Snapshots.TryGetValue(pid, out var s) && s != null &&
+                                        !string.IsNullOrWhiteSpace(s.LobbyCode))
+                                        code = s.LobbyCode;
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception e) { MelonLogger.Warning("Tracking join refresh: " + e.Message); }
+                    finally { _polling = false; }
+                }
+            }
+
+            string c = NormalizeLobbyCode(code);
+            if (string.IsNullOrEmpty(c))
+            {
+                NotifyError("Join", "No lobby code");
+                yield break;
+            }
+
+            bool inServer = false;
+            try { inServer = NetworkInfo.HasServer; } catch { /* */ }
+            if (inServer)
+            {
+                MelonLogger.Msg("Tracking: EOS leave before JoinServerByCode " + c);
+                Notify("Joining", "Leaving current lobby…");
+                try { NetworkHelper.Disconnect("Tracking Join"); }
+                catch (Exception ex)
+                {
+                    NotifyError("Join failed", "Disconnect: " + ex.Message);
+                    yield break;
+                }
+
+                // Wait until Fusion reports no server (OnDisconnectComplete cleared IsClient).
+                float leaveT = 0f;
+                while (leaveT < 12f)
+                {
+                    leaveT += Time.unscaledDeltaTime;
+                    bool still = false;
+                    try { still = NetworkInfo.HasServer; } catch { /* */ }
+                    if (!still) break;
+                    yield return null;
+                }
+                try { inServer = NetworkInfo.HasServer; } catch { inServer = true; }
+                if (inServer)
+                {
+                    NotifyError("Join failed", "Could not leave current lobby");
+                    yield break;
+                }
+
+                // Extra settle: EOS LeaveLobby callback + matchmaker must see us Disconnected.
+                float settle = 0f;
+                while (settle < 2.0f)
+                {
+                    settle += Time.unscaledDeltaTime;
+                    yield return null;
+                }
+            }
+
+            // Success = OnJoinedServer AND we stay connected briefly.
+            // NEVER treat NetworkInfo.HasServer alone as success — that fires false
+            // "Joined" on full/private/stale lobbies (and after failed code search).
+            bool joinedFlag = false;
+            bool leftDuringJoin = false;
+            ServerEvent onJoined = () => { joinedFlag = true; };
+            ServerEvent onLeft = () =>
+            {
+                // Only count leave after we actually saw a join attempt complete.
+                if (joinedFlag)
+                    leftDuringJoin = true;
+            };
+            try { MultiplayerHooking.OnJoinedServer += onJoined; }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Tracking: OnJoinedServer hook — " + e.Message);
+                onJoined = null;
+            }
+            try { MultiplayerHooking.OnDisconnected += onLeft; }
+            catch
+            {
+                onLeft = null;
+            }
+
+            try
+            {
+                // Exact Fusion menu call — one shot (retries stack EOS lobby searches).
+                NetworkHelper.JoinServerByCode(c);
+                Notify("Joining", SafeMenu(name) + " / " + c);
+                MelonLogger.Msg("Tracking: JoinServerByCode " + c + " (EOS matchmaker)");
+            }
+            catch (Exception ex)
+            {
+                UnhookJoinWatch(onJoined, onLeft);
+                NotifyError("Join failed", ex.Message);
+                yield break;
+            }
+
+            float t = 0f;
+            while (t < 18f)
+            {
+                t += Time.unscaledDeltaTime;
+                if (!joinedFlag)
+                {
+                    yield return null;
+                    continue;
+                }
+
+                // Joined event fired — wait a short settle so full-lobby kick
+                // doesn't get reported as success.
+                float hold = 0f;
+                while (hold < 2.0f)
+                {
+                    hold += Time.unscaledDeltaTime;
+                    if (leftDuringJoin) break;
+                    bool stillIn = false;
+                    try { stillIn = NetworkInfo.HasServer; } catch { /* */ }
+                    if (!stillIn)
+                    {
+                        leftDuringJoin = true;
+                        break;
+                    }
+                    yield return null;
+                }
+
+                UnhookJoinWatch(onJoined, onLeft);
+
+                if (leftDuringJoin)
+                {
+                    MelonLogger.Warning(
+                        "Tracking: join rejected after OnJoinedServer — code=" + c +
+                        " (full/kick/closed)");
+                    NotifyError(
+                        "Can't join",
+                        "Lobby " + c + " is full or closed.");
+                    yield break;
+                }
+
+                bool ok = false;
+                try { ok = NetworkInfo.HasServer; } catch { /* */ }
+                if (!ok)
+                {
+                    NotifyError(
+                        "Can't join",
+                        "Lobby " + c + " is full, private, or gone.");
+                    yield break;
+                }
+
+                MelonLogger.Msg(
+                    "Tracking: join OK — target=" + c +
+                    " via=OnJoinedServer t=" + t.ToString("0.0", CultureInfo.InvariantCulture) + "s");
+                Notify("Joined", SafeMenu(name) + " / " + c);
+                yield break;
+            }
+
+            UnhookJoinWatch(onJoined, onLeft);
+
+            MelonLogger.Warning("Tracking: join timed out for " + c + " (no OnJoinedServer)");
+            NotifyError(
+                "Can't join",
+                "No lobby " + c + " (full / private / stale). Refresh and retry.");
+        }
+
+        private static void UnhookJoinWatch(ServerEvent onJoined, ServerEvent onLeft)
+        {
+            if (onJoined != null)
+            {
+                try { MultiplayerHooking.OnJoinedServer -= onJoined; } catch { /* */ }
+            }
+            if (onLeft != null)
+            {
+                try { MultiplayerHooking.OnDisconnected -= onLeft; } catch { /* */ }
+            }
+        }
+
+        /// <summary>Match EOSMatchmaker: trim + ToUpperInvariant (LobbyCode attribute).</summary>
+        private static string NormalizeLobbyCode(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code)) return "";
+            var sb = new StringBuilder(8);
+            foreach (char ch in code.Trim())
+            {
+                if (char.IsWhiteSpace(ch) || ch == '-' || ch == '_') continue;
+                sb.Append(char.ToUpperInvariant(ch));
+            }
+            string c = sb.ToString();
+            // Fusion RandomCodeGenerator length is 8; accept 6–8 for older codes.
+            if (c.Length < 6 || c.Length > 10) return "";
+            return c;
+        }
+
+        private static string FormatListTitle(TrackedEntry e, TrackSnapshot snap)
+        {
+            string name = DisplayName(e, snap);
+            if (name.Length > 14) name = name.Substring(0, 14);
+            if (snap == null) return name + "  …";
+            if (!snap.Found) return name + "  ?";
+            if (snap.Online) return name + "  ● " + FormatDurationCompact(snap.SessionSec);
+            return name + "  ○ " + FormatDurationCompact(snap.OfflineSec);
+        }
+
+        /// <summary>
+        /// Human duration for detail rows.
+        ///   &lt;1m  → 45s
+        ///   &lt;1h  → 12m 5s
+        ///   &lt;24h → 5h 12m
+        ///   ≥24h → 2d 0h 2m
+        /// </summary>
+        private static string FormatDuration(int? sec)
+        {
+            if (sec == null) return "…";
+            int s = sec.Value;
+            if (s < 0) s = 0;
+
+            if (s < 60)
+                return s + "s";
+
+            int days = s / 86400;
+            int hours = (s % 86400) / 3600;
+            int mins = (s % 3600) / 60;
+            int secs = s % 60;
+
+            if (days > 0)
+                return days + "d " + hours + "h " + mins + "m";
+            if (hours > 0)
+                return hours + "h " + mins + "m";
+            return mins + "m " + secs + "s";
+        }
+
+        /// <summary>Shorter form for friend-list titles (keeps BoneMenu row readable).</summary>
+        private static string FormatDurationCompact(int? sec)
+        {
+            if (sec == null) return "…";
+            int s = sec.Value;
+            if (s < 0) s = 0;
+
+            if (s < 60) return s + "s";
+
+            int days = s / 86400;
+            int hours = (s % 86400) / 3600;
+            int mins = (s % 3600) / 60;
+
+            if (days > 0)
+            {
+                // 2d2h — drop zero hours; keep minutes only when no hours
+                if (hours > 0) return days + "d" + hours + "h";
+                if (mins > 0) return days + "d" + mins + "m";
+                return days + "d";
+            }
+            if (hours > 0) return hours + "h" + mins + "m";
+            return mins + "m";
+        }
+
+        private static void InstallFusionProfileHook(HarmonyLib.Harmony harmony)
+        {
+            if (_hooked) return;
+            try
+            {
+                var t = AccessTools.TypeByName("LabFusion.Menu.MenuLocation");
+                var m = AccessTools.Method(t, "ApplyPlayerToElement");
+                if (m == null)
+                {
+                    MelonLogger.Warning("Tracking: MenuLocation.ApplyPlayerToElement not found");
+                    return;
+                }
+                harmony.Patch(m, postfix: new HarmonyMethod(typeof(Tracking), nameof(ApplyPlayerToElementPostfix)));
+                _hooked = true;
+                MelonLogger.Msg("Tracking: hooked Fusion player profile actions");
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Tracking hook: " + e.Message);
+            }
+        }
+
+        /// <summary>
+        /// Fusion lobby player profile → Add / Remove Tracking.
+        /// ApplyPlayerToElement runs many times per player (metadata batches) — MUST reuse
+        /// existing elements via AddOrGet / first FunctionElement. Never RemoveElements /
+        /// AddElement during populate (BoneLib/Fusion pool desync → OOB/NRE).
+        /// </summary>
+        private static void ApplyPlayerToElementPostfix(PlayerElement element, PlayerID player)
+        {
+            try
+            {
+                if (element == null || player == null) return;
+                try { if (player.IsMe) return; } catch { return; }
+
+                string pid = null;
+                try { pid = player.PlatformID; } catch { }
+                if (string.IsNullOrWhiteSpace(pid)) return;
+                pid = pid.Trim();
+
+                string username = "";
+                try { username = player.Metadata?.Username?.GetValueOrEmpty() ?? ""; } catch { }
+                if (string.IsNullOrWhiteSpace(username))
+                {
+                    try { username = player.PlatformID; } catch { username = pid; }
+                }
+
+                var actions = element.ActionsElement;
+                if (actions == null) return;
+                PageElement page = null;
+                try
+                {
+                    if (actions.Pages != null && actions.Pages.Count > 0)
+                        page = actions.Pages[0];
+                }
+                catch { /* */ }
+                if (page == null)
+                    page = actions.AddPage();
+                if (page == null) return;
+
+                // One group per profile card — never stack duplicates on every ApplyPlayerToElement.
+                GroupElement group = page.AddOrGetElement<GroupElement>("Tracking");
+                if (group == null) return;
+
+                bool tracked = IsTracked(pid);
+                string label = tracked ? "Remove from Tracking" : "Add to Tracking";
+                Color color = tracked ? new Color(1f, 0.4f, 0.35f) : new Color(0.35f, 0.9f, 1f);
+                string pidCopy = pid;
+                string nameCopy = username;
+
+                // Reuse existing FunctionElement if present — never RemoveElements mid-populate.
+                LabFusion.Marrow.Proxies.FunctionElement btn = FindFirstFunction(group);
+                if (btn == null)
+                    btn = group.AddElement<LabFusion.Marrow.Proxies.FunctionElement>(label);
+                if (btn == null) return;
+
+                try { btn.Title = label; } catch { /* */ }
+                try { btn.WithColor(color); } catch { try { btn.Color = color; } catch { /* */ } }
+                // Assign (do not Do/+=) so repeated ApplyPlayerToElement cannot stack handlers.
+                btn.OnPressed = () =>
+                {
+                    if (IsTracked(pidCopy)) Remove(pidCopy);
+                    else Add(pidCopy, nameCopy);
+                    try
+                    {
+                        bool now = IsTracked(pidCopy);
+                        btn.Title = now ? "Remove from Tracking" : "Add to Tracking";
+                        btn.Color = now ? new Color(1f, 0.4f, 0.35f) : new Color(0.35f, 0.9f, 1f);
+                    }
+                    catch { /* */ }
+                };
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Tracking profile btn: " + e.Message);
+            }
+        }
+
+        private static LabFusion.Marrow.Proxies.FunctionElement FindFirstFunction(GroupElement group)
+        {
+            if (group == null) return null;
+            try
+            {
+                var els = group.Elements;
+                if (els == null) return null;
+                for (int i = 0; i < els.Count; i++)
+                {
+                    var el = els[i];
+                    if (el == null) continue;
+                    var fn = el as LabFusion.Marrow.Proxies.FunctionElement;
+                    if (fn != null) return fn;
+                    try
+                    {
+                        fn = el.TryCast<LabFusion.Marrow.Proxies.FunctionElement>();
+                        if (fn != null) return fn;
+                    }
+                    catch { /* */ }
+                }
+            }
+            catch { /* */ }
+            return null;
+        }
+
+        private static HttpClient CreateHttp()
+        {
+            var c = new HttpClient();
+            c.Timeout = TimeSpan.FromSeconds(HttpTimeoutSeconds);
+            c.DefaultRequestHeaders.ExpectContinue = false;
+            return c;
+        }
+
+        private static void LoadList()
+        {
+            lock (Gate)
+            {
+                Entries.Clear();
+                try
+                {
+                    string path = Path.Combine(UserDataDir(), ListName);
+                    if (!File.Exists(path)) return;
+                    string json = File.ReadAllText(path);
+                    // Very small schema: {"entries":[{"pid":"...","name":"...","added_at":"..."}]}
+                    int arr = json.IndexOf('[');
+                    int end = json.LastIndexOf(']');
+                    if (arr < 0 || end <= arr) return;
+                    string body = json.Substring(arr + 1, end - arr - 1);
+                    foreach (string part in SplitObjects(body))
+                    {
+                        string pid = JsonString(part, "pid");
+                        if (string.IsNullOrEmpty(pid)) continue;
+                        Entries.Add(new TrackedEntry
+                        {
+                            Pid = pid,
+                            Name = JsonString(part, "name") ?? pid,
+                            AddedAt = JsonString(part, "added_at") ?? "",
+                        });
+                        if (Entries.Count >= MaxTracked) break;
+                    }
+                }
+                catch (Exception e)
+                {
+                    MelonLogger.Warning("Tracking list load: " + e.Message);
+                }
+            }
+        }
+
+        private static void SaveList_NoLock()
+        {
+            try
+            {
+                string path = Path.Combine(UserDataDir(), ListName);
+                Directory.CreateDirectory(Path.GetDirectoryName(path) ?? UserDataDir());
+                var sb = new StringBuilder();
+                sb.Append("{\"version\":1,\"entries\":[");
+                for (int i = 0; i < Entries.Count; i++)
+                {
+                    if (i > 0) sb.Append(',');
+                    var e = Entries[i];
+                    sb.Append("{\"pid\":\"").Append(JsonEscape(e.Pid))
+                      .Append("\",\"name\":\"").Append(JsonEscape(e.Name ?? ""))
+                      .Append("\",\"added_at\":\"").Append(JsonEscape(e.AddedAt ?? ""))
+                      .Append("\"}");
+                }
+                sb.Append("]}");
+                File.WriteAllText(path, sb.ToString());
+            }
+            catch (Exception e)
+            {
+                MelonLogger.Warning("Tracking list save: " + e.Message);
+            }
+        }
+
+        private static string UserDataDir()
+        {
+            string root;
+            try { root = MelonLoader.Utils.MelonEnvironment.UserDataDirectory; }
+            catch { root = "UserData"; }
+            return Path.Combine(root, "MonsterPanel");
+        }
+
+        private static string Combine(string baseUrl, string path) => baseUrl.TrimEnd('/') + path;
+
+        private static string NullDash(string s) => string.IsNullOrWhiteSpace(s) ? "-" : s;
+
+        private static string ShortPid(string pid) =>
+            string.IsNullOrEmpty(pid) ? "-" : (pid.Length <= 12 ? pid : pid.Substring(0, 12) + "…");
+
+        private static string SafeMenu(string s, int max = 48)
+        {
+            if (string.IsNullOrEmpty(s)) return "-";
+            var sb = new StringBuilder(Math.Min(s.Length, max));
+            bool inTag = false;
+            foreach (char c in s)
+            {
+                if (c == '<') { inTag = true; continue; }
+                if (c == '>') { inTag = false; continue; }
+                if (inTag) continue;
+                if (c >= 32 && c < 127) sb.Append(c);
+                if (sb.Length >= max) break;
+            }
+            string outS = sb.ToString().Trim();
+            return outS.Length == 0 ? "-" : outS;
+        }
+
+        private static string TrimOneLine(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            s = s.Replace('\n', ' ').Replace('\r', ' ');
+            return s.Length <= max ? s : s.Substring(0, max);
+        }
+
+        private static string JsonEscape(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            var sb = new StringBuilder(s.Length + 8);
+            foreach (char c in s)
+            {
+                if (c == '"' || c == '\\') sb.Append('\\').Append(c);
+                else if (c < 32) sb.Append("\\u").Append(((int)c).ToString("x4"));
+                else sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        private static List<string> SplitObjects(string body)
+        {
+            var list = new List<string>();
+            int depth = 0, start = -1;
+            for (int i = 0; i < body.Length; i++)
+            {
+                char c = body[i];
+                if (c == '{')
+                {
+                    if (depth == 0) start = i;
+                    depth++;
+                }
+                else if (c == '}')
+                {
+                    depth--;
+                    if (depth == 0 && start >= 0)
+                    {
+                        list.Add(body.Substring(start, i - start + 1));
+                        start = -1;
+                    }
+                }
+            }
+            return list;
+        }
+
+        private static string JsonString(string obj, string key)
+        {
+            string pattern = "\"" + key + "\"";
+            int k = obj.IndexOf(pattern, StringComparison.Ordinal);
+            if (k < 0) return null;
+            int colon = obj.IndexOf(':', k + pattern.Length);
+            if (colon < 0) return null;
+            int i = colon + 1;
+            while (i < obj.Length && char.IsWhiteSpace(obj[i])) i++;
+            if (i >= obj.Length) return null;
+            if (obj[i] == 'n' && obj.IndexOf("null", i, StringComparison.Ordinal) == i) return null;
+            if (obj[i] != '"') return null;
+            i++;
+            var sb = new StringBuilder();
+            for (; i < obj.Length; i++)
+            {
+                char c = obj[i];
+                if (c == '\\' && i + 1 < obj.Length)
+                {
+                    char n = obj[++i];
+                    sb.Append(n);
+                    continue;
+                }
+                if (c == '"') break;
+                sb.Append(c);
+            }
+            return sb.ToString();
+        }
+
+        private static bool JsonBool(string obj, string key, bool fallback)
+        {
+            string pattern = "\"" + key + "\"";
+            int k = obj.IndexOf(pattern, StringComparison.Ordinal);
+            if (k < 0) return fallback;
+            int colon = obj.IndexOf(':', k + pattern.Length);
+            if (colon < 0) return fallback;
+            int i = colon + 1;
+            while (i < obj.Length && char.IsWhiteSpace(obj[i])) i++;
+            if (i < obj.Length && obj.IndexOf("true", i, StringComparison.Ordinal) == i) return true;
+            if (i < obj.Length && obj.IndexOf("false", i, StringComparison.Ordinal) == i) return false;
+            return fallback;
+        }
+
+        private static int? JsonInt(string obj, string key)
+        {
+            string pattern = "\"" + key + "\"";
+            int k = obj.IndexOf(pattern, StringComparison.Ordinal);
+            if (k < 0) return null;
+            int colon = obj.IndexOf(':', k + pattern.Length);
+            if (colon < 0) return null;
+            int i = colon + 1;
+            while (i < obj.Length && char.IsWhiteSpace(obj[i])) i++;
+            if (i < obj.Length && obj[i] == 'n') return null;
+            int start = i;
+            if (i < obj.Length && obj[i] == '-') i++;
+            while (i < obj.Length && char.IsDigit(obj[i])) i++;
+            if (i == start || (i == start + 1 && obj[start] == '-')) return null;
+            if (int.TryParse(obj.Substring(start, i - start), NumberStyles.Integer, CultureInfo.InvariantCulture, out int v))
+                return v;
+            return null;
+        }
+
+        private static void Notify(string title, string message)
+        {
+            SendFusionNotify(title, message, NotificationType.SUCCESS, 2.5f, cancelPrevious: true);
+        }
+
+        private static void NotifyError(string title, string message)
+        {
+            SendFusionNotify(title, message, NotificationType.ERROR, 3.5f, cancelPrevious: true);
+        }
+
+        /// <summary>Same shape as LabFusion NetworkNotifications (Tag + SaveToMenu=false).</summary>
+        private static void SendFusionNotify(string title, string message, NotificationType type, float popupLength, bool cancelPrevious)
+        {
+            try
+            {
+                if (cancelPrevious)
+                {
+                    try { Notifier.Cancel(NotifyTag); } catch { /* */ }
+                }
+                Notifier.Send(new Notification
+                {
+                    Title = title ?? "",
+                    Message = message ?? "",
+                    Tag = NotifyTag,
+                    SaveToMenu = false,
+                    ShowPopup = true,
+                    PopupLength = popupLength,
+                    Type = type,
+                });
+            }
+            catch
+            {
+                if (type == NotificationType.ERROR)
+                    MelonLogger.Warning(title + ": " + message);
+                else
+                    MelonLogger.Msg(title + ": " + message);
+            }
+        }
+    }
+}
