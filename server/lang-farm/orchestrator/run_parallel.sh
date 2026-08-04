@@ -17,6 +17,13 @@ LOOP_SLEEP="${LOOP_SLEEP:-2}"
 # Dead lobby only (no P2P). With P2P traffic bots now wait full LISTEN_SEC.
 NO_VOICE_ABORT="${NO_VOICE_ABORT_SEC:-18}"
 
+# Never inherit visual-host launcher env (BOT_NICK=coolguy / FUSION_HOST_MODE=1 leak).
+unset FUSION_HOST_MODE HOST_LOBBY_NAME HOST_LOBBY_DESC HOST_P2P_PORT HOST_HOLD_SEC
+unset HOST_DISPLAY_PLAYERS HOST_MAX_MEMBERS HOST_LEVEL_TITLE HOST_LEVEL_BARCODE
+export FUSION_HOST_MODE=0
+# Skip our own www·bonelab·fun host (comma-separated overrides via SKIP_LOBBY_NAMES / SKIP_LOBBY_CODES).
+export SKIP_LOBBY_NAMES="${SKIP_LOBBY_NAMES:-www·bonelab·fun,www.bonelab.fun}"
+
 mkdir -p "$LOGS" "$ROOT/results" "$ROOT/homes" "$ROOT/state"
 [[ -f "$RESULTS" ]] || printf '%s\n' '# utc	pid	user	lang	conf	ok	sid	lobby	wav	text' > "$RESULTS"
 

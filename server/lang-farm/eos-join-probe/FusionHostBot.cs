@@ -169,6 +169,12 @@ internal static class FusionHostBot
                 else
                 {
                     pulseFail = 0;
+                    try
+                    {
+                        Directory.CreateDirectory("/tmp/lang-farm/state");
+                        File.WriteAllText("/tmp/lang-farm/state/host_lobby_code.txt", _lobbyCode + "\n");
+                    }
+                    catch { /* */ }
                     Console.WriteLine(
                         $"[host] pulse ok {DateTime.UtcNow:HH:mm:ss}Z code={_lobbyCode} " +
                         $"p2pReq={_p2pRequests} p2pOk={_p2pEstablished} connReq={_connRequests} pkt={_packetsIn}");
