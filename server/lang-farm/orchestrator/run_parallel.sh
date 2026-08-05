@@ -3,10 +3,15 @@
 # Isolation trick: each bot gets its own HOME so EOS DeviceId/keychain do not collide.
 # Reuse identities; mint only when that bot cannot login.
 set -euo pipefail
-ROOT=/tmp/lang-farm
-BOT_DLL="$ROOT/eos-join-probe/bin/Release/net8.0/EosJoinProbe.dll"
-RESULTS="$ROOT/results/languages.txt"
-LOGS="$ROOT/logs"
+# VPS install uses FARM_ROOT=/opt/lang-farm; agent host defaults to /tmp/lang-farm.
+ROOT="${FARM_ROOT:-/tmp/lang-farm}"
+BOT_DLL="${BOT_DLL:-$ROOT/bin/EosJoinProbe.dll}"
+# Dev/agent layout keeps the DLL under eos-join-probe/bin/Release/...
+if [[ ! -f "$BOT_DLL" && -f "$ROOT/eos-join-probe/bin/Release/net8.0/EosJoinProbe.dll" ]]; then
+  BOT_DLL="$ROOT/eos-join-probe/bin/Release/net8.0/EosJoinProbe.dll"
+fi
+RESULTS="${RESULTS_TXT:-$ROOT/results/languages.txt}"
+LOGS="${LOGS:-$ROOT/logs}"
 N="${BOTS:-10}"
 LISTEN="${LISTEN_SEC:-55}"
 JOINS="${MAX_JOIN_TRIES:-8}"
@@ -23,6 +28,7 @@ unset HOST_DISPLAY_PLAYERS HOST_MAX_MEMBERS HOST_LEVEL_TITLE HOST_LEVEL_BARCODE
 export FUSION_HOST_MODE=0
 # Skip our own www·bonelab·fun host (comma-separated overrides via SKIP_LOBBY_NAMES / SKIP_LOBBY_CODES).
 export SKIP_LOBBY_NAMES="${SKIP_LOBBY_NAMES:-www·bonelab·fun,www.bonelab.fun}"
+export HOST_LOBBY_CODE_FILE="${HOST_LOBBY_CODE_FILE:-$ROOT/state/host_lobby_code.txt}"
 
 mkdir -p "$LOGS" "$ROOT/results" "$ROOT/homes" "$ROOT/state"
 [[ -f "$RESULTS" ]] || printf '%s\n' '# utc	pid	user	lang	conf	ok	sid	lobby	wav	text' > "$RESULTS"
@@ -31,16 +37,20 @@ if [[ -f "$ROOT/state/postgres_dsn.env" ]]; then
   export POSTGRES_DSN="$(cat "$ROOT/state/postgres_dsn.env")"
 fi
 : "${POSTGRES_DSN:?POSTGRES_DSN required}"
-# psycopg2 is installed under the real user home; bots isolate HOME for EOS.
-export PYTHONPATH="/home/ubuntu/.local/lib/python3.12/site-packages${PYTHONPATH:+:$PYTHONPATH}"
+# psycopg2: prefer system / venv; bots isolate HOME for EOS DeviceId.
+export PYTHONPATH="${FARM_PYTHONPATH:-${PYTHONPATH:-}}"
 
-# LID
-if ! curl -sf http://127.0.0.1:8091/health >/dev/null; then
-  nohup env WHISPER_MODEL=base MIN_CONFIDENCE=0.55 \
-    MIN_SPEECH_SEC=1.8 MIN_SPEECH_SEC_NON_EN=2.8 ECAPA_MARGIN=0.18 MMS_MARGIN=0.10 \
-    python3 "$ROOT/langdetect/detect_service.py" --host 127.0.0.1 --port 8091 --preload \
-    >>"$LOGS/detect_service.log" 2>&1 &
-  for _ in $(seq 1 60); do curl -sf http://127.0.0.1:8091/health >/dev/null && break; sleep 1; done
+# LID (optional — set START_DETECT=0 to skip; join/P2P farm still works)
+START_DETECT="${START_DETECT:-1}"
+DETECT_PY="${DETECT_PY:-$ROOT/langdetect/detect_service.py}"
+if [[ "$START_DETECT" == "1" ]] && [[ -f "$DETECT_PY" ]]; then
+  if ! curl -sf http://127.0.0.1:8091/health >/dev/null; then
+    nohup env WHISPER_MODEL="${WHISPER_MODEL:-base}" MIN_CONFIDENCE=0.55 \
+      MIN_SPEECH_SEC=1.8 MIN_SPEECH_SEC_NON_EN=2.8 ECAPA_MARGIN=0.18 MMS_MARGIN=0.10 \
+      python3 "$DETECT_PY" --host 127.0.0.1 --port 8091 --preload \
+      >>"$LOGS/detect_service.log" 2>&1 &
+    for _ in $(seq 1 90); do curl -sf http://127.0.0.1:8091/health >/dev/null && break; sleep 1; done
+  fi
 fi
 
 # Presence scraper runs on the VPS (systemd eos-lobby-scraper).
@@ -73,11 +83,14 @@ bot_worker() {
     LISTEN_SEC="$LISTEN" MAX_JOIN_TRIES="$JOINS" NO_VOICE_ABORT_SEC="$NO_VOICE_ABORT" \
     EOS_FORCE_NEW_ACCOUNT="$force" EOS_DATA_DIR="$DATA" \
     BOT_NICK="$NICK" POSTGRES_DSN="$POSTGRES_DSN" \
+    FUSION_HOST_MODE=0 \
+    SKIP_LOBBY_NAMES="$SKIP_LOBBY_NAMES" \
+    HOST_LOBBY_CODE_FILE="$HOST_LOBBY_CODE_FILE" \
     RESULTS_TXT="$RESULTS" SESSION_DIR="$ROOT/results/session" \
     LOBBY_CLAIM_DIR="$ROOT/state/lobby_claims" \
-    DETECT_URL=http://127.0.0.1:8091/detect MIN_CONFIDENCE=0.55 \
+    DETECT_URL="${DETECT_URL:-http://127.0.0.1:8091/detect}" MIN_CONFIDENCE=0.55 \
     MIN_VOICE_SAMPLES=72000 \
-    dotnet "$BOT_DLL" >>"$LOG" 2>&1
+    ${DOTNET_BIN:-dotnet} "$BOT_DLL" >>"$LOG" 2>&1
     local rc=$?
     set -e
 

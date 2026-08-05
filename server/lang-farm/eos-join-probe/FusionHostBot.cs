@@ -171,8 +171,10 @@ internal static class FusionHostBot
                     pulseFail = 0;
                     try
                     {
-                        Directory.CreateDirectory("/tmp/lang-farm/state");
-                        File.WriteAllText("/tmp/lang-farm/state/host_lobby_code.txt", _lobbyCode + "\n");
+                        // Shared with farm bots (SKIP own host). Override via HOST_LOBBY_CODE_FILE.
+                        string codePath = Env("HOST_LOBBY_CODE_FILE", "/tmp/lang-farm/state/host_lobby_code.txt");
+                        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(codePath))!);
+                        File.WriteAllText(codePath, _lobbyCode + "\n");
                     }
                     catch { /* */ }
                     Console.WriteLine(

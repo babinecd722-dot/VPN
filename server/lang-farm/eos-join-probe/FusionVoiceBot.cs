@@ -971,7 +971,7 @@ internal static class FusionVoiceBot
         var set = new HashSet<string>(SkipLobbyCodes, StringComparer.OrdinalIgnoreCase);
         try
         {
-            const string path = "/tmp/lang-farm/state/host_lobby_code.txt";
+            string path = Env("HOST_LOBBY_CODE_FILE", "/tmp/lang-farm/state/host_lobby_code.txt");
             if (File.Exists(path))
             {
                 foreach (string line in File.ReadAllLines(path))
