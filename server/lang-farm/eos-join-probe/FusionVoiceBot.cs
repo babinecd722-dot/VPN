@@ -150,6 +150,13 @@ internal static class FusionVoiceBot
             if (joined >= MaxJoinTries) { SafeRelease(details); continue; }
 
             IngestLobbyInfo(details);
+            // Never join our own visual host (www·bonelab·fun) — farm only foreign lobbies.
+            if (IsOwnVisualHost(details, out string hostSkipReason))
+            {
+                Console.WriteLine($"[langfarm] skip own-host ({hostSkipReason})");
+                SafeRelease(details);
+                continue;
+            }
             // Anti-stack: skip lobbies already claimed by another farm bot / already full of bonelab.fun
             string previewId = TryGetLobbyId(details);
             int ourBots = CountNickInLobbyInfo(details, BotNick);
@@ -796,6 +803,14 @@ internal static class FusionVoiceBot
                     continue;
                 }
 
+                // Drop our visual host from the candidate pool entirely.
+                if (IsOwnVisualHost(details, out string hostSkip))
+                {
+                    Console.WriteLine($"[langfarm] skip own-host ({hostSkip})");
+                    SafeRelease(details);
+                    continue;
+                }
+
                 int players = EstimatePlayers(details);
                 int ours = CountNickInLobbyInfo(details, BotNick);
                 bool claimed = !string.IsNullOrEmpty(id) && IsLobbyClaimed(id);
@@ -909,6 +924,135 @@ internal static class FusionVoiceBot
         string mine = NormalizeFarmNick(BotNick);
         return string.Equals(u, mine, StringComparison.OrdinalIgnoreCase)
             || string.Equals(u, "bonelab.fun", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Visual host lobby name (LinkFilter bypass forms). Farm bots must not join it.
+    private static readonly string[] DefaultSkipLobbyNames =
+    {
+        "www\u00b7bonelab\u00b7fun",      // middle-dot (current host)
+        "www.bonelab.fun",                // plain ASCII
+        "www.\\u00b7bonelab.\\u00b7fun",  // JSON-escaped middle-dot (System.Text.Json default)
+        "www.\u200bbonelab.\u200bfun",    // legacy ZWSP-after-dot
+    };
+
+    private static readonly HashSet<string> SkipLobbyNames = ParseSkipSet(
+        "SKIP_LOBBY_NAMES", DefaultSkipLobbyNames, normalizeDots: true);
+
+    private static readonly HashSet<string> SkipLobbyCodes = ParseSkipSet(
+        "SKIP_LOBBY_CODES", Array.Empty<string>(), normalizeDots: false);
+
+    private static HashSet<string> ParseSkipSet(string envKey, string[] defaults, bool normalizeDots)
+    {
+        var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        void Add(string raw)
+        {
+            if (string.IsNullOrWhiteSpace(raw)) return;
+            string v = raw.Trim();
+            set.Add(v);
+            if (normalizeDots)
+            {
+                string n = NormalizeFarmNick(v);
+                if (!string.IsNullOrEmpty(n)) set.Add(n);
+            }
+        }
+        foreach (string d in defaults) Add(d);
+        string env = Environment.GetEnvironmentVariable(envKey);
+        if (!string.IsNullOrWhiteSpace(env))
+        {
+            foreach (string part in env.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                Add(part);
+        }
+        return set;
+    }
+
+    /// <summary>Merge env SKIP_LOBBY_CODES with live host code file (host remints).</summary>
+    private static HashSet<string> CurrentSkipLobbyCodes()
+    {
+        var set = new HashSet<string>(SkipLobbyCodes, StringComparer.OrdinalIgnoreCase);
+        try
+        {
+            string path = Env("HOST_LOBBY_CODE_FILE", "/tmp/lang-farm/state/host_lobby_code.txt");
+            if (File.Exists(path))
+            {
+                foreach (string line in File.ReadAllLines(path))
+                {
+                    string code = line.Trim();
+                    if (code.Length >= 4 && code.Length <= 12)
+                        set.Add(code);
+                }
+            }
+        }
+        catch { /* */ }
+        return set;
+    }
+
+    /// <summary>True for our www·bonelab·fun visual host (by LobbyName / LobbyCode / LobbyInfo).</summary>
+    private static bool IsOwnVisualHost(LobbyDetails details, out string reason)
+    {
+        reason = null;
+        var skipCodes = CurrentSkipLobbyCodes();
+        if (SkipLobbyNames.Count == 0 && skipCodes.Count == 0) return false;
+
+        string code = GetLobbyAttr(details, "LobbyCode")?.Trim();
+        if (!string.IsNullOrEmpty(code) && skipCodes.Contains(code))
+        {
+            reason = $"code={code}";
+            return true;
+        }
+
+        string name = GetLobbyAttr(details, "LobbyName")?.Trim();
+        if (!string.IsNullOrEmpty(name))
+        {
+            if (SkipLobbyNames.Contains(name) || SkipLobbyNames.Contains(NormalizeFarmNick(name)))
+            {
+                reason = $"name={name}";
+                return true;
+            }
+        }
+
+        string hostName = GetLobbyAttr(details, "HostName")?.Trim();
+        string json = ReadLobbyInfoJson(details) ?? "";
+        // System.Text.Json often writes middle-dot as \u00b7 — normalize before matching.
+        string jsonNorm = NormalizeFarmNick(json.Replace("\\u00b7", ".", StringComparison.OrdinalIgnoreCase)
+            .Replace("\\u00B7", ".", StringComparison.OrdinalIgnoreCase)
+            .Replace("\\u200b", "", StringComparison.OrdinalIgnoreCase)
+            .Replace("\\u200B", "", StringComparison.OrdinalIgnoreCase));
+
+        if (!string.IsNullOrEmpty(json))
+        {
+            foreach (string skip in SkipLobbyNames)
+            {
+                if (json.IndexOf(skip, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    reason = $"lobbyinfo~{skip}";
+                    return true;
+                }
+                string skipNorm = NormalizeFarmNick(skip);
+                if (!string.IsNullOrEmpty(skipNorm) && jsonNorm.IndexOf(skipNorm, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    reason = $"lobbyinfo-norm~{skipNorm}";
+                    return true;
+                }
+            }
+            foreach (string skipCode in skipCodes)
+            {
+                if (json.IndexOf($"\"lobbyCode\":\"{skipCode}\"", StringComparison.OrdinalIgnoreCase) >= 0
+                    || json.IndexOf($"\"lobbyCode\": \"{skipCode}\"", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    reason = $"lobbyinfo-code={skipCode}";
+                    return true;
+                }
+            }
+        }
+
+        // Last resort: our visual host always advertises HostName=coolguy + www.bonelab.fun identity.
+        if (string.Equals(hostName, "coolguy", StringComparison.OrdinalIgnoreCase)
+            && jsonNorm.IndexOf("www.bonelab.fun", StringComparison.OrdinalIgnoreCase) >= 0)
+        {
+            reason = "hostname=coolguy+www.bonelab.fun";
+            return true;
+        }
+        return false;
     }
 
     private static string TryGetLobbyId(LobbyDetails details)

@@ -169,6 +169,14 @@ internal static class FusionHostBot
                 else
                 {
                     pulseFail = 0;
+                    try
+                    {
+                        // Shared with farm bots (SKIP own host). Override via HOST_LOBBY_CODE_FILE.
+                        string codePath = Env("HOST_LOBBY_CODE_FILE", "/tmp/lang-farm/state/host_lobby_code.txt");
+                        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(codePath))!);
+                        File.WriteAllText(codePath, _lobbyCode + "\n");
+                    }
+                    catch { /* */ }
                     Console.WriteLine(
                         $"[host] pulse ok {DateTime.UtcNow:HH:mm:ss}Z code={_lobbyCode} " +
                         $"p2pReq={_p2pRequests} p2pOk={_p2pEstablished} connReq={_connRequests} pkt={_packetsIn}");

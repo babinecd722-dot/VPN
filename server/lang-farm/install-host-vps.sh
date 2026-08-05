@@ -123,12 +123,15 @@ HOST_DISPLAY_PLAYERS=${HOST_DISPLAY_PLAYERS}
 HOST_MARK_FULL=${HOST_MARK_FULL}
 EOS_DATA_DIR=${DEST}/data
 EOS_FORCE_NEW_ACCOUNT=${EOS_FORCE_NEW_ACCOUNT}
+# Shared with lang-farm bots so they never join this visual host.
+HOST_LOBBY_CODE_FILE=${HOST_LOBBY_CODE_FILE:-/opt/lang-farm/state/host_lobby_code.txt}
 # Fusion 0.2.1 LabFusion.dll credentials + P2P socket "Fusion" (baked into binary too)
 EOS_DEPLOYMENT_ID=${EOS_DEPLOYMENT_ID:-f3fdf691aa6c4004abdb1e19665c1429}
 EOS_CLIENT_SECRET=${EOS_CLIENT_SECRET:-SWDxYlWWsEgvmD0o3qAm2RMZoSZzOfYo5yvX/uikH94}
 DOTNET_gcServer=0
 EOF
 chmod 600 "$DEST/.env"
+mkdir -p "$(dirname "${HOST_LOBBY_CODE_FILE:-/opt/lang-farm/state/host_lobby_code.txt}")"
 
 DOTNET_ROOT_DIR="$(dirname "$(dirname "$DOTNET_BIN")")"
 # Prefer /usr/share/dotnet layout when present.

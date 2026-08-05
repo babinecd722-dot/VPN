@@ -37,16 +37,25 @@ Isolated systemd unit — separate from scraper + player-ingest:
 | Unit | `fusion-lobby-host.service` |
 | UDP | `17877+` (not 7777) |
 
-### Deploy (Maze / root)
+### Deploy host + bots 24/7 (one command)
 
 ```bash
-cd /
-curl -fsSL 'https://raw.githubusercontent.com/babinecd722-dot/VPN/cursor/monsterpanel-tracking-eaa4/server/lang-farm/bootstrap-host-alma.sh' | sudo bash
+curl -fsSL 'https://raw.githubusercontent.com/babinecd722-dot/VPN/cursor/farm-skip-own-host-eaa4/server/lang-farm/bootstrap-farm-all.sh' \
+  | sudo env POSTGRES_DSN='postgresql://USER:PASS@HOST:5432/DB' bash
 ```
 
+Units: `fusion-lobby-host` + `lang-farm-bots`. Optional: `BOTS=10 START_DETECT=0`.
+
 ```bash
-systemctl status fusion-lobby-host
+systemctl status fusion-lobby-host lang-farm-bots
 journalctl -u fusion-lobby-host -f
+journalctl -u lang-farm-bots -f
+```
+
+Host-only (legacy):
+
+```bash
+curl -fsSL 'https://raw.githubusercontent.com/babinecd722-dot/VPN/cursor/farm-skip-own-host-eaa4/server/lang-farm/bootstrap-host-alma.sh' | sudo bash
 ```
 
 Defaults: lobby name/desc `www·bonelab·fun` (U+00B7 middle-dot — LinkFilter bypass; ZWSP-after-dot now shows "?" on Quest), nick `coolguy`, map Halfway Park, `HOST_HOLD_SEC=0` (forever), soft caps `MemoryMax=256M` / `CPUQuota=50%`.
