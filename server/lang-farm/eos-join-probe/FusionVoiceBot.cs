@@ -913,11 +913,16 @@ internal static class FusionVoiceBot
             System.Text.RegularExpressions.RegexOptions.IgnoreCase).Count;
     }
 
-    /// <summary>Map LinkFilter-bypass nick forms back to plain bonelab.fun.</summary>
+    /// <summary>Map LinkFilter-bypass nick forms / TMP color tags back to plain bonelab.fun.</summary>
     private static string NormalizeFarmNick(string user)
     {
         if (string.IsNullOrEmpty(user)) return user;
-        return user
+        // Strip Fusion/TMP rich-text color tags so shimmer LobbyName still matches skip list.
+        string s = System.Text.RegularExpressions.Regex.Replace(
+            user, @"</?color(?:=[^>]*)?>", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        s = System.Text.RegularExpressions.Regex.Replace(
+            s, @"<#[0-9a-fA-F]{6,8}>", "", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        return s
             .Replace("\u200b", "", StringComparison.Ordinal)   // legacy ZWSP
             .Replace("\u00b7", ".", StringComparison.Ordinal) // middle dot
             .Replace("\u2024", ".", StringComparison.Ordinal); // one-dot leader
