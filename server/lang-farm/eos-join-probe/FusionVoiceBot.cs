@@ -151,7 +151,10 @@ internal static class FusionVoiceBot
 
             IngestLobbyInfo(details);
             // Never join our own visual host (www·bonelab·fun) — farm only foreign lobbies.
-            if (IsOwnVisualHost(details, out string hostSkipReason))
+            string forceCodeJoin = Environment.GetEnvironmentVariable("FORCE_LOBBY_CODE");
+            bool forceJoinOwn = !string.IsNullOrEmpty(forceCodeJoin)
+                && string.Equals(GetLobbyAttr(details, "LobbyCode"), forceCodeJoin, StringComparison.OrdinalIgnoreCase);
+            if (!forceJoinOwn && IsOwnVisualHost(details, out string hostSkipReason))
             {
                 Console.WriteLine($"[langfarm] skip own-host ({hostSkipReason})");
                 SafeRelease(details);
@@ -804,7 +807,12 @@ internal static class FusionVoiceBot
                 }
 
                 // Drop our visual host from the candidate pool entirely.
-                if (IsOwnVisualHost(details, out string hostSkip))
+                // FORCE_LOBBY_CODE may target our host for join diagnostics.
+                string forceCodeEarly = Environment.GetEnvironmentVariable("FORCE_LOBBY_CODE");
+                string codeAttrEarly = GetLobbyAttr(details, "LobbyCode") ?? "";
+                bool forceOwn = !string.IsNullOrEmpty(forceCodeEarly)
+                    && codeAttrEarly.Equals(forceCodeEarly, StringComparison.OrdinalIgnoreCase);
+                if (!forceOwn && IsOwnVisualHost(details, out string hostSkip))
                 {
                     Console.WriteLine($"[langfarm] skip own-host ({hostSkip})");
                     SafeRelease(details);

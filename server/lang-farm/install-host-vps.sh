@@ -65,6 +65,10 @@ if [[ -d "$PROBE/patches" ]]; then
     "$PROBE/third_party/Epic.OnlineServices.Lobby/CreateLobbyOptionsInternal.cs"
   cp -f "$PROBE/patches/LobbyModificationAddAttributeOptionsInternal.cs" \
     "$PROBE/third_party/Epic.OnlineServices.Lobby/LobbyModificationAddAttributeOptionsInternal.cs"
+  if [[ -f "$PROBE/patches/JoinLobbyOptionsInternal.cs" ]]; then
+    cp -f "$PROBE/patches/JoinLobbyOptionsInternal.cs" \
+      "$PROBE/third_party/Epic.OnlineServices.Lobby/JoinLobbyOptionsInternal.cs"
+  fi
 fi
 
 echo "[install-host] building Release..."

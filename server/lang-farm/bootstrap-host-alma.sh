@@ -68,6 +68,10 @@ if [[ -d "$BUILD_ROOT/patches" ]]; then
     "$BUILD_ROOT/third_party/Epic.OnlineServices.Lobby/CreateLobbyOptionsInternal.cs"
   cp -f "$BUILD_ROOT/patches/LobbyModificationAddAttributeOptionsInternal.cs" \
     "$BUILD_ROOT/third_party/Epic.OnlineServices.Lobby/LobbyModificationAddAttributeOptionsInternal.cs"
+  if [[ -f "$BUILD_ROOT/patches/JoinLobbyOptionsInternal.cs" ]]; then
+    cp -f "$BUILD_ROOT/patches/JoinLobbyOptionsInternal.cs" \
+      "$BUILD_ROOT/third_party/Epic.OnlineServices.Lobby/JoinLobbyOptionsInternal.cs"
+  fi
 fi
 
 echo "[bootstrap-host] building + installing from $BUILD_ROOT ..."
