@@ -45,8 +45,9 @@ START_DETECT="${START_DETECT:-1}"
 DETECT_PY="${DETECT_PY:-$ROOT/langdetect/detect_service.py}"
 if [[ "$START_DETECT" == "1" ]] && [[ -f "$DETECT_PY" ]]; then
   if ! curl -sf http://127.0.0.1:8091/health >/dev/null; then
-    nohup env WHISPER_MODEL="${WHISPER_MODEL:-base}" MIN_CONFIDENCE=0.55 \
-      MIN_SPEECH_SEC=1.8 MIN_SPEECH_SEC_NON_EN=2.8 ECAPA_MARGIN=0.18 MMS_MARGIN=0.10 \
+    nohup env WHISPER_MODEL="${WHISPER_MODEL:-base}" MIN_CONFIDENCE="${MIN_CONFIDENCE:-0.35}" \
+      MIN_SPEECH_SEC="${MIN_SPEECH_SEC:-0.8}" MIN_SPEECH_SEC_NON_EN="${MIN_SPEECH_SEC_NON_EN:-1.2}" \
+      ECAPA_MARGIN="${ECAPA_MARGIN:-0.08}" MMS_MARGIN="${MMS_MARGIN:-0.05}" \
       python3 "$DETECT_PY" --host 127.0.0.1 --port 8091 --preload \
       >>"$LOGS/detect_service.log" 2>&1 &
     for _ in $(seq 1 90); do curl -sf http://127.0.0.1:8091/health >/dev/null && break; sleep 1; done
@@ -88,8 +89,9 @@ bot_worker() {
     HOST_LOBBY_CODE_FILE="$HOST_LOBBY_CODE_FILE" \
     RESULTS_TXT="$RESULTS" SESSION_DIR="$ROOT/results/session" \
     LOBBY_CLAIM_DIR="$ROOT/state/lobby_claims" \
-    DETECT_URL="${DETECT_URL:-http://127.0.0.1:8091/detect}" MIN_CONFIDENCE=0.55 \
-    MIN_VOICE_SAMPLES=72000 \
+    DETECT_URL="${DETECT_URL:-http://127.0.0.1:8091/detect}" \
+    MIN_CONFIDENCE="${MIN_CONFIDENCE:-0.35}" \
+    MIN_VOICE_SAMPLES="${MIN_VOICE_SAMPLES:-48000}" \
     ${DOTNET_BIN:-dotnet} "$BOT_DLL" >>"$LOG" 2>&1
     local rc=$?
     set -e
