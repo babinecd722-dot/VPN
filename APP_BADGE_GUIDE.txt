@@ -1,0 +1,554 @@
+================================================================================
+  ГАЙД: БЕЙДЖ ПОД ШТОРКОЙ (NOTCH / DYNAMIC ISLAND)
+  Что создавать и куда — для своего iOS-клиента
+================================================================================
+
+СОДЕРЖАНИЕ
+  1. Что это
+  2. Структура файлов в проекте (что создать)
+  3. Ассеты (картинки)
+  4. Список 6 бейджей
+  5. Координаты и формулы
+  6. Таблица Y-offset по iPhone
+  7. Поддерживаемые устройства
+  8. Когда показывать / скрывать
+  9. Z-order (слой отрисовки)
+  10. Хранение выбора
+  11. Экран настроек
+  12. Пошаговый план + промпты для вайбкодинга
+  13. Готовый псевдокод
+
+
+================================================================================
+1. ЧТО ЭТО
+================================================================================
+
+Декоративная PNG-картинка поверх верхней части экрана — в зоне notch /
+Dynamic Island («шторка»). Видна на скриншотах.
+
+Это НЕ:
+  - badge на иконке приложения
+  - счётчик уведомлений на табе
+
+Это:
+  - UIImageView в корневом окне приложения
+  - 6 вариантов дизайна на выбор в настройках
+
+
+================================================================================
+2. СТРУКТУРА ФАЙЛОВ В ПРОЕКТЕ — ЧТО СОЗДАТЬ
+================================================================================
+
+Создай такую структуру в своём Xcode-проекте:
+
+  YourApp/
+  │
+  ├── Assets.xcassets/
+  │   └── AppBadges/                          ← папка с картинками бейджей
+  │       ├── badge_default.imageset/
+  │       ├── badge_sky.imageset/
+  │       ├── badge_night.imageset/
+  │       ├── badge_titanium.imageset/
+  │       ├── badge_gold.imageset/            ← вместо "Pro", своё имя
+  │       └── badge_day.imageset/
+  │
+  ├── AppBadge/
+  │   ├── AppBadgeModel.swift                 ← struct + список 6 бейджей
+  │   ├── AppBadgeOffset.swift                ← Y-offset по модели iPhone
+  │   ├── AppBadgeManager.swift               ← UIImageView, frame, видимость
+  │   └── AppBadgeSettingsView.swift          ← SwiftUI экран выбора
+  │
+  ├── AppDelegate.swift  (или SceneDelegate)  ← подключить AppBadgeManager
+  └── Settings/
+      └── SettingsView.swift                  ← пункт "Бейдж приложения"
+
+
+ЧТО ДЕЛАЕТ КАЖДЫЙ ФАЙЛ:
+
+  AppBadgeModel.swift
+    - struct AppBadge { id, displayName, imageName }
+    - static let allBadges: [AppBadge] — массив из 6 вариантов
+    - static let defaultBadge — первый в списке
+
+  AppBadgeOffset.swift
+    - func appBadgeYOffset() -> CGFloat
+    - func isBadgeSupportedDevice() -> Bool
+    - таблица offset по модели iPhone (раздел 6)
+
+  AppBadgeManager.swift
+    - class AppBadgeManager — синглтон или свойство в AppDelegate
+    - let badgeView: UIImageView
+    - func setup(in window: UIWindow)
+    - func updateFrame()
+    - func updateVisibility()
+    - func setBadge(imageName: String)
+    - подписка на didBecomeActive / willResignActive
+
+  AppBadgeSettingsView.swift
+    - SwiftUI View с LazyVGrid 2 колонки
+    - при тапе: сохранить в UserDefaults + вызвать AppBadgeManager.shared.setBadge()
+
+  AppDelegate / SceneDelegate
+    - в didFinishLaunching или scene willConnect:
+        AppBadgeManager.shared.setup(in: window)
+
+  SettingsView
+    - NavigationLink → AppBadgeSettingsView()
+
+
+================================================================================
+3. АССЕТЫ (КАРТИНКИ) — ЧТО СОЗДАТЬ
+================================================================================
+
+В Xcode: Assets.xcassets → New Folder → "AppBadges"
+Для каждого бейджа: New Image Set
+
+  Параметры ВСЕХ картинок:
+    Формат:   PNG, RGBA, прозрачный фон
+    Размер:   279 × 66 пикселей
+    Scale:    только 3x (слоты 1x и 2x оставить пустыми)
+
+  Имена imageset (imageName для UIImage(named:)):
+
+    badge_default     → badge_default@3x.png
+    badge_sky         → badge_sky@3x.png
+    badge_night       → badge_night@3x.png
+    badge_titanium    → badge_titanium@3x.png
+    badge_gold        → badge_gold@3x.png
+    badge_day         → badge_day@3x.png
+
+  Дизайн: горизонтальная полоска/капсула под Dynamic Island.
+  Ширина 279px @3x = 93 pt на экране. Высота 66px @3x = 22 pt.
+
+
+================================================================================
+4. СПИСОК 6 БЕЙДЖЕЙ (AppBadgeModel.swift)
+================================================================================
+
+  №   displayName (в UI)   imageName (в bundle)
+  --  -------------------  ---------------------
+  1   Default              badge_default
+  2   Sky                  badge_sky
+  3   Night                badge_night
+  4   Titanium             badge_titanium
+  5   Gold                 badge_gold
+  6   Day                  badge_day
+
+  Код для AppBadgeModel.swift:
+
+  struct AppBadge: Identifiable, Hashable {
+      let id = UUID()
+      let displayName: String
+      let imageName: String
+  }
+
+  enum AppBadgeCatalog {
+      static let all: [AppBadge] = [
+          .init(displayName: "Default",   imageName: "badge_default"),
+          .init(displayName: "Sky",       imageName: "badge_sky"),
+          .init(displayName: "Night",     imageName: "badge_night"),
+          .init(displayName: "Titanium",  imageName: "badge_titanium"),
+          .init(displayName: "Gold",      imageName: "badge_gold"),
+          .init(displayName: "Day",       imageName: "badge_day"),
+      ]
+      static let `default` = all[0]
+  }
+
+
+================================================================================
+5. КООРДИНАТЫ И ФОРМУЛЫ (AppBadgeManager.swift)
+================================================================================
+
+Вызывать updateFrame() при каждом изменении размера окна / повороте.
+
+  imageWidth  = badgeView.image.size.width    // ~93 pt
+  imageHeight = badgeView.image.size.height // ~22 pt
+
+  x = floorToScreenPixels((screenWidth - imageWidth) / 2)
+  y = appBadgeYOffset()   // из AppBadgeOffset.swift
+  badgeView.frame = CGRect(x: x, y: y, width: imageWidth, height: imageHeight)
+
+
+  floorToScreenPixels — добавь в AppBadgeOffset.swift или утилиты:
+
+  func floorToScreenPixels(_ value: CGFloat) -> CGFloat {
+      let scale = UIScreen.main.scale
+      return floor(value * scale) / scale
+  }
+
+
+  Display Zoom (Настройки → Экран → Масштаб):
+
+  scaleFactor = UIScreen.main.scale / UIScreen.main.nativeScale
+  y = floorToScreenPixels(defaultOffset * scaleFactor)
+
+
+  ИТОГ (портрет, без Display Zoom):
+
+    X      = (screenWidth - 93) / 2, по центру
+    Y      = defaultOffset из таблицы (раздел 6)
+    Width  = 93 pt
+    Height = 22 pt
+
+  Пример iPhone 14 Pro (ширина 393 pt, defaultOffset = 18):
+    x = 150.0
+    y = 18.0
+    frame = CGRect(150, 18, 93, 22)
+
+
+================================================================================
+6. ТАБЛИЦА Y-OFFSET ПО IPHONE (AppBadgeOffset.swift)
+================================================================================
+
+Создай файл AppBadgeOffset.swift с этой логикой.
+Определи модель через utsname / sysctl (machine identifier).
+
+  defaultOffset = 2 pt:
+    iPhone10,3  iPhone10,6   → iPhone X
+    iPhone10,1  iPhone10,4   → iPhone 8 (НЕ поддерживается — нет notch)
+    iPhone11,2                 → iPhone XS
+    iPhone12,3                 → iPhone 11 Pro
+    iPhone13,1                 → iPhone 12 mini
+    iPhone14,4                 → iPhone 13 mini
+
+  defaultOffset = 6 pt:
+    iPhone12,1                 → iPhone 11
+    iPhone11,8                 → iPhone XR
+    iPhone13,3                 → iPhone 12 Pro Max
+    iPhone14,3                 → iPhone 13 Pro Max
+    iPhone14,8                 → iPhone 14 Plus
+
+  defaultOffset = 4 pt:
+    iPhone11,4  iPhone11,6   → iPhone XS Max
+    iPhone11,6                 → iPhone 11 Pro Max
+    iPhone13,2                 → iPhone 12
+    iPhone13,3                 → iPhone 12 Pro
+    iPhone14,5                 → iPhone 13
+    iPhone14,2                 → iPhone 13 Pro
+    iPhone14,7                 → iPhone 14
+    iPhone17,5                 → iPhone 16e
+
+  defaultOffset = 18 pt:
+    iPhone15,2                 → iPhone 14 Pro
+    iPhone15,4                 → iPhone 15
+    iPhone16,1                 → iPhone 15 Pro
+    iPhone17,3                 → iPhone 16
+
+  defaultOffset = 19 pt:
+    iPhone15,3                 → iPhone 14 Pro Max
+    iPhone15,5                 → iPhone 15 Plus
+    iPhone16,2                 → iPhone 15 Pro Max
+    iPhone17,4                 → iPhone 16 Plus
+
+  defaultOffset = 21 pt:
+    iPhone17,1                 → iPhone 16 Pro
+    iPhone18,3                 → iPhone 17
+    iPhone18,1                 → iPhone 17 Pro
+
+  defaultOffset = 22 pt:
+    iPhone17,2                 → iPhone 16 Pro Max
+    iPhone18,4                 → iPhone 17 Pro Max
+    iPhone18,2                 → iPhone Air
+
+  defaultOffset = 0 → устройство не поддерживается, бейдж скрыт.
+
+
+  ПОЛНАЯ ТАБЛИЦА (модель → Y в pt, без Display Zoom):
+
+  iPhone X / XS / 11 Pro / 12 mini / 13 mini     →  2
+  iPhone 11 / XR                                 →  6
+  iPhone XS Max / 11 Pro Max                     →  4
+  iPhone 12 / 12 Pro / 13 / 13 Pro / 14 / 16e  →  4
+  iPhone 12 Pro Max / 13 Pro Max / 14 Plus       →  6
+  iPhone 14 Pro / 15 / 15 Pro / 16               → 18
+  iPhone 14 Pro Max / 15 Plus / 15 Pro Max / 16 Plus → 19
+  iPhone 16 Pro / 17 / 17 Pro                    → 21
+  iPhone 16 Pro Max / 17 Pro Max / Air           → 22
+
+
+  Упрощённый switch для AppBadgeOffset.swift:
+
+  func defaultOffset(for model: String) -> CGFloat {
+      switch model {
+      case "iPhone10,3", "iPhone10,6", "iPhone11,2", "iPhone12,3",
+           "iPhone13,1", "iPhone14,4":
+          return 2
+      case "iPhone12,1", "iPhone11,8":
+          return 6
+      case "iPhone11,4", "iPhone11,6":
+          return 4
+      case "iPhone13,2", "iPhone13,3", "iPhone14,2", "iPhone14,3",
+           "iPhone14,5", "iPhone14,7", "iPhone14,8", "iPhone17,5":
+          return 4
+      case "iPhone13,4", "iPhone14,3":
+          return 6   // 12/13 Pro Max
+      case "iPhone15,2", "iPhone15,4", "iPhone16,1", "iPhone17,3":
+          return 18
+      case "iPhone15,3", "iPhone15,5", "iPhone16,2", "iPhone17,4":
+          return 19
+      case "iPhone17,1", "iPhone18,3", "iPhone18,1":
+          return 21
+      case "iPhone17,2", "iPhone18,4", "iPhone18,2":
+          return 22
+      default:
+          return 0
+      }
+  }
+
+
+================================================================================
+7. ПОДДЕРЖИВАЕМЫЕ УСТРОЙСТВА
+================================================================================
+
+Бейдж только на iPhone с notch / Dynamic Island.
+В AppBadgeOffset.swift:
+
+  func isBadgeSupportedDevice() -> Bool {
+      return defaultOffset(for: currentMachineIdentifier()) > 0
+  }
+
+Список моделей с notch (все из таблицы выше).
+iPhone SE, iPhone 8, iPad — defaultOffset = 0 → бейдж не показывается.
+
+
+================================================================================
+8. КОГДА ПОКАЗЫВАТЬ / СКРЫВАТЬ (AppBadgeManager.swift)
+================================================================================
+
+СКРЫТ, если хотя бы одно:
+  1. !isBadgeSupportedDevice()
+  2. forceHidden == true  (приложение в фоне)
+  3. screenWidth > screenHeight  (landscape)
+
+ВИДЕН, если все три условия ложны.
+
+Старт:
+  badgeView.isHidden = true
+  forceHidden = true
+
+Жизненный цикл — в AppBadgeManager.setup():
+  NotificationCenter:
+    UIApplication.didBecomeActiveNotification  → forceHidden = false
+    UIApplication.willResignActiveNotification → forceHidden = true
+  после каждого → updateVisibility()
+
+Задержка при появлении: 0.4 сек (asyncAfter).
+При скрытии: сразу.
+
+
+================================================================================
+9. Z-ORDER (СЛОЙ ОТРИСОВКИ)
+================================================================================
+
+В AppBadgeManager.setup(in window: UIWindow):
+
+  1. badgeView = UIImageView()
+  2. window.addSubview(badgeView)   // или window.rootViewController?.view
+
+badgeView должен быть ПОВЕРХ всего UI.
+Если у тебя есть overlay/modal слой — вставляй их ПОД badgeView:
+
+  containerView.insertSubview(overlay, belowSubview: badgeView)
+
+Так бейдж попадает на скриншоты.
+
+
+================================================================================
+10. ХРАНЕНИЕ ВЫБОРА (UserDefaults)
+================================================================================
+
+Создай в AppBadgeManager или отдельном AppBadgeStorage.swift:
+
+  Ключ:    "selectedAppBadge"
+  Тип:     String (imageName, например "badge_sky")
+  Default: "badge_default"
+
+  При запуске:
+    let saved = UserDefaults.standard.string(forKey: "selectedAppBadge")
+               ?? AppBadgeCatalog.default.imageName
+    badgeView.image = UIImage(named: saved)
+
+  При выборе в настройках:
+    UserDefaults.standard.set(imageName, forKey: "selectedAppBadge")
+    AppBadgeManager.shared.setBadge(imageName: imageName)
+
+
+================================================================================
+11. ЭКРАН НАСТРОЕК (AppBadgeSettingsView.swift)
+================================================================================
+
+Создай SwiftUI View. Добавь в Settings → "Бейдж приложения".
+
+  Layout:
+    LazyVGrid — 2 колонки
+    cardCornerRadius   = 12
+    previewHeight      = 56 pt
+    columnSpacing      = 16
+    horizontalPadding  = 20
+    verticalPadding    = 24
+    vStackSpacing      = 8
+
+  Карточка:
+    ┌──────────────────┐
+    │  Image 56pt high │
+    │     Default      │  .font(.footnote)
+    └──────────────────┘
+    Выбранная: border accentColor 2pt
+
+  При тапе:
+    1. selectedBadge = badge
+    2. UserDefaults save
+    3. AppBadgeManager.shared.setBadge(imageName: badge.imageName)
+
+
+================================================================================
+12. ПОШАГОВЫЙ ПЛАН + ПРОМПТЫ ДЛЯ ВАЙБКОДИНГА
+================================================================================
+
+ШАГ 1 — Ассеты
+  Создай 6 PNG 279×66 @3x, положи в Assets.xcassets/AppBadges/
+  Промпт: "Создай 6 imageset в Assets.xcassets/AppBadges: badge_default,
+  badge_sky, badge_night, badge_titanium, badge_gold, badge_day.
+  Каждый PNG 279x66 pixels, только 3x scale."
+
+ШАГ 2 — AppBadgeModel.swift
+  Промпт: "Создай AppBadge/AppBadgeModel.swift со struct AppBadge и
+  enum AppBadgeCatalog с 6 бейджами: Default, Sky, Night, Titanium, Gold, Day."
+
+ШАГ 3 — AppBadgeOffset.swift
+  Промпт: "Создай AppBadge/AppBadgeOffset.swift с функциями:
+  currentMachineIdentifier(), defaultOffset(for:), appBadgeYOffset()
+  с таблицей offset для iPhone X через iPhone 17 Pro Max,
+  floorToScreenPixels, isBadgeSupportedDevice()."
+
+ШАГ 4 — AppBadgeManager.swift
+  Промпт: "Создай AppBadge/AppBadgeManager.swift — синглтон с UIImageView badgeView.
+  Методы: setup(in: UIWindow), updateFrame(), updateVisibility(), setBadge(imageName:).
+  Позиция: x центр экрана, y из appBadgeYOffset(). Скрывать в landscape и в фоне.
+  Задержка 0.4с при показе. Подписка на didBecomeActive/willResignActive."
+
+ШАГ 5 — Подключить в AppDelegate
+  Промпт: "В AppDelegate в didFinishLaunching вызови
+  AppBadgeManager.shared.setup(in: window).
+  При rotation/size change вызывай updateFrame() и updateVisibility()."
+
+ШАГ 6 — AppBadgeSettingsView.swift
+  Промпт: "Создай AppBadge/AppBadgeSettingsView.swift — SwiftUI экран с LazyVGrid
+  2 колонки, 6 карточек бейджей. При выборе сохраняй в UserDefaults ключ
+  selectedAppBadge и обновляй AppBadgeManager."
+
+ШАГ 7 — Пункт в Settings
+  Промпт: "В SettingsView добавь NavigationLink 'Бейдж приложения'
+  на AppBadgeSettingsView."
+
+
+================================================================================
+13. ГОТОВЫЙ ПСЕВДОКОД
+================================================================================
+
+// ===== AppBadgeManager.swift =====
+
+final class AppBadgeManager {
+    static let shared = AppBadgeManager()
+    let badgeView = UIImageView()
+    private var forceHidden = true
+    private weak var window: UIWindow?
+
+    func setup(in window: UIWindow) {
+        self.window = window
+        let saved = UserDefaults.standard.string(forKey: "selectedAppBadge")
+                  ?? AppBadgeCatalog.default.imageName
+        badgeView.image = UIImage(named: saved)
+        badgeView.isHidden = true
+        window.addSubview(badgeView)
+
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.forceHidden = false
+            self?.updateVisibility()
+        }
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.forceHidden = true
+            self?.updateVisibility()
+        }
+
+        updateFrame()
+        updateVisibility()
+    }
+
+    func setBadge(imageName: String) {
+        badgeView.image = UIImage(named: imageName) ?? UIImage(named: "badge_default")
+        UserDefaults.standard.set(imageName, forKey: "selectedAppBadge")
+        updateFrame()
+    }
+
+    func updateFrame() {
+        guard let image = badgeView.image,
+              let window = window else { return }
+        let w = window.bounds.width
+        let x = floorToScreenPixels((w - image.size.width) / 2)
+        let y = appBadgeYOffset()
+        badgeView.frame = CGRect(x: x, y: y,
+                                 width: image.size.width,
+                                 height: image.size.height)
+    }
+
+    func updateVisibility() {
+        guard let window = window else { return }
+        let w = window.bounds.width
+        let h = window.bounds.height
+        let shouldHide = !isBadgeSupportedDevice()
+                      || forceHidden
+                      || w > h
+
+        if !shouldHide && badgeView.isHidden {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                self?.badgeView.isHidden = shouldHide
+            }
+        } else {
+            badgeView.isHidden = shouldHide
+        }
+    }
+}
+
+// ===== AppDelegate.swift — добавить =====
+
+func application(_ application: UIApplication,
+                 didFinishLaunchingWithOptions ...) -> Bool {
+    // ... твой код ...
+    if let window = self.window {
+        AppBadgeManager.shared.setup(in: window)
+    }
+    return true
+}
+
+// При изменении размера (если есть обработчик):
+func windowDidResize() {
+    AppBadgeManager.shared.updateFrame()
+    AppBadgeManager.shared.updateVisibility()
+}
+
+
+================================================================================
+ЧЕКЛИСТ ПЕРЕД СБОРКОЙ
+================================================================================
+
+  [ ] 6 PNG 279×66 @3x в Assets.xcassets/AppBadges/
+  [ ] AppBadgeModel.swift — список 6 бейджей
+  [ ] AppBadgeOffset.swift — таблица Y по моделям
+  [ ] AppBadgeManager.swift — UIImageView + frame + visibility
+  [ ] AppDelegate — setup(in: window)
+  [ ] AppBadgeSettingsView.swift — экран выбора
+  [ ] SettingsView — NavigationLink на экран бейджа
+  [ ] UserDefaults ключ "selectedAppBadge"
+  [ ] Тест на iPhone с notch в портрете — бейдж виден по центру сверху
+  [ ] Тест landscape — бейдж скрыт
+  [ ] Тест сворачивания — бейдж скрыт
+
+
+================================================================================
+КОНЕЦ ГАЙДА
+================================================================================
